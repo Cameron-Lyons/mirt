@@ -127,12 +127,12 @@ def test_reset_clears_other_exposure_state_immediately(n_factors):
     exposure = ProgressiveRestricted(seed=19)
     engine, _ = _engine(n_factors, exposure)
     engine.get_current_state()
-    assert exposure.max_information_seen
+    assert exposure._latest_item_indices.size
 
     engine.reset()
-    assert exposure.max_information_seen == {}
+    assert exposure._latest_item_indices.size == 0
     engine.reset()
-    assert exposure.max_information_seen == {}
+    assert exposure._latest_item_indices.size == 0
 
 
 @pytest.mark.parametrize("n_factors", [1, 2], ids=["CAT", "MCAT"])

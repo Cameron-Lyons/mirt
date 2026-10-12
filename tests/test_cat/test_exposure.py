@@ -259,13 +259,16 @@ class TestProgressiveRestricted:
         assert len(filtered_tight) <= len(filtered_wide)
 
     def test_reset_clears_state(self):
-        """Test that reset clears internal state."""
+        """Test that reset clears the selection window and opens a session."""
         prog = ProgressiveRestricted()
-        prog._max_info_seen = {0: 1.0, 1: 2.0}
+        prog._latest_item_indices = np.array([0, 1])
+        prog._latest_information = np.array([1.0, 2.0])
 
         prog.reset()
 
-        assert prog._max_info_seen == {}
+        assert prog._latest_item_indices.size == 0
+        assert prog._latest_information.size == 0
+        assert prog.n_examinees == 1
 
 
 class TestCreateExposureControl:
@@ -354,3 +357,166 @@ class TestExposureControlInterface:
         for control in controls:
             assert hasattr(control, "reset")
             control.reset()
+
+
+def _exposure_pool(n_items: int = 60, seed: int = 0):
+    from mirt.models import TwoParameterLogistic
+
+    rng = np.random.default_rng(seed)
+    model = TwoParameterLogistic(n_items=n_items)
+    model.set_parameters(
+        discrimination=rng.lognormal(0.2, 0.35, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+    )
+    model._is_fitted = True
+    return model
+
+
+class TestProgressiveRestrictedMethod:
+    """Revuelta and Ponsoda's restricted maximum and progressive weight."""
+
+    def test_defaults_restrict_exposure_without_a_window(self):
+        control = ProgressiveRestricted()
+        assert control.window_size is None
+        assert control.max_exposure == 0.25
+        assert control.acceleration == 1.0
+
+    def test_maximum_exposure_rate_is_enforced(self):
+        from mirt.cat import CATEngine
+
+        model = _exposure_pool()
+        control = ProgressiveRestricted(max_exposure=0.3, seed=1)
+        engine = CATEngine(
+            model, exposure_control=control, max_items=10, min_items=10, seed=2
+        )
+        thetas = np.random.default_rng(3).normal(size=150)
+        engine.run_batch_simulation(thetas)
+
+        rates = control.get_exposure_rates()
+        assert control.n_examinees == 150
+        # The old 0.5-information window let the best items reach 1.0.
+        assert max(rates.values()) < 0.3 + 1.0 / 150 + 1e-12
+        assert sum(rates.values()) == pytest.approx(10.0)
+
+    def test_restriction_is_relaxed_when_every_item_is_exhausted(
+        self, fitted_2pl_model
+    ):
+        model = fitted_2pl_model.model
+        control = ProgressiveRestricted(max_exposure=0.25, seed=0)
+        control.reset()
+        for item in range(model.n_items):
+            control.update(item)
+
+        eligible = control.filter_items(set(range(model.n_items)), model, 0.0)
+        assert eligible == set(range(model.n_items))
+
+    def test_restriction_excludes_items_at_the_maximum(self, fitted_2pl_model):
+        model = fitted_2pl_model.model
+        control = ProgressiveRestricted(max_exposure=0.5, seed=0)
+        control.reset()
+        control.reset()
+        control.update(0)
+        control.update(1)
+        control.update(1)
+
+        eligible = control.filter_items(set(range(model.n_items)), model, 0.0)
+        assert eligible == set(range(model.n_items)) - {0, 1}
+
+    def test_small_acceleration_moves_to_information_after_one_item(self):
+        from mirt.cat.exposure import _candidate_information
+
+        model = _exposure_pool()
+        information = _candidate_information(
+            model, np.array([[0.0]]), np.arange(model.n_items)
+        )
+        for seed in range(5):
+            control = ProgressiveRestricted(
+                max_exposure=None, acceleration=1e-9, seed=seed
+            )
+            eligible = control.filter_items(set(range(model.n_items)), model, 0.0)
+            chosen = control.select_from_eligible(
+                eligible, n_administered=1, max_items=10
+            )
+            assert chosen == int(np.argmax(information))
+
+    @pytest.mark.parametrize(
+        ("options", "error"),
+        [
+            ({"max_exposure": 0.0}, ValueError),
+            ({"max_exposure": 1.5}, ValueError),
+            ({"acceleration": 0.0}, ValueError),
+            ({"acceleration": np.inf}, ValueError),
+            ({"acceleration": "fast"}, TypeError),
+        ],
+    )
+    def test_invalid_settings_are_rejected(self, options, error):
+        with pytest.raises(error):
+            ProgressiveRestricted(**options)
+
+
+class TestSympsonHetterCalibration:
+    """Each calibration round measures only the current parameters."""
+
+    def test_calibration_uses_sessions_since_the_previous_round(self):
+        control = SympsonHetter(target_rate=0.25)
+        control.record_sessions(np.array([[0, 1]] * 10))
+        control.calibrate(4)
+        assert control.exposure_parameters[0] == pytest.approx(0.25)
+        assert control.n_examinees == 0
+
+        # Two of ten sessions under the new parameters: below the target.
+        control.record_sessions(np.array([[0, 1]] * 2 + [[2, 3]] * 8))
+        control.calibrate(4)
+        # Cumulative counts (12 of 20) used to shrink it to 0.104 instead.
+        assert control.exposure_parameters[0] == pytest.approx(0.275)
+
+    def test_cumulative_calibration_remains_available(self):
+        control = SympsonHetter(target_rate=0.25)
+        control.record_sessions(np.array([[0, 1]] * 10))
+        control.calibrate(4, reset_counts=False)
+        control.record_sessions(np.array([[0, 1]] * 2 + [[2, 3]] * 8))
+        control.calibrate(4, reset_counts=False)
+        assert control.exposure_parameters[0] == pytest.approx(0.25 * 0.25 / 0.6)
+
+    def test_reset_counts_keeps_parameters(self):
+        control = SympsonHetter({0: 0.4, 1: 0.9}, target_rate=0.3)
+        control.record_sessions(np.array([[0, 1]]))
+        control.reset_counts()
+        assert control.exposure_parameters == {0: 0.4, 1: 0.9}
+        assert control.n_examinees == 0
+        assert control.get_exposure_rates() == {0: 0.0, 1: 0.0}
+
+    @pytest.mark.parametrize("open_new_engine", [False, True])
+    def test_engine_sessions_after_a_reset_are_counted(self, open_new_engine):
+        from mirt.cat import CATEngine
+
+        model = _exposure_pool(20)
+        control = SympsonHetter(target_rate=0.5, seed=1)
+        engine = CATEngine(model, exposure_control=control, max_items=4, seed=2)
+        engine.run_batch_simulation([0.0, 0.5, 1.0])
+        if open_new_engine:
+            # The new engine's open session predates the reset.
+            engine = CATEngine(model, exposure_control=control, max_items=4, seed=3)
+        control.calibrate(model.n_items)
+        engine.run_batch_simulation([-0.5, 0.5])
+
+        report = control.exposure_report(n_items=model.n_items)
+        assert report.n_examinees == 2
+        assert report.selection_counts.sum() == 8
+
+    def test_reset_counts_flag_must_be_boolean(self):
+        with pytest.raises(TypeError, match="reset_counts"):
+            SympsonHetter().calibrate(4, reset_counts=1)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_class"),
+    [
+        ("sympson_hetter", SympsonHetter),
+        ("Sympson_Hetter", SympsonHetter),
+        (" RANDOMESQUE ", Randomesque),
+        ("None", NoExposureControl),
+    ],
+)
+def test_exposure_factory_normalizes_names(name, expected_class):
+    assert isinstance(create_exposure_control(name), expected_class)

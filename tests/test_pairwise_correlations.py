@@ -6,7 +6,6 @@ from numpy.testing import assert_allclose, assert_array_equal
 
 import mirt._correlation as correlation
 from mirt._correlation import pairwise_correlations, q3_correlations
-from mirt.backends.rust.diagnostics import _q3_from_residuals_numpy
 from mirt.diagnostics.ld import _compute_q3
 from mirt.models.testlet import _pairwise_complete_correlations
 from mirt.utils.residuals import _compute_ld_matrix
@@ -118,9 +117,6 @@ def test_callers_preserve_diagonals_sparse_pairs_and_suppression():
     np.fill_diagonal(q3_expected, 0.0)
     assert_allclose(q3_correlations(values, observed), q3_expected, atol=1e-14)
     assert_allclose(_compute_q3(values, responses), q3_expected, atol=1e-14)
-    assert_allclose(
-        _q3_from_residuals_numpy(responses, values), q3_expected, atol=1e-14
-    )
 
     expected[counts < 3] = np.nan
     np.fill_diagonal(expected, 1.0)

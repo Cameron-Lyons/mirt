@@ -6,6 +6,7 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
+import mirt
 import mirt.estimation._mc_information as information_module
 import mirt.estimation._mc_objective as objective_module
 import mirt.estimation._polytomous_information as polytomous_information_module
@@ -384,7 +385,8 @@ def test_opt_in_fit_reports_errors_without_changing_seeded_fit(method, monkeypat
             MCEMEstimator,
             {**options, "importance_sampling": method == "importance"},
         )
-    model = _model("2pl")
+    # Unidimensional built-ins use the observed information instead.
+    model = _model("2pl_3d")
     responses, _, _ = _inputs(model, persons=61)
     ordinary, enabled = cls(**options), cls(**options, compute_standard_errors=True)
     compute_errors = enabled._compute_standard_errors_mc
@@ -411,6 +413,8 @@ def test_opt_in_fit_reports_errors_without_changing_seeded_fit(method, monkeypat
     expected = ordinary.fit(model.copy(), responses)
     actual = enabled.fit(model.copy(), responses)
     assert calls == 1
+    assert (actual.se_method, expected.se_method) == ("complete_data", None)
+    assert actual.vcov is None
     # Independent optimizer runs can round differently; SE must preserve its inputs.
     roundoff = 32 * np.finfo(np.float64).eps
     np.testing.assert_allclose(
@@ -603,3 +607,48 @@ def test_invalid_uncertainty_inputs_are_rejected(invalid):
         weights[0, 0] = -1 if invalid == "negative_weights" else np.nan
     with pytest.raises(ValueError, match="shape|weights|finite"):
         estimator._compute_standard_errors_mc(model, responses, samples, weights)
+
+
+_OBSERVED_INFORMATION_CASES = {
+    "mcem": lambda: MCEMEstimator(n_samples=100, tol=1e-2, seed=1),
+    "qmcem": lambda: QMCEMEstimator(n_samples=64, seed=1),
+    "stochastic": lambda: StochasticEMEstimator(seed=1, tol=0.03, burnin=20),
+}
+
+
+@pytest.mark.parametrize(
+    ("method", "kind"),
+    [("mcem", "2pl"), ("qmcem", "2pl"), ("stochastic", "2pl"), ("qmcem", "grm")],
+)
+def test_unidimensional_fits_report_observed_information(method, kind):
+    # Diagonal complete-data curvature used to understate EM's errors by
+    # factors of 1.2 to 2.5, without a method label or covariance.
+    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.quadrature import RectangularQuadrature
+    from mirt.estimation.standard_errors import estimate_covariance
+
+    if kind == "2pl":
+        responses = mirt.simdata("2PL", n_persons=300, n_items=8, seed=0)
+        model = TwoParameterLogistic(8)
+    else:
+        responses = mirt.simdata(
+            "GRM", n_persons=300, n_items=5, n_categories=3, seed=0
+        )
+        model = GradedResponseModel(5, n_categories=3)
+    estimator = _OBSERVED_INFORMATION_CASES[method]()
+    estimator.compute_standard_errors = True
+    result = estimator.fit(model.copy(), responses)
+
+    assert result.se_method == "oakes"
+    quadrature = RectangularQuadrature(61)
+    expected = estimate_covariance(
+        result.model, responses, quadrature, quadrature.weights, "oakes"
+    )
+    np.testing.assert_allclose(result.vcov, expected.covariance, rtol=1e-8)
+    reference = EMEstimator().fit(model.copy(), responses)
+    for name, errors in expected.standard_errors.items():
+        np.testing.assert_allclose(result.standard_errors[name], errors, rtol=1e-8)
+        # The Monte Carlo estimates differ slightly from EM's.
+        free = model.free_parameter_masks[name]
+        ratio = errors[free] / reference.standard_errors[name][free]
+        assert np.all((0.8 < ratio) & (ratio < 1.25))

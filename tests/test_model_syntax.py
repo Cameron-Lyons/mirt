@@ -503,7 +503,6 @@ def test_spec_priors_require_full_coverage_and_one_source(small_data) -> None:
         ),
         (TWO_FACTORS + "\nSTART = (1, a2, 1.0)", MirtValidationError, "load on"),
         (TWO_FACTORS + "\nFIXED = (1, a3)", MirtValidationError, "factor 3"),
-        ("F = 1-10\nFIXED = (1, d)", MirtValidationError, "difficulty"),
         ("F1 = 1-5\nF2 = 6-9", MirtValidationError, "Item_10 load on none"),
         ("F1 = 1-5\nF2 = 6-11", MirtValidationError, "refers to item 11"),
     ],
@@ -563,7 +562,9 @@ def test_constrain_ties_factor_slopes_and_whole_rows(small_data) -> None:
 
 
 def test_constrain_needs_free_coordinates(small_data) -> None:
-    with pytest.raises(MirtValidationError, match="line 2: CONSTRAIN selects no"):
+    with pytest.raises(
+        MirtValidationError, match="line 2: a1 names slopes, but the 1PL"
+    ):
         fit_mirt(small_data[:, :4], "1PL", spec="F = 1-4\nCONSTRAIN = (1-4, a1)")
     with pytest.raises(MirtValidationError, match="at least two items"):
         fit_mirt(small_data, "2PL", spec=TWO_FACTORS + "\nCONSTRAIN = (1, a1)")
@@ -601,6 +602,189 @@ def test_per_item_family_sequences_follow_fit_mirt(small_data) -> None:
         fit_mirt(small_data, ["2PL"] * 5 + ["3PL"] * 5, spec="F = 1-10")
     with pytest.raises(MirtValidationError, match="names 9 items"):
         fit_mirt(small_data, ["2PL"] * 9, spec="F = 1-10")
+
+
+def _one_factor_data() -> np.ndarray:
+    rng = np.random.default_rng(2)
+    theta = rng.normal(size=800)
+    slopes, difficulty = np.linspace(0.8, 2.0, 6), np.linspace(-1.0, 1.0, 6)
+    logits = slopes * (theta[:, None] - difficulty)
+    return (rng.random((800, 6)) < 1 / (1 + np.exp(-logits))).astype(int)
+
+
+@pytest.mark.parametrize(
+    ("syntax", "r_slopes", "r_intercepts", "r_log_likelihood", "n_parameters"),
+    [
+        (
+            "F1 = 1-6\nPRIOR = (1-6, d, norm, 0, 2)",
+            [0.8642, 0.9839, 1.7410, 1.2877, 1.9266, 1.9752],
+            [0.7684, 0.4446, 0.1772, -0.3371, -1.0704, -1.9778],
+            -2840.7091,
+            12,
+        ),
+        (
+            "F1 = 1-6\nSTART = (1, d, 0.5)\nFIXED = (1, d)",
+            [0.7929, 0.9866, 1.7495, 1.2915, 1.9328, 2.0009],
+            [0.5000, 0.4078, 0.1101, -0.3877, -1.1490, -2.0740],
+            -2845.4789,
+            11,
+        ),
+        (
+            "F1 = 1-6\nCONSTRAIN = (1-3, a1), (4-6, d)",
+            [1.0840, 1.0840, 1.0840, 2.2866, 1.7844, 1.1161],
+            [0.7272, 0.3648, 0.0502, -1.1783, -1.1783, -1.1783],
+            -2900.3888,
+            8,
+        ),
+    ],
+    ids=["prior", "fixed", "constrain"],
+)
+def test_one_factor_intercepts_keep_their_r_meaning(
+    syntax, r_slopes, r_intercepts, r_log_likelihood, n_parameters
+) -> None:
+    # Regression: a one-factor "2PL" spec was a difficulty-form 2PL, so the
+    # guide's own d examples raised "unknown parameter 'd' for the 2PL model".
+    # References: R mirt 1.48, mirt(data, mirt.model(syntax), "2PL").
+    result = fit_mirt(_one_factor_data(), "2PL", spec=syntax)
+
+    assert isinstance(result.model, mirt.MultidimensionalModel)
+    assert result.model.n_factors == 1
+    assert_allclose(result.model.parameters["slopes"][:, 0], r_slopes, atol=1e-2)
+    assert_allclose(result.model.parameters["intercepts"], r_intercepts, atol=1e-2)
+    assert result.log_likelihood == pytest.approx(r_log_likelihood, abs=1e-2)
+    assert result.n_parameters == n_parameters
+    restored = FitResult.from_json(result.to_json())
+    assert type(restored.model) is mirt.MultidimensionalModel
+    assert_allclose(
+        restored.model.parameters["intercepts"], result.model.parameters["intercepts"]
+    )
+    # Without d the one-factor spec keeps the difficulty-form 2PL.
+    plain = fit_mirt(
+        _one_factor_data(), "2PL", spec="F1 = 1-6\nFIXED = (1, a1)", max_iter=5
+    )
+    assert type(plain.model) is mirt.TwoParameterLogistic
+
+
+@pytest.mark.parametrize(
+    ("family", "syntax", "message"),
+    [
+        ("1PL", "START = (1, a1, 1.5)", "a1 names slopes, but the 1PL model fixes"),
+        ("1PL", "FIXED = (1, a1)", "a1 names slopes, but the 1PL model fixes"),
+        ("1PL", "PRIOR = (1-6, a, lnorm, 0, 0.5)", "a names slopes, but the 1PL"),
+        ("1PL", "START = (1, discrimination, 1.5)", "discrimination names slopes"),
+        ("PCM", "CONSTRAIN = (1-6, a1)", "a1 names slopes, but the PCM model fixes"),
+        (
+            "GRM",
+            "FIXED = (1, d1)",
+            "d1 names intercepts, but the GRM model stores "
+            "thresholds b_k, R's intercepts being d_k = -a [*] b_k; select whole rows "
+            "with thresholds",
+        ),
+        (
+            "GPCM",
+            "PRIOR = (1-6, d, norm, 0, 2)",
+            "d names .*the GPCM model stores steps",
+        ),
+        ("PCM", "START = (1, d2, 0.5)", "d2 names .*the PCM model stores steps"),
+        ("3PL", "FIXED = (1, d)", "d names .*3PL model stores the difficulty b"),
+        (
+            "1PL",
+            "PRIOR = (1-6, d, norm, 0, 2)",
+            "d names .*1PL model stores the difficulty",
+        ),
+    ],
+)
+def test_names_the_family_fixes_or_lacks_raise_labelled_errors(
+    family, syntax, message
+) -> None:
+    # Regression: "START = (1, a1, 1.5)" raised a raw ValueError without the
+    # line, a slope PRIOR on the 1PL was silently ignored, and d1 for the GRM
+    # was an unexplained "unknown parameter".
+    rng = np.random.default_rng(4)
+    data = rng.integers(0, 2 if family in ("1PL", "3PL") else 3, size=(200, 6))
+
+    with pytest.raises(MirtValidationError, match=f"line 2: {message}") as caught:
+        fit_mirt(data, family, spec=f"F = 1-6\n{syntax}", max_iter=2)
+    assert caught.value.context["line"] == 2
+
+
+def _guide_code_blocks() -> list[str]:
+    """Return the Python code blocks of the model syntax guide, in order."""
+    import re
+    import textwrap
+    from pathlib import Path
+
+    guide = Path(__file__).resolve().parents[1] / "docs" / "guides" / "model_syntax.rst"
+    lines = guide.read_text(encoding="utf-8").splitlines()
+    blocks, index = [], 0
+    while index < len(lines):
+        directive = re.match(r"(\s*)\.\. code-block:: python\s*$", lines[index])
+        index += 1
+        if directive is None:
+            continue
+        body = []
+        while index < len(lines) and (
+            not lines[index].strip()
+            or len(lines[index]) - len(lines[index].lstrip()) > len(directive.group(1))
+        ):
+            body.append(lines[index])
+            index += 1
+        blocks.append(textwrap.dedent("\n".join(body)))
+    return blocks
+
+
+def test_guide_examples_run(capsys) -> None:
+    # The guide's code blocks build on each other, as in a doctest session.
+    import warnings
+
+    blocks = _guide_code_blocks()
+    namespace: dict[str, object] = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for number, code in enumerate(blocks):
+            exec(compile(code, f"model_syntax.rst block {number}", "exec"), namespace)
+
+    assert len(blocks) >= 5
+    one_factor = namespace["one_factor"]
+    assert_allclose(one_factor.model.parameters["intercepts"][1:3], 0.0)  # type: ignore[attr-defined]
+    capsys.readouterr()
+
+
+def test_guide_table_statements_parse_and_fit(small_data) -> None:
+    # Every statement in the guide's syntax table is valid for a "2PL" model,
+    # with one factor and with two.
+    import re
+    from pathlib import Path
+
+    guide = Path(__file__).resolve().parents[1] / "docs" / "guides" / "model_syntax.rst"
+    statements = re.findall(
+        r"^``((?:FIXED|START|PRIOR|CONSTRAIN|COV) = [^`]+)``",
+        guide.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert {statement.split()[0] for statement in statements} == {
+        "FIXED",
+        "START",
+        "PRIOR",
+        "CONSTRAIN",
+        "COV",
+    }
+    for statement in statements:
+        factors = "F1 = 1-4\nF2 = 5-7\nF3 = 8-10" if "F3" in statement else None
+        mirt_model(f"{factors or 'F1 = 1-10'}\n{statement}")
+        if statement.startswith("COV"):
+            continue
+        for structure in ("F1 = 1-10", "F1 = 1-5\nF2 = 6-10"):
+            result = fit_mirt(
+                small_data,
+                "2PL",
+                spec=f"{structure}\n{statement}",
+                n_quadpts=7,
+                max_iter=5,
+                compute_standard_errors=False,
+            )
+            for values in result.model.parameters.values():
+                assert np.all(np.isfinite(values))
 
 
 # Results

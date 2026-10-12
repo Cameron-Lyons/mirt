@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+import mirt
 from mirt.estimation import _posterior
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.em import EMEstimator
@@ -11,6 +12,25 @@ from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.weighted import WeightedEMEstimator
 from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.utils.numeric import logsumexp
+
+_BACKENDS = [
+    "numpy",
+    pytest.param(
+        "rust",
+        marks=pytest.mark.skipif(
+            not mirt.is_rust_available(), reason="Rust extension unavailable"
+        ),
+    ),
+]
+
+
+@pytest.fixture(autouse=True, params=_BACKENDS)
+def backend(request):
+    """Run every test on the NumPy path and on the native kernel."""
+    previous = mirt.get_backend()
+    mirt.set_backend(request.param)
+    yield request.param
+    mirt.set_backend(previous)
 
 
 @pytest.mark.parametrize("blocked", [False, True])
@@ -122,3 +142,95 @@ def test_estimator_e_steps_preserve_prior_with_large_custom_likelihood_offset(
     np.testing.assert_allclose(posterior, np.tile(prior, (2, 1)), atol=1e-15)
     np.testing.assert_allclose(posterior.sum(axis=1), 1.0, atol=1e-15)
     np.testing.assert_array_equal(marginal, offset)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_rows_far_below_the_largest_prior_mass_are_normalized_exactly(
+    monkeypatch, blocked
+):
+    # The joint is shifted by the largest prior mass. A likelihood that peaks
+    # where the prior mass is e^-900 times smaller would underflow there, and
+    # one at e^-300 would lose its smallest terms, so such rows are
+    # normalized again from their own maxima.
+    prior = np.array([0.0, -300.0, -900.0, -906.0, -np.inf])
+    likelihood = np.array(
+        [
+            [-2000.0, -2000.0, 0.0, -1.0, 0.0],
+            [-2000.0, 0.0, -2000.0, -800.0, -5.0],
+            [-1.0, -0.5, 0.0, -3.0, -np.inf],
+        ]
+    )
+    expected_log = logsumexp(likelihood + prior, axis=1)
+    expected = np.exp(likelihood + prior - expected_log[:, None])
+    if blocked:
+        monkeypatch.setattr(_posterior, "_MAX_NORMALIZATION_ELEMENTS", 5)
+    posterior, marginal = normalize_log_posterior(likelihood.copy(), prior)
+    np.testing.assert_allclose(posterior, expected, rtol=1e-13, atol=1e-300)
+    np.testing.assert_allclose(marginal, expected_log, rtol=1e-14)
+    assert posterior[0, 3] > 0.0
+
+
+def _edge_case_rows(rng):
+    """Likelihood rows with large offsets, underflow and nonfinite entries."""
+    rows = rng.normal(-500.0, 200.0, (40, 7))
+    rows[0] = 1e300
+    rows[1] = -np.inf
+    rows[2, 3] = np.inf
+    rows[3, 1] = np.nan
+    rows[4] = [-2000.0, 0.0, -2000.0, -800.0, -5.0, -np.inf, -1e5]
+    rows[5, ::2] = -np.inf
+    rows[6] = [np.inf, 0.0, -np.inf, 1.0, 2.0, 3.0, 4.0]
+    return rows
+
+
+@pytest.mark.parametrize(
+    "prior_kind", ["none", "uniform", "steep", "zero_mass", "all_zero", "nan"]
+)
+def test_native_and_numpy_normalization_agree_on_edge_cases(prior_kind, backend):
+    if backend != "rust":
+        pytest.skip("compares the native kernel against the NumPy path")
+    rng = np.random.default_rng(23)
+    rows = _edge_case_rows(rng)
+    prior = {
+        "none": None,
+        "uniform": np.full(7, -np.log(7.0)),
+        "steep": np.array([0.0, -300.0, -900.0, -906.0, -np.inf, -2.0, -1.0]),
+        "zero_mass": np.array([-np.inf, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0]),
+        "all_zero": np.full(7, -np.inf),
+        "nan": np.array([0.0, np.nan, -1.0, -2.0, -3.0, -4.0, -5.0]),
+    }[prior_kind]
+    with np.errstate(all="ignore"):
+        native, native_log = normalize_log_posterior(rows.copy(), prior)
+        mirt.set_backend("numpy")
+        expected, expected_log = normalize_log_posterior(rows.copy(), prior)
+
+    np.testing.assert_allclose(
+        native, expected, rtol=1e-13, atol=1e-300, equal_nan=True
+    )
+    np.testing.assert_allclose(native_log, expected_log, rtol=1e-14, equal_nan=True)
+
+
+def test_native_kernel_serves_only_owned_contiguous_buffers(monkeypatch, backend):
+    calls = []
+
+    def record(log_joint, prior):
+        calls.append(log_joint)
+        return np.zeros(log_joint.shape[0])
+
+    monkeypatch.setattr(_posterior, "rust_enabled", lambda: True)
+    monkeypatch.setattr(
+        _posterior,
+        "mirt_rs",
+        type("Native", (), {"normalize_log_posterior_inplace": staticmethod(record)}),
+    )
+    owned = np.zeros((3, 4))
+    assert normalize_log_posterior(owned, np.zeros(4))[0] is owned
+    assert calls == [owned]
+    # Strided, single-precision and read-only buffers take the NumPy path.
+    for buffer in (np.zeros((4, 3)).T, np.zeros((3, 4), dtype=np.float32)):
+        normalize_log_posterior(buffer, np.zeros(4))
+    readonly = np.zeros((3, 4))
+    readonly.flags.writeable = False
+    with pytest.raises(ValueError, match="read-only"):
+        normalize_log_posterior(readonly, np.zeros(4))
+    assert len(calls) == 1

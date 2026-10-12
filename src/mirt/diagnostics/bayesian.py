@@ -3,13 +3,14 @@
 This module provides:
 - PSIS-LOO (Pareto-smoothed importance sampling leave-one-out cross-validation)
 - WAIC (Widely Applicable Information Criterion)
+- Model comparison by expected log predictive density (``loo_compare``)
 - Posterior predictive checks
 - DIC (Deviance Information Criterion)
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -628,14 +629,6 @@ def _pareto_smooth_log_weights(
     return values, float(shape)
 
 
-def _pareto_smooth_weights(
-    log_weights: NDArray[np.float64],
-) -> tuple[NDArray[np.float64], float]:
-    """Return normalized Pareto-smoothed importance weights and tail shape."""
-    smoothed, shape = _pareto_smooth_log_weights(log_weights, relative_eff=1.0)
-    return np.exp(smoothed), shape
-
-
 def psis_loo(
     log_lik: ArrayLike,
     k_threshold: float = 0.7,
@@ -1133,11 +1126,141 @@ def _get_builtin_statistic(
     return statistics[name]
 
 
+def loo_compare(
+    *results: PSISResult | WAICResult,
+    names: Sequence[str] | None = None,
+) -> Any:
+    """Compare models by expected log predictive density (PSIS-LOO or WAIC).
+
+    Models are ranked by ``elpd``, best first, as in R's ``loo::loo_compare``
+    and ``arviz.compare``. Each difference from the best model has the
+    standard error of the paired pointwise differences,
+    ``se_diff = sqrt(n * var(elpd_i - elpd_best_i))`` over the ``n``
+    observations, which is much smaller than the separate standard errors
+    when the models make correlated predictions.
+
+    Parameters
+    ----------
+    *results : PSISResult or WAICResult
+        Results of :func:`psis_loo`, or of :func:`waic` (not mixed), computed
+        on the same observations.
+    names : sequence of str, optional
+        Model names, in the order of ``results``. Default ``"Model 1"``,
+        ``"Model 2"``, ...
+
+    Returns
+    -------
+    DataFrame
+        One row per model, best first, with columns ``Model``,
+        ``elpd_diff``, ``se_diff``, ``elpd_loo``, ``se_elpd_loo``, ``p_loo``,
+        ``looic`` and ``se_looic`` (for WAIC ``elpd_waic``, ``se_elpd_waic``,
+        ``p_waic``, ``waic`` and ``se_waic``). Differences and their
+        standard errors are on the elpd scale; ``elpd_diff`` is zero for the
+        best model and negative otherwise. The information criteria and
+        their standard errors are on the deviance scale, ``-2 * elpd``.
+
+    Raises
+    ------
+    MirtValidationError
+        If no results are given, PSIS-LOO and WAIC results are mixed, their
+        pointwise values differ in length, or ``names`` does not have one
+        name per result.
+
+    See Also
+    --------
+    mirt.compare_models : Information criteria of maximum-likelihood fits.
+    """
+    from mirt.exceptions import MirtValidationError
+    from mirt.utils.dataframe import create_dataframe
+
+    if not results:
+        raise MirtValidationError(
+            "loo_compare requires at least one PSISResult or WAICResult",
+            parameter="results",
+        )
+    n_models = len(results)
+    if names is None:
+        names = [f"Model {i + 1}" for i in range(n_models)]
+    names = list(names)
+    if len(names) != n_models:
+        raise MirtValidationError(
+            f"Expected {n_models} names, got {len(names)}",
+            parameter="names",
+            value=names,
+            expected=f"{n_models} names",
+        )
+    loo = isinstance(results[0], PSISResult)
+    kind = PSISResult if loo else WAICResult
+    if not all(isinstance(result, kind) for result in results):
+        raise MirtValidationError(
+            "results must all be PSISResult or all be WAICResult",
+            parameter="results",
+            expected="results of one criterion",
+        )
+    if loo:
+        loo_results = [result for result in results if isinstance(result, PSISResult)]
+        pointwise = [np.asarray(r.pointwise, dtype=np.float64) for r in loo_results]
+        elpd = np.array([r.elpd_loo for r in loo_results])
+        se_elpd = np.array([r.se_elpd for r in loo_results])
+        penalty = np.array([r.p_loo for r in loo_results])
+        criterion = np.array([r.looic for r in loo_results])
+        suffix, ic_name = "loo", "looic"
+    else:
+        waic_results = [result for result in results if isinstance(result, WAICResult)]
+        # WAIC pointwise values and their standard error are on the deviance
+        # scale, -2 times the elpd scale.
+        pointwise = [
+            -0.5 * np.asarray(r.pointwise, dtype=np.float64) for r in waic_results
+        ]
+        elpd = np.array([r.elpd_waic for r in waic_results])
+        se_elpd = np.array([r.se_waic / 2.0 for r in waic_results])
+        penalty = np.array([r.p_waic for r in waic_results])
+        criterion = np.array([r.waic for r in waic_results])
+        suffix, ic_name = "waic", "waic"
+    if len({values.shape for values in pointwise}) != 1 or pointwise[0].ndim != 1:
+        raise MirtValidationError(
+            "results must have pointwise values for the same observations",
+            parameter="results",
+            expected="equal-length one-dimensional pointwise values",
+        )
+
+    order = np.argsort(-elpd, kind="stable")
+    best = int(order[0])
+    n_obs = pointwise[0].size
+    se_diff = np.array(
+        [
+            0.0
+            if index == best or n_obs < 2
+            else float(
+                np.sqrt(n_obs * np.var(pointwise[index] - pointwise[best], ddof=1))
+            )
+            for index in order
+        ]
+    )
+    return create_dataframe(
+        {
+            "Model": [names[index] for index in order],
+            "elpd_diff": elpd[order] - elpd[best],
+            "se_diff": se_diff,
+            f"elpd_{suffix}": elpd[order],
+            f"se_elpd_{suffix}": se_elpd[order],
+            f"p_{suffix}": penalty[order],
+            ic_name: criterion[order],
+            f"se_{ic_name}": 2.0 * se_elpd[order],
+        }
+    )
+
+
 def compare_models(
     *results: PSISResult | WAICResult,
     names: list[str] | None = None,
 ) -> str:
-    """Compare multiple models using LOO or WAIC.
+    """Compare multiple models using LOO or WAIC as a formatted table.
+
+    .. deprecated::
+        Use :func:`loo_compare`, which returns a DataFrame with the standard
+        errors of the elpd differences. :func:`mirt.compare_models` compares
+        maximum-likelihood fits by information criteria.
 
     Parameters
     ----------
@@ -1149,43 +1272,54 @@ def compare_models(
     Returns
     -------
     str
-        Formatted comparison table.
+        Formatted comparison table, best model first. ``SE`` is the standard
+        error of ``elpd``, and ``dSE`` that of the difference in the
+        information criterion from the best model.
     """
-    n_models = len(results)
-    if names is None:
-        names = [f"Model {i + 1}" for i in range(n_models)]
+    _warn_loo_table_deprecated(stacklevel=3)
+    return _loo_comparison_text(results, names)
 
-    if len(names) != n_models:
-        raise ValueError(f"Expected {n_models} names, got {len(names)}")
 
-    if isinstance(results[0], PSISResult):
-        ic_values = [r.looic for r in results]
-        elpd_values = [r.elpd_loo for r in results]
-        se_values = [r.se_elpd for r in results]
-        ic_name = "LOOIC"
-    else:
-        ic_values = [r.waic for r in results]
-        elpd_values = [r.elpd_waic for r in results]
-        se_values = [r.se_waic for r in results]
-        ic_name = "WAIC"
+def _warn_loo_table_deprecated(stacklevel: int) -> None:
+    import warnings
 
-    sorted_idx = np.argsort(ic_values)
-    best_ic = ic_values[sorted_idx[0]]
+    warnings.warn(
+        "compare_models for PSIS-LOO and WAIC results is deprecated; use "
+        "mirt.diagnostics.loo_compare, which returns a DataFrame with the "
+        "standard errors of the elpd differences",
+        DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+
+
+def _loo_comparison_text(
+    results: Sequence[PSISResult | WAICResult],
+    names: Sequence[str] | None,
+) -> str:
+    """Format :func:`loo_compare` as the table of the former compare_models."""
+    table = loo_compare(*results, names=names)
+    suffix, ic_name = (
+        ("loo", "LOOIC") if isinstance(results[0], PSISResult) else ("waic", "WAIC")
+    )
+    model = np.asarray(table["Model"])
+    criterion = np.asarray(table[ic_name.lower()], dtype=np.float64)
+    elpd = np.asarray(table[f"elpd_{suffix}"], dtype=np.float64)
+    se_elpd = np.asarray(table[f"se_elpd_{suffix}"], dtype=np.float64)
+    se_diff = np.asarray(table["se_diff"], dtype=np.float64)
 
     lines = [
         "Model Comparison",
-        "=" * 60,
-        f"{'Model':<15} {ic_name:>10} {'elpd':>10} {'SE':>8} {'d' + ic_name:>10}",
-        "-" * 60,
+        "=" * 69,
+        f"{'Model':<15} {ic_name:>10} {'elpd':>10} {'SE':>8} "
+        f"{'d' + ic_name:>10} {'dSE':>8}",
+        "-" * 69,
     ]
-
-    for idx in sorted_idx:
-        diff = ic_values[idx] - best_ic
+    for row in range(len(model)):
         lines.append(
-            f"{names[idx]:<15} {ic_values[idx]:>10.2f} "
-            f"{elpd_values[idx]:>10.2f} {se_values[idx]:>8.2f} {diff:>10.2f}"
+            f"{model[row]!s:<15} {criterion[row]:>10.2f} {elpd[row]:>10.2f} "
+            f"{se_elpd[row]:>8.2f} {criterion[row] - criterion[0]:>10.2f} "
+            f"{2.0 * se_diff[row]:>8.2f}"
         )
-
     return "\n".join(lines)
 
 

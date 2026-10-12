@@ -8,10 +8,14 @@ from mirt.models.dichotomous import (
     FourParameterLogistic,
     TwoParameterLogistic,
 )
+from mirt.models.multidimensional import MultidimensionalModel
 from mirt.models.polytomous import (
+    GeneralizedPartialCredit,
     GradedRatingScaleModel,
     GradedResponseModel,
     NominalResponseModel,
+    PartialCreditModel,
+    RatingScaleModel,
 )
 from mirt.utils import estfun as public_estfun
 from mirt.utils import estfun_summary as public_estfun_summary
@@ -155,10 +159,134 @@ class TestCoefficients:
         )
 
     def test_slope_intercept_rejects_incompatible_parameterization(self):
-        model = GradedResponseModel(n_items=2, n_categories=3)
+        model = RatingScaleModel(n_items=2, n_categories=3)
 
         with pytest.raises(MirtModelError, match="requires"):
             coef(model, irt_pars=False)
+
+    def test_ordinal_intercepts_match_r_coef(self):
+        # mirt(..., itemtype = "graded" / "gpcm" / "Rasch") with fixed
+        # parameters in R 1.48: coef(IRTpars = TRUE) gives the thresholds or
+        # steps set here, coef(IRTpars = FALSE) the intercepts expected below,
+        # and probtrace the category probabilities.
+        theta = np.array([[-1.0], [0.5]])
+        slopes = np.array([1.3, 0.7, 1.8])
+        graded = GradedResponseModel(n_items=3, n_categories=[4, 4, 3])
+        graded.set_parameters(
+            discrimination=slopes,
+            thresholds=np.array(
+                [
+                    [-1.153846, -0.1538462, 0.8461538],
+                    [-1.285714, 0.5714286, 2.857143],
+                    [-0.3333333, 0.4444444, 0.0],
+                ]
+            ),
+        )
+        gpcm = GeneralizedPartialCredit(n_items=3, n_categories=[4, 4, 3])
+        gpcm.set_parameters(
+            discrimination=slopes,
+            steps=np.array(
+                [
+                    [-0.3846154, -0.5384615, 0.6153846],
+                    [0.4285714, -0.5714286, 1.428571],
+                    [-0.3333333, 0.2222222, 0.0],
+                ]
+            ),
+        )
+        pcm = PartialCreditModel(n_items=3, n_categories=[4, 4, 3])
+        pcm.set_parameters(
+            steps=np.array([[-0.5, -0.7, 0.8], [0.3, -0.4, 1.0], [-0.6, 0.4, 0.0]])
+        )
+        partial_credit_intercepts = [
+            [0.5, 1.2, 0.4],
+            [-0.3, 0.1, -0.9],
+            [0.6, 0.2, 0.0],
+        ]
+        cases = [
+            (
+                graded,
+                slopes,
+                [[1.5, 0.2, -1.1], [0.9, -0.4, -2.0], [0.6, -0.8, 0.0]],
+                [0.4501660, 0.3000941, 0.1665672, 0.0831727],
+            ),
+            (
+                gpcm,
+                slopes,
+                partial_credit_intercepts,
+                [0.57933289, 0.2603110, 0.1428617, 0.01749434],
+            ),
+            (
+                pcm,
+                np.ones(3),
+                partial_credit_intercepts,
+                [0.46945421, 0.2847384, 0.2109394, 0.03486804],
+            ),
+        ]
+        for model, expected_slopes, expected_intercepts, first_curve in cases:
+            converted = coef(model, irt_pars=False)
+
+            assert set(converted) == {"slope", "intercept"}
+            np.testing.assert_allclose(
+                converted["slope"], expected_slopes[:, None], atol=1e-12
+            )
+            np.testing.assert_allclose(
+                converted["intercept"], expected_intercepts, atol=1e-6
+            )
+            np.testing.assert_allclose(
+                model.probability(theta, 0)[0], first_curve, atol=1e-6
+            )
+            assert set(coef(model)) == set(model.parameters)
+
+    def test_four_parameter_intercepts_match_r_coef(self):
+        # coef(mirt(..., "4PL"), IRTpars = FALSE) in R for a = (1.2, 0.6),
+        # b = (1/3, -4/3): d = (-0.4, 0.8), with g and u unchanged.
+        model = FourParameterLogistic(n_items=2)
+        model.set_parameters(
+            discrimination=np.array([1.2, 0.6]),
+            difficulty=np.array([1 / 3, -4 / 3]),
+            guessing=np.array([0.15, 0.05]),
+            upper=np.array([0.9, 0.97]),
+        )
+
+        converted = coef(model, irt_pars=False)
+
+        assert set(converted) == {"slope", "intercept", "guessing", "upper"}
+        np.testing.assert_allclose(converted["intercept"], [-0.4, 0.8])
+        np.testing.assert_array_equal(converted["upper"], [0.9, 0.97])
+
+    def test_slope_intercept_models_are_returned_unconverted(self):
+        # As R, which leaves models with cross-loadings in a/d form.
+        mirt_model = MultidimensionalModel(n_items=3, n_factors=2)
+        nominal = NominalResponseModel(n_items=2, n_categories=3)
+
+        for model in (mirt_model, nominal):
+            for irt_pars in (True, False):
+                coefficients = coef(model, irt_pars=irt_pars)
+                assert set(coefficients) == {"slopes", "intercepts"}
+                for name, values in coefficients.items():
+                    np.testing.assert_array_equal(values, model.parameters[name])
+
+    def test_mixed_format_models_convert_each_component(self):
+        from mirt.models.mixed_format import MixedItemModel
+
+        model = MixedItemModel.from_itemtypes(
+            ["2PL", "2PL", "GRM"], n_categories=[2, 2, 3]
+        )
+        grm = model.component_models[1]
+        grm.set_parameters(
+            discrimination=np.array([1.5]), thresholds=np.array([[-1.0, 0.5]])
+        )
+
+        converted = coef(model, irt_pars=False)
+
+        assert set(converted) == {
+            "2PL.slope",
+            "2PL.intercept",
+            "GRM.slope",
+            "GRM.intercept",
+        }
+        np.testing.assert_allclose(converted["GRM.intercept"], [[1.5, -0.75]])
+        assert set(coef(model)) == set(model.parameters)
 
 
 class TestItemPlotData:
@@ -246,7 +374,8 @@ class TestEstimatingFunctions:
         actual = estfun(model, responses, theta)
         expected = _central_scores(model, responses, theta)
 
-        assert actual.shape == (3, model.n_parameters)
+        # One column per free coordinate, including the rotation's.
+        assert actual.shape == (3, 6) == (3, model.n_parameters + 1)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-7)
 
     def test_supports_polytomous_models_and_missing_values(self):
@@ -300,3 +429,23 @@ class TestEstimatingFunctions:
         np.testing.assert_allclose(summary["mean"], scores.mean(axis=0))
         np.testing.assert_allclose(summary["var"], scores.var(axis=0))
         np.testing.assert_allclose(summary["meat"], scores.T @ scores / 3)
+
+
+def test_coef_accepts_fit_results_and_multigroup_results():
+    import mirt
+
+    responses = mirt.simdata(n_persons=400, n_items=5, seed=1)
+    result = mirt.fit_mirt(responses, compute_standard_errors=False)
+    for key, values in mirt.coef(result).items():
+        np.testing.assert_array_equal(values, mirt.coef(result.model)[key])
+
+    groups = np.repeat(["a", "b"], 200)
+    multigroup = mirt.fit_multigroup(
+        responses, groups, invariance="metric", compute_standard_errors=False
+    )
+    by_group = mirt.coef(multigroup)
+    assert list(by_group) == ["a", "b"]
+    np.testing.assert_array_equal(
+        by_group["a"]["discrimination"], by_group["b"]["discrimination"]
+    )
+    assert "intercept" in mirt.coef(multigroup, irt_pars=False)["b"]

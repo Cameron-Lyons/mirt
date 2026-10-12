@@ -291,6 +291,9 @@ def test_shrinkage_validates_variance_components(
 
 
 def test_fit_retains_effect_metadata_and_honors_controls(monkeypatch) -> None:
+    # Person covariates are fitted jointly with the items by marginal
+    # maximum likelihood (tests/test_estimation/test_mixed.py); item
+    # covariates regress the base-model difficulties.
     responses = np.array(
         [
             [0, 0, 0],
@@ -299,9 +302,8 @@ def test_fit_retains_effect_metadata_and_honors_controls(monkeypatch) -> None:
             [1, 1, 1],
         ]
     )
-    person_covariates = np.arange(4.0)
     item_covariates = np.arange(3.0)
-    theta = 2.0 + 3.0 * person_covariates
+    theta = 2.0 + 3.0 * np.arange(4.0)
     fitted_model = TwoParameterLogistic(n_items=3)
     fitted_model.set_parameters(
         discrimination=np.ones(3),
@@ -316,6 +318,7 @@ def test_fit_retains_effect_metadata_and_honors_controls(monkeypatch) -> None:
             model=fitted_model,
             log_likelihood=-10.0,
             converged=True,
+            n_parameters=6,
         )
 
     def fake_fscores(model, response_data, method):
@@ -331,9 +334,7 @@ def test_fit_retains_effect_metadata_and_honors_controls(monkeypatch) -> None:
     monkeypatch.setattr("mirt.scoring.fscores", fake_fscores)
 
     estimator = MixedEffectsIRT(
-        person_covariates=person_covariates,
         item_covariates=item_covariates,
-        person_covariate_names=["experience"],
         item_covariate_names=["complexity"],
     )
     result = estimator.fit(responses, max_iter=7, tol=1e-6)
@@ -343,15 +344,15 @@ def test_fit_retains_effect_metadata_and_honors_controls(monkeypatch) -> None:
     assert received["tol"] == pytest.approx(1e-6)
     np.testing.assert_allclose(result.theta, theta)
     np.testing.assert_allclose(result.theta_se, 0.2)
-    assert result.person_intercept == pytest.approx(2.0)
-    np.testing.assert_allclose(result.person_effects, [3.0])
+    assert result.person_effects is None
     assert result.item_intercept == pytest.approx(-1.0)
     np.testing.assert_allclose(result.item_effects, [0.5])
-    np.testing.assert_allclose(estimator.predict_theta([[4.0]]), [14.0])
     np.testing.assert_allclose(estimator.predict_difficulty([[4.0]]), [1.0])
+    # The second-stage item regression does not enter the likelihood.
+    assert result.log_likelihood == pytest.approx(-10.0)
+    assert result.aic == pytest.approx(20.0 + 2 * 6)
 
     summary = result.summary()
-    assert "experience: 3.0000" in summary
     assert "complexity: 0.5000" in summary
 
 

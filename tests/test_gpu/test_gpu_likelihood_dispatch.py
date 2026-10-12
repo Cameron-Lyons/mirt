@@ -2,13 +2,11 @@
 
 import numpy as np
 import pytest
-from scipy.special import logsumexp
 
 import mirt._gpu_backend as backend
 import mirt.estimation.em as em_module
 from mirt.constants import PROB_EPSILON
 from mirt.estimation.em import EMEstimator
-from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.models.dichotomous import (
     OneParameterLogistic,
     ThreeParameterLogistic,
@@ -254,12 +252,12 @@ def test_active_thresholds_remain_finite(kernel, value, monkeypatch):
         )
 
 
-@pytest.mark.parametrize("kind", ["2pl", "3pl", "mirt"])
+@pytest.mark.parametrize("kind", ["2pl", "3pl"])
 @pytest.mark.parametrize("general_responses", [False, True])
 def test_binary_tensor_reduction_matches_public_curves(
     kind, general_responses, cpu_tensor_runtime
 ):
-    model = TwoParameterLogistic(7, n_factors=3) if kind == "mirt" else _model(kind)
+    model = _model(kind)
     rng = np.random.default_rng(983)
     values = model.parameters
     values["discrimination"] = rng.uniform(0.4, 2.0, values["discrimination"].shape)
@@ -280,7 +278,7 @@ def test_binary_tensor_reduction_matches_public_curves(
     params = model.parameters
     args = [
         data,
-        points if kind == "mirt" else points[:, 0],
+        points[:, 0],
         params["discrimination"],
         params["difficulty"],
     ]
@@ -311,37 +309,6 @@ def test_matrix_reduction_preserves_extreme_curves_and_response_buffers(
     ).numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
     np.testing.assert_array_equal(data, original)
-
-
-@pytest.mark.parametrize("mean,variance", [(0.0, 1.0), (0.4, 1.7)])
-def test_complete_tensor_e_step_preserves_prior_and_missing_rows(
-    mean, variance, cpu_tensor_runtime
-):
-    model = _model("2pl")
-    data = _data(model)
-    grid = GaussHermiteQuadrature(15)
-    points = grid.nodes[:, 0]
-    log_mass = np.log(grid.weights) - 0.5 * (
-        np.log(variance) + (points - mean) ** 2 / variance - points**2
-    )
-    log_mass -= logsumexp(log_mass)
-    joint = model.log_likelihood_batch(data, grid.nodes) + log_mass
-    normalizer = logsumexp(joint, axis=1)
-    params = model.parameters
-    posterior, marginal = backend.e_step_complete_gpu(
-        data,
-        points,
-        grid.weights,
-        params["discrimination"],
-        params["difficulty"],
-        mean,
-        variance,
-    )
-    np.testing.assert_allclose(
-        posterior, np.exp(joint - normalizer[:, None]), rtol=1e-12, atol=1e-12
-    )
-    np.testing.assert_allclose(marginal, np.exp(normalizer), rtol=1e-12, atol=1e-12)
-    assert marginal[0] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(

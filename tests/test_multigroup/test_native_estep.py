@@ -7,12 +7,12 @@ from typing import Any
 
 import numpy as np
 import pytest
-from scipy.special import logsumexp
+from scipy.special import expit, logsumexp
 
 from mirt._backend_state import get_backend_preference, set_backend_preference
 from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt._rust_backend import RUST_AVAILABLE
-from mirt.backends.rust import likelihood, multigroup, polytomous
+from mirt.backends.rust import multigroup, polytomous
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.models.polytomous import NominalResponseModel
 
@@ -60,6 +60,26 @@ def _reference(
     return posteriors, np.array(group_lls)
 
 
+def _binary_table(
+    responses: np.ndarray,
+    discrimination: np.ndarray,
+    difficulty: np.ndarray,
+    guessing: np.ndarray | None = None,
+) -> np.ndarray:
+    """Person-by-node log-likelihoods of 2PL or clipped 3PL items."""
+    logits = discrimination * (POINTS[:, None] - difficulty)
+    if guessing is None:
+        log_correct = -np.logaddexp(0.0, -logits)
+        log_incorrect = -np.logaddexp(0.0, logits)
+    else:
+        probability = guessing + (1.0 - guessing) * expit(logits)
+        probability = np.clip(probability, 1e-10, 1.0 - 1e-10)
+        log_correct, log_incorrect = np.log(probability), np.log1p(-probability)
+    correct = (responses == 1).astype(np.float64)
+    incorrect = (responses == 0).astype(np.float64)
+    return correct @ log_correct.T + incorrect @ log_incorrect.T
+
+
 def _dichotomous_case(guessing: bool) -> tuple[Callable[[], Any], list[np.ndarray]]:
     rng = np.random.default_rng(11)
     binary = np.full(N_ITEMS, 2)
@@ -69,7 +89,7 @@ def _dichotomous_case(guessing: bool) -> tuple[Callable[[], Any], list[np.ndarra
     diff = [np.r_[3.0, rng.normal(0.0, 1.0, N_ITEMS - 1)] for _ in MEANS]
     if not guessing:
         tables = [
-            likelihood.compute_log_likelihoods_2pl(r, POINTS, a, b)
+            _binary_table(r, a, b)
             for r, a, b in zip(responses, disc, diff, strict=True)
         ]
         return (
@@ -80,7 +100,7 @@ def _dichotomous_case(guessing: bool) -> tuple[Callable[[], Any], list[np.ndarra
         )
     guess = [rng.uniform(0.05, 0.3, N_ITEMS) for _ in MEANS]
     tables = [
-        likelihood.compute_log_likelihoods_3pl(r, POINTS, a, b, c)
+        _binary_table(r, a, b, c)
         for r, a, b, c in zip(responses, disc, diff, guess, strict=True)
     ]
     return (
@@ -195,51 +215,11 @@ def test_steep_dichotomous_items_use_exact_log_probabilities() -> None:
         [responses], POINTS, WEIGHTS, [disc], [diff], np.zeros(1), np.ones(1)
     )
     assert result is not None
-    table = likelihood.compute_log_likelihoods_2pl(responses, POINTS, disc, diff)
+    table = _binary_table(responses, disc, diff)
     log_mass = gaussian_log_quadrature_mass(POINTS, WEIGHTS, np.zeros(1), np.eye(1))
 
     assert table.max() < 2.0 * np.log(1e-10)
     np.testing.assert_allclose(result[1], [logsumexp(table[0] + log_mass)], rtol=1e-12)
-
-
-def test_multigroup_expected_counts_match_posterior_products() -> None:
-    binary = np.full(N_ITEMS, 2)
-    responses = [_responses(40, binary, 5), _responses(25, binary, 6)]
-    rng = np.random.default_rng(9)
-    posteriors = [rng.dirichlet(np.ones(POINTS.size), len(r)) for r in responses]
-    # Strided posteriors must be handled like contiguous ones.
-    strided = [np.asfortranarray(posterior) for posterior in posteriors]
-
-    result = multigroup.multigroup_expected_counts(responses, strided)
-
-    assert result is not None
-    for r_k, n_k, group_responses, posterior in zip(
-        *result, responses, posteriors, strict=True
-    ):
-        np.testing.assert_allclose(
-            r_k, (group_responses == 1).T.astype(float) @ posterior, atol=1e-13
-        )
-        np.testing.assert_allclose(
-            n_k, (group_responses >= 0).T.astype(float) @ posterior, atol=1e-13
-        )
-
-
-@pytest.mark.parametrize(
-    ("posteriors", "message"),
-    [
-        ([np.full((3, POINTS.size), 1.0 / POINTS.size)], "one row per response row"),
-        ([], "one entry per response matrix"),
-    ],
-)
-def test_multigroup_expected_counts_validate_posteriors(
-    posteriors: list[np.ndarray], message: str
-) -> None:
-    from mirt import mirt_rs
-
-    responses = [np.array([[0, 1], [1, -1]], dtype=np.int32)]
-
-    with pytest.raises(ValueError, match=message):
-        mirt_rs.multigroup_expected_counts(responses, posteriors)
 
 
 @pytest.mark.parametrize("model", ["grm", "gpcm", "nrm"])

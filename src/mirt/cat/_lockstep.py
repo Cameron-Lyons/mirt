@@ -41,6 +41,7 @@ from mirt._model_defaults import (
     uses_builtin_model_hooks,
     uses_original_model_hook,
 )
+from mirt.cat._information import item_information
 from mirt.cat._native import uses_native_defaults
 from mirt.cat.content import NoContentConstraint
 from mirt.cat.exposure import NoExposureControl
@@ -174,11 +175,12 @@ def _plan(engine: Any) -> _Plan | None:
 
     model = engine.model
     n_items = model.n_items
+    prior_mean, prior_cov = engine._scoring_prior()
     points, weights = build_quadrature(
         n_quadpts=int(engine.n_quadpts),
         n_factors=1,
-        prior_mean=None,
-        prior_cov=None,
+        prior_mean=prior_mean,
+        prior_cov=prior_cov,
     )
     nodes = points[:, 0]
     binary_scoring = _uses_binary_eap(model)
@@ -232,17 +234,11 @@ def _plan(engine: Any) -> _Plan | None:
 
 
 def _item_information(model: Any, theta: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Return item information with shape (len(theta), n_items)."""
-    theta_2d = theta[:, None]
-    if not model.is_polytomous:
-        return np.asarray(model.information(theta_2d), dtype=np.float64).reshape(
-            len(theta), model.n_items
-        )
-    information = np.empty((len(theta), model.n_items))
-    for item_idx in range(model.n_items):
-        values = np.asarray(model.information(theta_2d, item_idx=item_idx))
-        information[:, item_idx] = values.reshape(len(theta), -1).sum(axis=1)
-    return information
+    """Return item information with shape (len(theta), n_items).
+
+    This is the evaluation sequential MFI selection uses, row by row.
+    """
+    return item_information(model, theta[:, None], np.arange(model.n_items))
 
 
 def _select_items(
@@ -430,6 +426,7 @@ def _block_results(engine: Any, block: _Block) -> list[CATResult]:
                 theta_history=block.theta_history[row, :count].tolist(),
                 se_history=block.se_history[row, :count].tolist(),
                 item_info_history=block.info_history[row, :count].tolist(),
+                polytomous=bool(engine.model.is_polytomous),
             )
         )
     return results

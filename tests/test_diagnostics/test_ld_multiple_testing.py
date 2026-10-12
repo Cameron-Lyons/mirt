@@ -4,6 +4,7 @@ from numpy.testing import assert_allclose
 from scipy import stats
 
 import mirt.diagnostics.ld as ld_module
+from mirt._local_dependence import MarginalLDStatistics
 from mirt.diagnostics.ld import (
     LDResult,
     compute_ld_chi2,
@@ -29,23 +30,29 @@ class MinimalModel:
     item_names = ["one", "two", "three"]
 
 
+def _statistics(chi2):
+    """Pair statistics with one degree of freedom per pair."""
+    degrees = np.ones_like(chi2)
+    np.fill_diagonal(degrees, np.nan)
+    return MarginalLDStatistics(
+        chi2, chi2.copy(), degrees, np.zeros_like(chi2), np.zeros((3, 3), int)
+    )
+
+
 def test_compute_ld_statistics_stores_raw_and_adjusted_pair_probabilities(monkeypatch):
     raw_p_values = np.array([0.01, 0.03, 0.20])
     chi2 = _chi2_matrix_from_p_values(raw_p_values)
     q3 = np.zeros((3, 3))
     monkeypatch.setattr(
         ld_module,
-        "_compute_residuals_and_positive_probabilities",
-        lambda model, responses, theta: (
-            np.zeros_like(responses, dtype=np.float64),
-            np.full_like(responses, 0.5, dtype=np.float64),
-        ),
+        "_compute_raw_residuals",
+        lambda model, responses, theta: np.zeros_like(responses, dtype=np.float64),
     )
     monkeypatch.setattr(ld_module, "_compute_q3", lambda residuals, responses: q3)
     monkeypatch.setattr(
         ld_module,
         "_compute_ld_chi2_g2",
-        lambda model, responses, theta, n_quadpts, **kwargs: (chi2, chi2.copy()),
+        lambda model, responses, n_quadpts, **kwargs: _statistics(chi2),
     )
 
     result = compute_ld_statistics(
@@ -81,19 +88,33 @@ def test_compute_ld_chi2_returns_requested_adjustment(monkeypatch, method, expec
     monkeypatch.setattr(
         ld_module,
         "_compute_ld_chi2_g2",
-        lambda model, responses, theta, n_quadpts: (chi2, chi2.copy()),
+        lambda model, responses, n_quadpts, **kwargs: _statistics(chi2),
     )
 
     _, p_value_matrix = compute_ld_chi2(
         MinimalModel(),
         np.zeros((12, 3), dtype=np.int64),
-        theta=np.zeros(12),
         p_adjust=method,
     )
 
     rows, columns = np.triu_indices(3, k=1)
     assert_allclose(p_value_matrix[rows, columns], expected)
-    assert_allclose(p_value_matrix, p_value_matrix.T)
+    assert_allclose(p_value_matrix, p_value_matrix.T, equal_nan=True)
+    assert np.all(np.isnan(np.diag(p_value_matrix)))
+
+
+def test_stored_degrees_of_freedom_drive_pair_selection():
+    """Polytomous pairs are tested on (K_i - 1)(K_j - 1) degrees of freedom."""
+    chi2 = _chi2_matrix_from_p_values([0.01, 0.03, 0.20])
+    q3 = np.zeros_like(chi2)
+    degrees = np.full_like(chi2, 4.0)
+    np.fill_diagonal(degrees, np.nan)
+    result = LDResult(q3, chi2, chi2.copy(), q3.copy(), [], [], chi2_df_matrix=degrees)
+
+    # The one-df statistic of p = 0.01 has p = 0.17 on four degrees of freedom.
+    assert flag_ld_pairs(result, method="chi2") == []
+    table = ld_summary_table(result, top_n=1)
+    assert f"{stats.chi2.sf(chi2[0, 1], df=4):.4f}" in table
 
 
 def test_flag_ld_pairs_uses_stored_adjustment_and_all_pair_tests():

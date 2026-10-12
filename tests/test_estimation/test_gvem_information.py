@@ -200,25 +200,23 @@ def test_custom_objectives_and_steps_keep_numerical_fallback(monkeypatch, overri
         monkeypatch.setattr(
             estimator, "_compute_elbo_python", quadratic.__get__(estimator)
         )
-        import mirt.estimation.gvem as module
-
-        monkeypatch.setattr(module, "_rust_gvem_compute_elbo", lambda *args: None)
     elif override == "step":
         estimator.se_step_size = 1e-3
-        # Record objective calls without changing the estimator's methods.
-        import mirt.estimation.gvem as module
+        # Record objective calls without changing what they compute.
+        objective = estimator._compute_elbo_python
 
         def record(*args):
             calls.append(args)
-            return None
+            return objective(*args)
 
-        monkeypatch.setattr(module, "_rust_gvem_compute_elbo", record)
+        monkeypatch.setattr(estimator, "_compute_elbo_python", record)
     else:
         monkeypatch.setattr(estimator, "_compute_elbo", quadratic.__get__(estimator))
 
     mean, cov = np.array([0.2, -0.3, 0.1]), np.eye(3)
     result = estimator._compute_standard_errors(model, responses, mean, cov)
-    assert len(calls) == 2 * model.n_parameters + 1
+    n_free = sum(int(mask.sum()) for mask in model.free_parameter_masks.values())
+    assert len(calls) == 2 * n_free + 1
     if override != "step":
         for value in result.values():
             np.testing.assert_allclose(value, np.sqrt(0.5), rtol=1e-4)
@@ -308,7 +306,14 @@ def test_complete_fit_matches_numerical_uncertainty(backend, factors, monkeypatc
         numerical = numerical_estimator.fit(
             mirt.TwoParameterLogistic(5, n_factors=factors), data
         )
-        assert checked_estimators == [analytic_estimator, numerical_estimator]
+        # One factor reports the observed information of the marginal
+        # likelihood, so the variational curvature is not computed.
+        assert checked_estimators == (
+            [] if factors == 1 else [analytic_estimator, numerical_estimator]
+        )
+        expected_method = "oakes" if factors == 1 else "variational_curvature"
+        assert analytic.se_method == numerical.se_method == expected_method
+        assert (analytic.vcov is not None) == (factors == 1)
         # Independent fits can differ in the last bits of float reductions.
         roundoff = 32 * np.finfo(np.float64).eps
         np.testing.assert_allclose(

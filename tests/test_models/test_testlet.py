@@ -8,6 +8,7 @@ import pytest
 from numpy.typing import NDArray
 
 from mirt import TestletModel, create_testlet_structure
+from mirt.estimation.em import EMEstimator
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.testlet import (
     BifactorTestletModel,
@@ -585,3 +586,244 @@ class TestTestletDiagnostics:
                 values["difficulty"],
                 values["membership"],
             )
+
+
+@pytest.mark.parametrize(
+    ("n_items", "membership"), [(3, [0, 1, 2]), (6, [0, 0, 0, 1, 1, 1])]
+)
+def test_generic_em_standard_errors_hold_testlet_variances_fixed(
+    n_items: int, membership: list[int]
+) -> None:
+    """Complete-data errors skip model-level variances, as the M-step does.
+
+    Three items in three testlets give a variance vector as long as the item
+    count, which must still not be read as one value per item.
+    """
+    from mirt.estimation.em import EMEstimator
+
+    model = TestletModel(n_items=n_items, testlet_membership=np.array(membership))
+    responses = np.random.default_rng(0).integers(0, 2, (300, n_items))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # Rectangular quadrature keeps the product grid, whose "auto" errors
+        # are itemwise complete-data curvatures.
+        result = EMEstimator(n_quadpts=9, max_iter=20, quadrature="rectangular").fit(
+            model, responses
+        )
+
+    errors = result.standard_errors
+    assert result.se_method == "complete_data"
+    np.testing.assert_array_equal(errors["testlet_variances"], 0.0)
+    for name in ("discrimination", "difficulty", "testlet_loadings"):
+        assert errors[name].shape == (n_items,)
+        assert np.all(np.isfinite(errors[name])) and np.all(errors[name] > 0)
+
+
+def _simulated_testlet_responses(
+    seed: int,
+    n_persons: int,
+    membership: list[int],
+    loading: float = 0.9,
+) -> NDArray[np.int_]:
+    """Draw responses from a testlet model with unit testlet variances."""
+    rng = np.random.default_rng(seed)
+    n_items = len(membership)
+    model = TestletModel(n_items, membership)
+    in_testlet = np.asarray(membership) >= 0
+    model.set_parameters(
+        discrimination=rng.uniform(0.8, 1.6, n_items),
+        testlet_loadings=np.where(in_testlet, loading, 0.0),
+        difficulty=rng.normal(0.0, 0.8, n_items),
+    )
+    probability = model.probability(rng.standard_normal((n_persons, model.n_factors)))
+    return (rng.random(probability.shape) < probability).astype(int)
+
+
+class TestTestletVarianceIdentification:
+    """Loadings and variances enter only as ``d_j * sigma_t``."""
+
+    def test_full_theta_curves_scale_standardized_effects(self) -> None:
+        model = TestletModel(4, [0, 0, 1, 1])
+        loadings = np.array([0.8, 0.6, 1.0, 0.5])
+        model.set_parameters(testlet_loadings=loadings)
+        rescaled = model.copy().set_parameters(
+            testlet_variances=np.array([4.0, 4.0]), testlet_loadings=loadings / 2
+        )
+        theta = np.random.default_rng(0).standard_normal((7, 3))
+
+        np.testing.assert_allclose(
+            rescaled.probability(theta), model.probability(theta)
+        )
+        np.testing.assert_allclose(
+            rescaled.probability(theta[:, 0]), model.probability(theta[:, 0])
+        )
+        np.testing.assert_allclose(
+            rescaled.information(theta), model.information(theta)
+        )
+
+    def test_variance_is_free_only_with_every_loading_fixed(self) -> None:
+        model = TestletModel(5, [0, 0, 1, 1, -1])
+        assert not model.free_parameter_masks["testlet_variances"].any()
+        assert model.n_parameters == 5 + 4 + 5
+
+        fixed = np.array([False, False, True, True, False])
+        model.set_free_parameter_masks({"testlet_loadings": fixed})
+        np.testing.assert_array_equal(
+            model.free_parameter_masks["testlet_variances"], [True, False]
+        )
+        assert model.n_parameters == 5 + 2 + 5 + 1
+
+        model.set_free_parameter_masks(
+            {"testlet_loadings": fixed, "testlet_variances": np.array([False, False])}
+        )
+        assert not model.free_parameter_masks["testlet_variances"].any()
+        with pytest.raises(MirtValidationError, match="model-family fixed"):
+            model.set_free_parameter_masks(
+                {"testlet_variances": np.array([True, False])}
+            )
+
+    def test_em_curves_agree_with_a_fixed_starting_variance(self) -> None:
+        membership = [0, 0, 0, 0, 1, 1, 1, 1, -1, -1]
+        responses = _simulated_testlet_responses(2, 1000, membership)
+        model = RandomTestletEffectsModel(10, membership)
+        model.set_all_testlet_variances(2.5)
+
+        result = EMEstimator(n_quadpts=11).fit(model, responses, start="model")
+
+        # The variance stays at its value and the loadings absorb it, so the
+        # general-only curves reproduce each item's observed proportion.
+        np.testing.assert_array_equal(result.model.testlet_variances, 2.5)
+        assert result.n_parameters == 28
+        nodes, weights = _normal_quadrature(41)
+        implied = weights @ result.model.probability(nodes)
+        np.testing.assert_allclose(implied, responses.mean(axis=0), atol=0.01)
+
+    def test_em_estimates_variances_of_testlets_with_fixed_loadings(self) -> None:
+        membership = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1]
+        responses = _simulated_testlet_responses(4, 2000, membership, loading=1.0)
+        model = RandomTestletEffectsModel(10, membership)
+        model.set_parameters(testlet_loadings=np.ones(10))
+        model.set_free_parameter_masks({"testlet_loadings": np.zeros(10, dtype=bool)})
+
+        result = EMEstimator(n_quadpts=15).fit(model, responses)
+
+        variances = result.model.testlet_variances
+        errors = result.standard_errors["testlet_variances"]
+        assert result.converged
+        assert result.n_parameters == 10 + 10 + 2
+        np.testing.assert_allclose(variances, 1.0, atol=3 * errors.max())
+        assert np.all(errors > 0.02) and np.all(errors < 0.5)
+
+    def test_method_of_moments_variances_match_the_generating_values(self) -> None:
+        rng = np.random.default_rng(9)
+        membership = [0] * 5 + [1] * 5
+        for variance in (0.25, 1.0, 4.0):
+            model = RandomTestletEffectsModel(10, membership)
+            model.set_parameters(
+                discrimination=np.full(10, 1.2),
+                testlet_loadings=np.ones(10),
+                difficulty=np.linspace(-1.0, 1.0, 10),
+                testlet_variances=np.full(2, variance),
+            )
+            theta = rng.standard_normal(8000)
+            full = np.column_stack([theta, rng.standard_normal((8000, 2))])
+            probability = model.probability(full)
+            responses = (rng.random(probability.shape) < probability).astype(int)
+
+            estimate = model.estimate_testlet_variances(responses, theta)
+
+            np.testing.assert_allclose(estimate, variance, rtol=0.2)
+
+
+class TestTestletEstimation:
+    """Testlet models are fitted as bifactor models on reduced grids."""
+
+    def test_em_reduction_matches_the_product_grid_likelihood(self) -> None:
+        from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+        membership = [0, 0, 0, 1, 1, 1, -1]
+        responses = _simulated_testlet_responses(5, 400, membership)
+        result = EMEstimator(n_quadpts=9).fit(TestletModel(7, membership), responses)
+
+        quadrature = GaussHermiteQuadrature(n_points=9, n_dimensions=3)
+        log_likelihood = result.model.log_likelihood_batch(responses, quadrature.nodes)
+        log_mass = np.log(quadrature.weights / quadrature.weights.sum())
+        exact = np.sum(np.logaddexp.reduce(log_likelihood + log_mass, axis=1))
+        assert result.se_method == "oakes"
+        np.testing.assert_allclose(result.log_likelihood, exact, rtol=0, atol=1e-8)
+
+    def test_em_fits_many_testlets_with_default_settings(self) -> None:
+        membership = create_testlet_structure(30, [5] * 6)
+        responses = _simulated_testlet_responses(3, 1500, list(membership), 0.8)
+
+        result = EMEstimator().fit(RandomTestletEffectsModel(30, membership), responses)
+
+        loadings = result.model.testlet_loadings
+        assert result.converged
+        assert result.n_parameters == 90
+        assert np.sqrt(np.mean((loadings - 0.8) ** 2)) < 0.3
+
+    def test_em_estimates_one_common_loading_per_testlet(self) -> None:
+        membership = [0, 0, 0, 0, 1, 1, 1, 1, -1, -1]
+        responses = _simulated_testlet_responses(7, 800, membership)
+        fits = [
+            EMEstimator(n_quadpts=9, tol=1e-6, **options).fit(
+                BifactorTestletModel(10, membership, constrain_testlet_loadings=True),
+                responses,
+            )
+            # SQUAREM keeps the product grid of the same Gauss-Hermite rule.
+            for options in (
+                {},
+                {"quadrature": "gauss-hermite", "accelerate": "squarem"},
+            )
+        ]
+
+        for result in fits:
+            loadings = result.model.testlet_loadings
+            errors = result.standard_errors["testlet_loadings"]
+            assert result.converged
+            assert result.n_parameters == 10 + 10 + 2
+            for items in (slice(0, 4), slice(4, 8)):
+                np.testing.assert_array_equal(loadings[items], loadings[items][0])
+                np.testing.assert_array_equal(errors[items], errors[items][0])
+            assert np.all(np.abs(loadings[:8] - 0.9) < 3 * errors[:8])
+        reduced, product = (result.model.testlet_loadings for result in fits)
+        np.testing.assert_allclose(reduced, product, atol=2e-3)
+        np.testing.assert_allclose(
+            fits[0].log_likelihood, fits[1].log_likelihood, atol=1e-3
+        )
+
+
+def test_reliability_coefficients_match_the_equivalent_bifactor_model() -> None:
+    from mirt.models.bifactor import BifactorModel
+
+    membership = [0, 0, 0, 1, 1, -1]
+    discrimination = np.array([1.2, 0.8, 1.5, 1.0, 2.0, 0.9])
+    loadings = np.array([0.7, 1.1, 0.4, 0.9, 0.6, 0.0])
+    variances = np.array([2.0, 0.5])
+    testlet = BifactorTestletModel(6, membership)
+    testlet.set_parameters(
+        discrimination=discrimination,
+        testlet_loadings=loadings,
+        testlet_variances=variances,
+    )
+    # The standalone item loads on a specific factor of its own with slope 0.
+    bifactor = BifactorModel(6, [0, 0, 0, 1, 1, 2])
+    bifactor.set_parameters(
+        general_loadings=discrimination,
+        specific_loadings=loadings * np.sqrt(np.r_[variances[[0, 0, 0, 1, 1]], 0.0]),
+    )
+    general, specific, unique = bifactor._standardized_components()
+
+    assert testlet.omega_hierarchical() == pytest.approx(
+        bifactor.omega_hierarchical(), rel=1e-12
+    )
+    reliability = testlet.testlet_reliability()
+    assert reliability[0] == pytest.approx(bifactor.omega_subscale(0), rel=1e-12)
+    assert reliability[1] == pytest.approx(bifactor.omega_subscale(1), rel=1e-12)
+    shares = testlet.explained_variance()
+    assert shares["general"] == pytest.approx(np.mean(general**2), rel=1e-12)
+    assert shares["testlet"] == pytest.approx(np.mean(specific**2), rel=1e-12)
+    assert shares["unique"] == pytest.approx(np.mean(unique), rel=1e-12)
+    assert shares["total_common"] == pytest.approx(1.0 - np.mean(unique), rel=1e-12)

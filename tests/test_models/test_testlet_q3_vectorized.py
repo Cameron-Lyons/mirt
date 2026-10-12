@@ -138,32 +138,70 @@ def test_q3_row_chunking_preserves_results(monkeypatch: pytest.MonkeyPatch) -> N
     assert actual["n_between_pairs"] == expected["n_between_pairs"]
 
 
-def test_testlet_variance_estimates_match_pairwise_reference() -> None:
-    responses, theta, discrimination, difficulty, _ = _q3_inputs()
+def _pairwise_moment(
+    responses: np.ndarray,
+    theta: np.ndarray,
+    model: RandomTestletEffectsModel,
+    items: np.ndarray,
+    sigma: float,
+) -> float:
+    """Observed minus implied within-testlet covariance, pair by pair."""
+    nodes, weights = np.polynomial.hermite.hermgauss(model.n_quadpts)
+    nodes, weights = nodes * np.sqrt(2.0), weights / np.sqrt(np.pi)
+    values = np.asarray(responses, dtype=np.float64)
+    observed = np.isfinite(values) & (values >= 0.0)
+    a, d, b = (
+        model.discrimination[items],
+        model.testlet_loadings[items],
+        model.difficulty[items],
+    )
+    curves = 1.0 / (
+        1.0
+        + np.exp(
+            -(
+                theta[:, None, None] * a[None, :, None]
+                - b[None, :, None]
+                + sigma * d[None, :, None] * nodes[None, None, :]
+            )
+        )
+    )
+    marginal = curves @ weights
+    total = 0.0
+    for first in range(items.size):
+        for second in range(first + 1, items.size):
+            rows = observed[:, items[first]] & observed[:, items[second]]
+            residual = (values[rows, items[first]] - marginal[rows, first]) * (
+                values[rows, items[second]] - marginal[rows, second]
+            )
+            joint = (curves[rows, first] * curves[rows, second]) @ weights
+            implied = joint - marginal[rows, first] * marginal[rows, second]
+            total += float(np.sum(residual - implied))
+    return total
+
+
+def test_testlet_variance_estimates_solve_the_pairwise_moment_condition() -> None:
+    rng = np.random.default_rng(2026)
     membership = np.array([0, 0, 0, 4, 4, 4, -1])
-    model = RandomTestletEffectsModel(
-        n_items=responses.shape[1],
-        testlet_membership=membership,
-    )
+    model = RandomTestletEffectsModel(7, membership)
     model.set_parameters(
-        discrimination=discrimination,
-        difficulty=difficulty,
+        discrimination=rng.lognormal(0.0, 0.25, 7),
+        testlet_loadings=np.r_[np.ones(6), 0.0],
+        difficulty=rng.normal(size=7),
+        testlet_variances=np.array([1.5, 0.6]),
     )
+    theta = rng.normal(size=600)
+    full = np.column_stack([theta, rng.normal(size=(600, 2))])
+    probabilities = model.probability(full)
+    responses = (rng.random(probabilities.shape) < probabilities).astype(np.float64)
+    responses[rng.random(responses.shape) < 0.18] = -1.0
+    responses[0, 0] = np.nan
 
     actual = model.estimate_testlet_variances(responses, theta)
-    expected_q3, _ = _pairwise_reference(
-        responses,
-        theta,
-        discrimination,
-        difficulty,
-    )
-    expected = np.zeros(model.n_testlets)
+
+    assert np.all((actual > 0.0) & (actual < 25.0))
     for position, label in enumerate(model.testlet_labels):
         items = np.flatnonzero(membership == label)
-        correlations = expected_q3[np.ix_(items, items)]
-        values = correlations[np.triu_indices(len(items), k=1)]
-        finite_values = values[np.isfinite(values)]
-        if finite_values.size:
-            expected[position] = max(0.0, float(np.mean(finite_values)))
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        sigma = float(np.sqrt(actual[position]))
+        below = _pairwise_moment(responses, theta, model, items, 0.999 * sigma)
+        above = _pairwise_moment(responses, theta, model, items, 1.001 * sigma)
+        assert below > 0.0 > above

@@ -3,8 +3,12 @@
 import numpy as np
 import pytest
 
+import mirt
 from mirt import _information
+from mirt.exceptions import MirtValidationError
 from mirt.models import GradedResponseModel, MultidimensionalModel, TwoParameterLogistic
+from mirt.results.fit_result import FitResult
+from mirt.results.score_result import ScoreResult
 from mirt.utils.reliability import conditional_rxx, empirical_rxx, marginal_rxx, sem
 
 
@@ -64,7 +68,7 @@ def test_zero_information_has_unbounded_error_and_zero_reliability(
 
     with np.errstate(divide="raise", invalid="raise", over="raise", under="ignore"):
         standard_errors = sem(logistic_model, theta)
-        empirical = empirical_rxx(logistic_model, theta)
+        empirical = empirical_rxx(logistic_model, theta, method="information")
         marginal = marginal_rxx(
             logistic_model,
             theta_range=(1e6, 2e6),
@@ -146,7 +150,7 @@ def test_information_reliability_supports_polytomous_models(
 ) -> None:
     theta = np.linspace(-1.5, 1.5, 20)
 
-    result = empirical_rxx(graded_model, theta)
+    result = empirical_rxx(graded_model, theta, method="information")
 
     assert 0.0 < result < 1.0
 
@@ -223,13 +227,13 @@ def test_information_reliability_rejects_multidimensional_models() -> None:
     model = MultidimensionalModel(n_items=4, n_factors=2)
 
     with pytest.raises(ValueError, match="factor-specific"):
-        empirical_rxx(model, [[-1.0, -0.5], [1.0, 0.5]])
+        empirical_rxx(model, [[-1.0, -0.5], [1.0, 0.5]], method="information")
 
 
 def test_empirical_reliability_handles_zero_variance(
     logistic_model: TwoParameterLogistic,
 ) -> None:
-    assert empirical_rxx(logistic_model, [0.0, 0.0, 0.0]) == 0.0
+    assert empirical_rxx(logistic_model, [0.0, 0.0, 0.0], method="information") == 0.0
 
 
 @pytest.mark.parametrize("scale", [1e-308, 1e-160, 1e-8, 1.0, 1e160, 1e308])
@@ -306,10 +310,14 @@ def test_information_reliability_avoids_overflowing_error_variances(
     monkeypatch.setattr(
         logistic_model, "information", lambda theta: np.full(len(theta), information)
     )
-    expected = 1.0 / (1.0 + (1.0 / np.sqrt(information) / scale) ** 2)
+    # Information-based errors are those of ML estimates, whose variance
+    # already contains them (R's T_as_X = TRUE).
+    expected = max(0.0, 1.0 - (1.0 / np.sqrt(information) / scale) ** 2)
 
     with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
-        actual = empirical_rxx(logistic_model, np.array([-1.0, 0.0, 1.0]) * scale)
+        actual = empirical_rxx(
+            logistic_model, np.array([-1.0, 0.0, 1.0]) * scale, method="information"
+        )
 
     assert actual == pytest.approx(expected, abs=1e-14)
 
@@ -410,9 +418,9 @@ def test_information_evaluation_uses_bounded_blocks_without_changing_results(
         actual = conditional_rxx(model, theta, latent_variance=2.5)
         expected = information * 2.5 / (1.0 + information * 2.5)
     else:
-        actual = empirical_rxx(model, theta)
+        actual = empirical_rxx(model, theta, method="information")
         variance = np.var(theta, ddof=1)
-        expected = variance / (variance + np.mean(1.0 / information))
+        expected = 1.0 - np.mean(1.0 / information) / variance
 
     np.testing.assert_allclose(actual, expected, atol=1e-14)
     np.testing.assert_array_equal(np.concatenate(calls)[:, 0], original)
@@ -446,3 +454,118 @@ def test_reliability_validates_item_information_before_reducing(
     with np.errstate(over="raise", invalid="raise", divide="raise"):
         with pytest.raises(ValueError, match=message):
             sem(logistic_model, [-1.0, 0.0, 1.0])
+
+
+def test_posterior_score_result_uses_r_empirical_rxx_formula(
+    logistic_model: TwoParameterLogistic,
+) -> None:
+    theta = np.array([-1.2, -0.3, 0.1, 0.4, 1.0])
+    errors = np.array([0.5, 0.4, 0.45, 0.4, 0.55])
+    variance = np.var(theta, ddof=1)
+    expected = variance / (variance + np.mean(errors**2))
+
+    actual = empirical_rxx(logistic_model, ScoreResult(theta, errors, "EAP"))
+
+    assert actual == pytest.approx(expected, abs=1e-14)
+    assert actual == pytest.approx(
+        empirical_rxx(logistic_model, theta, standard_errors=errors), abs=1e-14
+    )
+
+
+def test_ml_score_result_removes_error_variance_and_drops_infinite_rows(
+    logistic_model: TwoParameterLogistic,
+) -> None:
+    # R's empirical_rxx(..., T_as_X = TRUE) after dropping non-finite scores.
+    theta = np.array([-1.5, -0.4, 0.2, 0.9, 6.0])
+    errors = np.array([0.6, 0.45, 0.4, 0.5, np.inf])
+    finite = np.isfinite(errors)
+    expected = 1.0 - np.mean(errors[finite] ** 2) / np.var(theta[finite], ddof=1)
+
+    actual = empirical_rxx(logistic_model, ScoreResult(theta, errors, "ML"))
+
+    assert actual == pytest.approx(expected, abs=1e-14)
+    assert actual == pytest.approx(
+        empirical_rxx(
+            logistic_model,
+            theta[finite],
+            standard_errors=errors[finite],
+            scores_include_error=True,
+        ),
+        abs=1e-14,
+    )
+
+
+def test_empirical_reliability_is_unbiased_for_eap_and_ml_scores() -> None:
+    rng = np.random.default_rng(4)
+    n_items = 15
+    model = TwoParameterLogistic(n_items=n_items)
+    model.set_parameters(
+        discrimination=rng.lognormal(0.0, 0.3, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+    )
+    model._is_fitted = True
+    theta = rng.standard_normal(3000)
+    responses = mirt.simdata(
+        model="2PL",
+        theta=theta,
+        discrimination=model.parameters["discrimination"],
+        difficulty=model.parameters["difficulty"],
+        seed=1,
+    )
+    eap = mirt.fscores(model, responses, method="EAP")
+    ml = mirt.fscores(model, responses, method="ML")
+    finite = np.isfinite(ml.standard_error.ravel())
+    eap_truth = np.corrcoef(theta, eap.theta.ravel())[0, 1] ** 2
+    ml_truth = np.corrcoef(theta[finite], ml.theta.ravel()[finite])[0, 1] ** 2
+
+    # The former information default gave 0.67 for EAP and 0.78 for ML
+    # scores against true reliabilities of 0.73 and 0.72.
+    assert empirical_rxx(model, eap) == pytest.approx(eap_truth, abs=0.02)
+    assert empirical_rxx(model, ml) == pytest.approx(ml_truth, abs=0.02)
+    assert empirical_rxx(
+        model, ml.theta.ravel()[finite], method="information"
+    ) == pytest.approx(ml_truth, abs=0.02)
+
+
+def test_empirical_reliability_without_errors_warns_about_ml_assumption(
+    logistic_model: TwoParameterLogistic,
+) -> None:
+    theta = np.array([-1.0, 0.0, 1.0])
+
+    with pytest.warns(UserWarning, match="assumes ML or WLE"):
+        implicit = empirical_rxx(logistic_model, theta)
+
+    assert implicit == empirical_rxx(logistic_model, theta, method="information")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"standard_errors": [0.5, 0.5]}, "carries its own"),
+        ({"scores_include_error": "yes"}, "must be boolean"),
+    ],
+)
+def test_empirical_reliability_validates_score_result_options(
+    logistic_model: TwoParameterLogistic,
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    scores = ScoreResult(np.array([-1.0, 1.0]), np.array([0.5, 0.5]), "EAP")
+
+    with pytest.raises(MirtValidationError, match=message):
+        empirical_rxx(logistic_model, scores, **kwargs)  # type: ignore[arg-type]
+
+
+def test_reliability_helpers_accept_fit_results(
+    logistic_model: TwoParameterLogistic,
+) -> None:
+    fit = FitResult(logistic_model, -1.0, 1, True, {}, 4.0, 5.0)
+    theta = np.array([-1.0, 0.0, 1.0])
+    errors = np.full(3, 0.5)
+
+    np.testing.assert_array_equal(sem(fit, theta), sem(logistic_model, theta))
+    assert empirical_rxx(fit, theta, standard_errors=errors) == empirical_rxx(
+        logistic_model, theta, standard_errors=errors
+    )
+    with pytest.raises(MirtValidationError, match="item model or a FitResult"):
+        sem(np.ones(3), theta)  # type: ignore[arg-type]

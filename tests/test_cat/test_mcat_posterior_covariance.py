@@ -83,19 +83,39 @@ def test_map_keeps_its_existing_standard_error_approximation():
     assert_allclose(state.covariance, np.diag(scores.standard_error.ravel() ** 2))
 
 
-def test_failed_covariance_update_preserves_previous_state(monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("model likelihoods must produce finite posterior mass"),
+        np.linalg.LinAlgError("singular"),
+        FloatingPointError("overflow"),
+    ],
+)
+def test_failed_covariance_update_preserves_previous_state(monkeypatch, error):
     engine = MCATEngine(_model())
     original_theta = engine._current_theta.copy()
     original_covariance = engine._current_covariance.copy()
 
     def fail(*args, **kwargs):
-        raise ValueError("posterior unavailable")
+        raise error
 
     monkeypatch.setattr("mirt.cat._eap.score_binary_eap", fail)
-    engine._update_theta()
+    with pytest.warns(RuntimeWarning, match="keeping the previous estimate"):
+        engine._update_theta()
 
     assert_allclose(engine._current_theta, original_theta)
     assert_allclose(engine._current_covariance, original_covariance)
+
+
+def test_configuration_errors_in_an_update_are_not_swallowed(monkeypatch):
+    engine = MCATEngine(_model())
+
+    def fail(*args, **kwargs):
+        raise ValueError("Unknown scoring method: eap")
+
+    monkeypatch.setattr("mirt.cat._eap.score_binary_eap", fail)
+    with pytest.raises(ValueError, match="Unknown scoring method"):
+        engine._update_theta()
 
 
 @pytest.mark.parametrize("method", ["EAP", "MAP"])

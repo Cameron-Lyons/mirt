@@ -50,69 +50,60 @@ def _scalar_grdif_reference(
     unique_groups: np.ndarray,
     scaling_method: str,
 ) -> tuple[np.ndarray, ...]:
+    """Per-item contrast-form Wald tests, as in ``irtQ::grdif``.
+
+    Squared residuals are centred at ``P(1 - P)``; group-mean variances use
+    the chosen scale and the covariance the sample correlation.
+    """
     n_items = data.shape[1]
-    n_groups = len(unique_groups)
-    grdif_r = np.zeros(n_items)
-    grdif_s = np.zeros(n_items)
+    outputs = np.full((6, n_items), np.nan)
 
     for item_index in range(n_items):
-        mrr_values: list[float] = []
-        msr_values: list[float] = []
-        var_mrr_values: list[float] = []
-        var_msr_values: list[float] = []
-        counts: list[int] = []
+        means: list[np.ndarray] = []
+        covariances: list[np.ndarray] = []
         for group in unique_groups:
             mask = group_masks[group]
             responses = data[mask, item_index]
-            group_theta = theta[mask]
             valid = responses >= 0
             n_valid = int(np.count_nonzero(valid))
             if n_valid < 2:
-                mrr_values.append(0.0)
-                msr_values.append(0.0)
-                var_mrr_values.append(1.0)
-                var_msr_values.append(1.0)
-                counts.append(1)
                 continue
-
-            expected = model.probability(
-                group_theta[valid], item_idx=item_index
+            probability = model.probability(
+                theta[mask][valid], item_idx=item_index
             ).ravel()
-            residuals = responses[valid] - expected
-            squared = residuals**2
-            mrr_values.append(float(np.mean(residuals)))
-            msr_values.append(float(np.mean(squared)))
-            var_mrr_values.append(
-                max(
-                    _compute_robust_scale(residuals, scaling_method) / n_valid,
-                    PROB_EPSILON,
-                )
+            residuals = responses[valid] - probability
+            excess = residuals**2 - probability * (1.0 - probability)
+            var_r = max(
+                _compute_robust_scale(residuals, scaling_method) / n_valid,
+                PROB_EPSILON,
             )
-            var_msr_values.append(
-                max(
-                    _compute_robust_scale(squared, scaling_method) / n_valid,
-                    PROB_EPSILON,
-                )
+            var_s = max(
+                _compute_robust_scale(excess, scaling_method) / n_valid,
+                PROB_EPSILON,
             )
-            counts.append(n_valid)
-
-        mrr = np.asarray(mrr_values)
-        msr = np.asarray(msr_values)
-        var_mrr = np.asarray(var_mrr_values)
-        var_msr = np.asarray(var_msr_values)
-        weights = np.asarray(counts) / np.sum(counts)
-        grdif_r[item_index] = np.sum((mrr - np.sum(weights * mrr)) ** 2 / var_mrr)
-        grdif_s[item_index] = np.sum((msr - np.sum(weights * msr)) ** 2 / var_msr)
-
-    grdif_rs = grdif_r + grdif_s
-    return (
-        grdif_r,
-        grdif_s,
-        grdif_rs,
-        stats.chi2.sf(grdif_r, df=n_groups - 1),
-        stats.chi2.sf(grdif_s, df=n_groups - 1),
-        stats.chi2.sf(grdif_rs, df=2 * (n_groups - 1)),
-    )
+            correlation = np.corrcoef(residuals, excess)[0, 1]
+            covariance = correlation * np.sqrt(var_r * var_s)
+            means.append(np.array([residuals.mean(), excess.mean()]))
+            covariances.append(np.array([[var_r, covariance], [covariance, var_s]]))
+        k = len(means)
+        if k < 2:
+            continue
+        contrast = np.hstack([-np.ones((k - 1, 1)), np.eye(k - 1)])
+        stacked = np.concatenate(means)
+        joint = np.zeros((2 * k, 2 * k))
+        for index, block in enumerate(covariances):
+            joint[2 * index : 2 * index + 2, 2 * index : 2 * index + 2] = block
+        for row, selector in enumerate((slice(0, None, 2), slice(1, None, 2))):
+            vector = contrast @ stacked[selector]
+            covariance = contrast @ joint[selector, selector] @ contrast.T
+            outputs[row, item_index] = vector @ np.linalg.solve(covariance, vector)
+        joint_contrast = np.kron(contrast, np.eye(2))
+        vector = joint_contrast @ stacked
+        covariance = joint_contrast @ joint @ joint_contrast.T
+        outputs[2, item_index] = vector @ np.linalg.solve(covariance, vector)
+        for row, df in ((3, k - 1), (4, k - 1), (5, 2 * (k - 1))):
+            outputs[row, item_index] = stats.chi2.sf(outputs[row - 3, item_index], df)
+    return tuple(outputs)
 
 
 @pytest.mark.parametrize("scaling_method", ["mean", "mad", "iqr"])
@@ -151,7 +142,9 @@ def test_vectorized_statistics_match_independent_scalar_reference(
     )
 
     for actual_values, expected_values in zip(actual, expected, strict=True):
-        assert_allclose(actual_values, expected_values, rtol=2e-13, atol=2e-13)
+        assert_allclose(actual_values, expected_values, rtol=1e-9, atol=1e-12)
+    # Item 0 has a single valid response in group 0, so three groups remain.
+    assert_allclose(actual[3][0], stats.chi2.sf(actual[0][0], df=2))
     assert vectorized_model.calls == [None]
     assert len(scalar_model.calls) > n_items
 
@@ -191,10 +184,20 @@ def test_statistics_reuse_precomputed_expected_responses() -> None:
         masks,
         np.unique(groups),
         expected_responses=expected,
+        response_variances=expected * (1.0 - expected),
     )
 
     assert all(values.shape == (5,) for values in result)
     assert model.calls == []
+    with pytest.raises(ValueError, match="passed together"):
+        _compute_grdif_statistics(
+            data,
+            theta,
+            model,
+            masks,
+            np.unique(groups),
+            expected_responses=expected,
+        )
 
 
 @pytest.mark.parametrize(
@@ -542,7 +545,7 @@ def _scalar_effect_reference(
     model: _DichotomousModel,
     effect_type: str,
 ) -> np.ndarray:
-    """Per-item, per-group loop of the original effect-size definition."""
+    """Per-item, per-group loop of the effect sizes; MSR is net of P(1 - P)."""
     effects = np.zeros(data.shape[1])
     for item in range(data.shape[1]):
         mrr_values: list[float] = []
@@ -555,7 +558,9 @@ def _scalar_effect_reference(
             expected = model.probability(theta[groups == group][valid])[:, item]
             residuals = responses[valid] - expected
             mrr_values.append(float(np.mean(residuals)))
-            msr_values.append(float(np.mean(residuals**2)))
+            msr_values.append(
+                float(np.mean(residuals**2 - expected * (1.0 - expected)))
+            )
         if len(mrr_values) >= 2:
             delta_mrr = max(mrr_values) - min(mrr_values)
             delta_msr = max(msr_values) - min(msr_values)
@@ -633,7 +638,7 @@ def test_effect_size_recomputes_moments_from_theta_with_the_model(
     hand_built = {
         key: value
         for key, value in result.items()
-        if key not in {"mrr", "msr", "group_item_counts"}
+        if key not in {"mrr", "msr", "msr_expected", "group_item_counts"}
     }
 
     recomputed = grdif_effect_size(

@@ -10,6 +10,15 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.special import chdtrc
 
+from mirt.diagnostics._quadrature import (
+    DEFAULT_MAX_GRID_NODES,
+    default_diagnostic_quadpts,
+    resolve_diagnostic_quadpts,
+)
+from mirt.diagnostics._utils import (
+    aligned_missing_coded_responses,
+    resolve_fit_constraints,
+)
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
     adjust_p_values,
@@ -17,7 +26,6 @@ from mirt.diagnostics.multiple_testing import (
 )
 from mirt.exceptions import MirtValidationError
 from mirt.typing import ItemFitStatistic
-from mirt.utils.data import _missing_coded_responses
 from mirt.utils.numeric import (
     _FitStatsAccumulator,
     _fourth_central_moment,
@@ -36,8 +44,13 @@ _ITEMFIT_TARGET_CHUNK_ELEMENTS = 262_144
 _ITEMFIT_STATISTICS: tuple[str, ...] = get_args(ItemFitStatistic)
 _MEAN_SQUARE_STATISTICS = frozenset({"infit", "outfit", "z_infit", "z_outfit"})
 _STANDARDIZED_STATISTICS = frozenset({"z_infit", "z_outfit"})
+# Standardized statistics whose normal reference assumes known abilities.
+_ABILITY_REFERENCED_STATISTICS = _STANDARDIZED_STATISTICS | {"Zh"}
 _BINNED_STATISTICS = ("X2", "G2", "PV_Q1")
 _DEFAULT_THETA_GROUPS = 10
+# Default S-X2 Gauss-Hermite points per factor for one or two factors. More
+# factors take the dimension-aware rule of the diagnostics, which is smaller.
+_SX2_QUADPTS = 41
 
 
 def compute_itemfit(
@@ -49,7 +62,7 @@ def compute_itemfit(
     p_adjust: PValueAdjustment = "none",
     *,
     min_expected: float = 1.0,
-    n_quadpts: int = 41,
+    n_quadpts: int | None = None,
     quadrature_points: ArrayLike | None = None,
     quadrature_weights: ArrayLike | None = None,
     item_parameter_counts: ArrayLike | None = None,
@@ -60,25 +73,26 @@ def compute_itemfit(
     prior_cov: ArrayLike | None = None,
     constraints: EqualityConstraints | None = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Compute mean-square, theta-binned and Orlando-Thissen S-X2 item fit.
+    """Compute mean-square, theta-binned, Zh and Orlando-Thissen S-X2 item fit.
 
     Parameters
     ----------
     model : BaseItemModel or FitResult
         Fitted item response model, or the ``FitResult`` of a fit, whose
-        estimated ``latent_covariance`` then defines the latent population.
+        estimated ``latent_covariance`` then defines the latent population
+        and whose equality constraints are counted (see ``constraints``).
     responses : array-like of shape (n_persons, n_items)
         Integer category codes. Negative codes, ``NaN`` and the nulls of
         nullable DataFrame columns denote missing responses.
     statistics : list of str, optional
         Any of ``"infit"``, ``"outfit"``, ``"z_infit"``, ``"z_outfit"``,
-        ``"S_X2"``, ``"X2"``, ``"G2"`` and ``"PV_Q1"``. Defaults to
-        ``["infit", "outfit"]``. Unknown names raise
+        ``"Zh"``, ``"S_X2"``, ``"X2"``, ``"G2"`` and ``"PV_Q1"``. Defaults
+        to ``["infit", "outfit"]``. Unknown names raise
         :class:`~mirt.exceptions.MirtValidationError`.
     theta : ndarray of shape (n_persons,) or (n_persons, n_factors), optional
-        Person abilities for the mean-square and X2/G2 statistics. EAP scores
-        are computed when omitted, which biases ``z_infit`` and ``z_outfit``
-        (see Notes).
+        Person abilities for the mean-square, Zh and X2/G2 statistics. EAP
+        scores are computed when omitted, which biases ``z_infit``,
+        ``z_outfit`` and ``Zh`` (see Notes).
     n_groups : int, optional
         Number of ability groups for X2, G2 and PV_Q1 (default 10). It is
         deprecated for S-X2, which conditions on exact total scores.
@@ -86,8 +100,13 @@ def compute_itemfit(
         Multiple-testing adjustment across items for every chi-square test.
     min_expected : float, default=1.0
         Minimum expected S-X2 cell count for sparse-cell pooling.
-    n_quadpts : int, default=41
-        Gauss-Hermite quadrature points per model factor for S-X2.
+    n_quadpts : int, optional
+        Gauss-Hermite quadrature points per model factor for S-X2. ``None``
+        (default) uses 41 for one or two factors and the dimension-aware
+        default of the diagnostics above: 21 for three factors, 9 for four,
+        7 for five, 5 for six or seven, and fewer beyond, so the grid has at
+        most 100,000 points. Larger explicit grids raise
+        :class:`~mirt.exceptions.MirtValidationError`.
     quadrature_points, quadrature_weights : array-like, optional
         Explicit latent grid and probability masses for S-X2. They replace
         the normal population of ``prior_mean`` and ``prior_cov`` for S-X2.
@@ -109,7 +128,9 @@ def compute_itemfit(
         Equality constraints of the fit, in any form that
         ``fit_mirt(constraints=...)`` accepts. A group of tied coordinates is
         one estimated parameter, so each of its ``k`` items counts ``1/k`` of
-        it in the S-X2, X2, G2 and PV_Q1 degrees of freedom. Ignored when
+        it in the S-X2, X2, G2 and PV_Q1 degrees of freedom. Defaults to the
+        constraints a ``FitResult`` was fitted with; pass ``[]`` to count
+        every free coordinate separately. Ignored when
         ``item_parameter_counts`` is given.
 
     Returns
@@ -128,12 +149,23 @@ def compute_itemfit(
     moments of each modeled score (Wright & Masters, 1982). They are
     approximately standard normal under the model only when ``theta`` holds
     the true abilities or estimates that do not depend on these responses.
+    ``Zh`` is the item-level standardized log-likelihood of Drasgow, Levine
+    and Williams (1985), as in R's ``itemfit(fit_stats = "Zh")``: the sum of
+    the item's response log-likelihoods ``l0`` over the persons who answered
+    it, minus its expectation, over its standard deviation,
+    ``(sum l0 - sum E) / sqrt(sum V)``. Negative values flag responses less
+    likely than the model predicts. Like the z statistics, it is
+    approximately standard normal only for abilities that do not depend on
+    these responses.
     The EAP abilities that replace an omitted ``theta`` shrink toward the
     mean and adapt to each person's own responses, so every item appears to
     overfit: in a correctly specified 20-item 2PL with 1,000 persons,
-    ``z_infit`` averages about -1.9 and about half of the items fall below
-    -1.96. A ``UserWarning`` flags this case, in which the z statistics are
-    only descriptive. One plausible-value draw per person
+    ``z_infit`` averages about -1.9 and ``Zh`` about +2.0, and about half of
+    the items fall beyond 1.96 in that direction. A ``UserWarning`` flags
+    this case, in which these statistics are only descriptive. R's
+    ``itemfit`` reports ``Zh`` with the same EAP abilities. With the true
+    abilities ``Zh`` has mean about 0 and standard deviation about 1.07.
+    One plausible-value draw per person
     (:func:`mirt.generate_plausible_values`) as ``theta`` centers them near
     zero, but they stay conservative (standard deviation about 0.5).
 
@@ -187,6 +219,7 @@ def compute_itemfit(
     """
     from mirt.results._common import resolve_latent_prior
 
+    constraints = resolve_fit_constraints(model, constraints)
     model, prior_mean, prior_cov = resolve_latent_prior(model, prior_mean, prior_cov)
     p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     requested = _validate_statistics(
@@ -194,7 +227,7 @@ def compute_itemfit(
     )
     if responses is None:
         raise ValueError("responses required for item fit statistics")
-    responses = _missing_coded_responses(responses)
+    responses = aligned_missing_coded_responses(model, responses)
     if responses.ndim != 2 or not all(responses.shape):
         raise ValueError("responses must be a nonempty two-dimensional matrix")
     n_persons, n_items = responses.shape
@@ -202,16 +235,17 @@ def compute_itemfit(
         raise ValueError(f"responses must contain {model.n_items} model items")
     mean_squares = _MEAN_SQUARE_STATISTICS.intersection(requested)
     binned = [name for name in _BINNED_STATISTICS if name in requested]
+    item_zh = "Zh" in requested
     n_factors = getattr(model, "n_factors", 1)
 
-    standardized = sorted(_STANDARDIZED_STATISTICS.intersection(requested))
+    standardized = sorted(_ABILITY_REFERENCED_STATISTICS.intersection(requested))
     if theta is None and standardized:
         warnings.warn(
             f"{' and '.join(standardized)} with EAP abilities estimated from the "
             "same responses are biased toward overfit (about half of well-fitting "
-            "items fall below -1.96 on a 20-item test) and are only descriptive; "
-            "pass theta that does not depend on these responses for a standard "
-            "normal reference",
+            "items fall beyond 1.96 in the overfit direction on a 20-item test) "
+            "and are only descriptive; pass theta that does not depend on these "
+            "responses for a standard normal reference",
             UserWarning,
             stacklevel=2,
         )
@@ -263,7 +297,7 @@ def compute_itemfit(
         if p_adjust != "none":
             result["p_value_adjusted"] = adjust_p_values(result["p_value"], p_adjust)
 
-    if not mean_squares and not binned:
+    if not mean_squares and not binned and not item_zh:
         return result
 
     posterior: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
@@ -286,6 +320,8 @@ def compute_itemfit(
 
     if mean_squares:
         result.update(_mean_square_fit(model, responses, theta, mean_squares))
+    if item_zh:
+        result["Zh"] = _item_zh(model, responses, theta)
 
     if binned:
         from mirt.diagnostics.itemfit_binned import _compute_binned_itemfit
@@ -369,6 +405,43 @@ def _mean_square_fit(
         for name, values in accumulator.statistics().items()
         if name in statistics
     }
+
+
+def _item_zh(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Item-level standardized log-likelihood over the persons in row blocks."""
+    from mirt.diagnostics.personfit import (
+        _log_likelihood_moments,
+        _standardized_log_likelihood,
+    )
+    from mirt.scoring._common import validate_scoring_responses
+
+    responses = validate_scoring_responses(model, responses)
+    n_persons, n_items = responses.shape
+    category_width = max(model.n_categories) if model.is_polytomous else 1
+    rows_per_chunk = max(
+        1, _ITEMFIT_TARGET_CHUNK_ELEMENTS // (n_items * category_width)
+    )
+    ll, expected_ll, var_ll = (np.zeros(n_items) for _ in range(3))
+    counts = np.zeros(n_items, dtype=np.int64)
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        block = responses[start:stop]
+        valid = block >= 0
+        probabilities, _, _ = compute_probability_moments(
+            model, theta[start:stop], n_items
+        )
+        block_ll, block_expected, block_var = _log_likelihood_moments(
+            model, block, probabilities, valid, axis=0
+        )
+        ll += block_ll
+        expected_ll += block_expected
+        var_ll += block_var
+        counts += valid.sum(axis=0)
+    return _standardized_log_likelihood(ll, expected_ll, var_ll, counts)
 
 
 def _validate_n_groups(n_groups: int) -> int:
@@ -504,9 +577,39 @@ def _free_coordinate_counts(model: BaseItemModel, statistic: str) -> NDArray[np.
     return result
 
 
+def _sx2_quadpts(n_quadpts: int | None, n_factors: int) -> int:
+    """Validate the S-X2 grid size or return its dimension-aware default.
+
+    S-X2 recursions over the summed scores at every node bound the grid at
+    ``DEFAULT_MAX_GRID_NODES`` points.
+    """
+    default = min(_SX2_QUADPTS, default_diagnostic_quadpts(n_factors))
+    if n_quadpts is None:
+        n_quadpts = default
+    else:
+        n_quadpts = resolve_diagnostic_quadpts(n_quadpts, n_factors)
+    n_nodes = n_quadpts**n_factors
+    if n_nodes > DEFAULT_MAX_GRID_NODES:
+        advice = (
+            f"omit n_quadpts to use {default} points per factor"
+            if default**n_factors <= DEFAULT_MAX_GRID_NODES
+            else f"no product grid fits {n_factors} factors"
+        )
+        raise MirtValidationError(
+            f"S-X2 quadrature with n_quadpts={n_quadpts} and {n_factors} factors "
+            f"has {n_nodes} points, more than {DEFAULT_MAX_GRID_NODES}; {advice}, "
+            "or supply quadrature_points and quadrature_weights (for example a "
+            "quasi-Monte Carlo sample of the latent population)",
+            parameter="n_quadpts",
+            value=n_quadpts,
+            expected=f"n_quadpts ** n_factors <= {DEFAULT_MAX_GRID_NODES}",
+        )
+    return n_quadpts
+
+
 def _sx2_quadrature(
     model: BaseItemModel,
-    n_quadpts: int,
+    n_quadpts: int | None,
     points: ArrayLike | None,
     weights: ArrayLike | None,
     prior_mean: ArrayLike | None = None,
@@ -518,16 +621,7 @@ def _sx2_quadrature(
             "quadrature_points and quadrature_weights must be supplied together"
         )
     if points is None:
-        if (
-            isinstance(n_quadpts, (bool, np.bool_))
-            or not isinstance(n_quadpts, (int, np.integer))
-            or n_quadpts < 2
-        ):
-            raise ValueError("n_quadpts must be an integer of at least 2")
-        if n_quadpts**n_factors > 100_000:
-            raise ValueError(
-                "default quadrature exceeds 100000 points; supply a bounded explicit quadrature grid"
-            )
+        n_quadpts = _sx2_quadpts(n_quadpts, n_factors)
         from mirt.scoring._common import build_quadrature
 
         return build_quadrature(
@@ -840,7 +934,7 @@ def _compute_s_x2(
     responses: NDArray[np.int_],
     *,
     min_expected: float,
-    n_quadpts: int,
+    n_quadpts: int | None,
     quadrature_points: ArrayLike | None,
     quadrature_weights: ArrayLike | None,
     item_parameter_counts: ArrayLike | None,
@@ -908,7 +1002,7 @@ def compute_s_x2(
     p_adjust: PValueAdjustment = "none",
     *,
     min_expected: float = 1.0,
-    n_quadpts: int = 41,
+    n_quadpts: int | None = None,
     quadrature_points: ArrayLike | None = None,
     quadrature_weights: ArrayLike | None = None,
     item_parameter_counts: ArrayLike | None = None,

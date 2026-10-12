@@ -1,14 +1,37 @@
 """Shared ability validation and bounded information reductions."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 _INFORMATION_CHUNK_ELEMENTS = 262_144
+
+
+def _resolve_model(model_or_result: Any) -> "BaseItemModel":
+    """Return the item model of a ``FitResult``, or a model unchanged.
+
+    Raises
+    ------
+    MirtValidationError
+        If the input is neither an item model nor a ``FitResult``.
+    """
+    from mirt.results._common import resolve_item_model
+
+    model = resolve_item_model(model_or_result)
+    if not all(hasattr(model, name) for name in ("n_items", "n_factors")):
+        raise MirtValidationError(
+            "model must be an item model or a FitResult",
+            parameter="model",
+            value=type(model_or_result).__name__,
+            expected="BaseItemModel or FitResult",
+        )
+    return model
 
 
 def _validate_information_values(values: NDArray[np.float64]) -> None:

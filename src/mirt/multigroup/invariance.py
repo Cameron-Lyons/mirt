@@ -79,11 +79,25 @@ class InvarianceSpec:
         Items with discrimination freed for partial invariance.
     free_intercepts : list[int], optional
         Items with intercepts freed for partial invariance.
+    free_means : bool, optional
+        Whether nonreference latent means are estimated, like ``free_means``
+        in R's ``multipleGroup(invariance=...)``. ``None`` (the default)
+        estimates them whenever invariant location anchors identify them,
+        that is at the scalar and strict levels. ``True`` requires them to
+        be identified and ``False`` fixes them at the reference value, zero.
+    free_variances : bool, optional
+        Whether nonreference latent variances (covariance matrices for
+        several factors) are estimated, like R's ``free_var``. ``None``
+        estimates them whenever invariant scale anchors identify them, from
+        the metric level on. ``True`` requires them to be identified and
+        ``False`` fixes them at the reference value, one.
     """
 
     level: Literal["configural", "metric", "scalar", "strict"]
     free_discrimination: list[int] | None = None
     free_intercepts: list[int] | None = None
+    free_means: bool | None = None
+    free_variances: bool | None = None
     _discrimination_params: set[str] = field(
         default_factory=lambda: DISCRIMINATION_PARAMS.copy(), repr=False
     )
@@ -116,6 +130,11 @@ class InvarianceSpec:
             )
         if self.level == "metric" and self.free_intercepts is not None:
             raise ValueError("free_intercepts requires scalar or strict invariance")
+        for name in ("free_means", "free_variances"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"{name} must be True, False or None")
+            setattr(self, name, None if value is None else bool(value))
 
     def get_shared_parameters(self, model: MultigroupModel) -> list[str]:
         """Get list of parameters that should be shared based on invariance level.
@@ -197,12 +216,18 @@ class InvarianceSpec:
             parts.append(f"free_disc={self.free_discrimination}")
         if self.free_intercepts:
             parts.append(f"free_int={self.free_intercepts}")
+        for name in ("free_means", "free_variances"):
+            if getattr(self, name) is not None:
+                parts.append(f"{name}={getattr(self, name)}")
         return f"InvarianceSpec({', '.join(parts)})"
 
 
 def parse_invariance(
     invariance: str | InvarianceSpec,
     free_items: dict[str, list[int]] | None = None,
+    *,
+    free_means: bool | None = None,
+    free_variances: bool | None = None,
 ) -> InvarianceSpec:
     """Parse invariance specification.
 
@@ -212,6 +237,8 @@ def parse_invariance(
         Either an invariance level string or InvarianceSpec object.
     free_items : dict, optional
         For partial invariance: {param_name: [item_indices]} to free.
+    free_means, free_variances : bool, optional
+        Latent-moment options of :class:`InvarianceSpec`.
 
     Returns
     -------
@@ -219,11 +246,16 @@ def parse_invariance(
         Parsed invariance specification.
     """
     if isinstance(invariance, InvarianceSpec):
-        if free_items is not None:
-            raise ValueError(
-                "free_items cannot be combined with an InvarianceSpec; "
-                "set partial-invariance items on the specification"
-            )
+        for name, value in (
+            ("free_items", free_items),
+            ("free_means", free_means),
+            ("free_variances", free_variances),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"{name} cannot be combined with an InvarianceSpec; "
+                    "set it on the specification"
+                )
         return invariance
 
     if invariance not in INVARIANCE_LEVELS:
@@ -255,6 +287,8 @@ def parse_invariance(
         level=invariance,
         free_discrimination=free_disc or None,
         free_intercepts=free_int or None,
+        free_means=free_means,
+        free_variances=free_variances,
     )
 
 
@@ -361,7 +395,12 @@ def compute_delta_fit(
 
 @dataclass
 class InvarianceTestResult:
-    """Result from invariance hierarchy testing."""
+    """Result from invariance hierarchy testing.
+
+    ``note`` explains a comparison that was not tested, such as a level that
+    adds no constraint (``df=0``) or a failed likelihood-ratio test; it is
+    empty otherwise.
+    """
 
     comparison: str
     chi2: float
@@ -370,6 +409,7 @@ class InvarianceTestResult:
     delta_aic: float
     delta_bic: float
     significant: bool
+    note: str = ""
 
 
 def test_invariance_step(

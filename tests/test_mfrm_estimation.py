@@ -267,7 +267,10 @@ def test_facet_free_binary_model_matches_em_one_parameter_logistic() -> None:
     responses = truth.simulate(rng.normal(size=600), seed=3)
 
     result = fit_mfrm(ManyFacetRaschModel(5, []), responses, estimate_sd=False)
-    reference = mirt.fit_mirt(responses, model="1PL", tol=1e-6)
+    # Both hold the slope at one, the Rasch model for a standard-normal trait.
+    reference = mirt.fit_mirt(
+        responses, model="1PL", tol=1e-6, fixed={"discrimination": True}
+    )
 
     assert result.sigma == 1.0 and result.sigma_se == 0.0
     assert_allclose(result.log_likelihood, reference.log_likelihood, atol=1e-6)
@@ -288,7 +291,13 @@ def test_facet_free_partial_credit_model_matches_em_pcm() -> None:
         estimate_sd=False,
     )
     # 21 Gauss-Hermite nodes are 6e-3 off this log-likelihood; 61 resolve it.
-    reference = mirt.fit_mirt(responses, model="PCM", tol=1e-6, n_quadpts=61)
+    reference = mirt.fit_mirt(
+        responses,
+        model="PCM",
+        tol=1e-6,
+        n_quadpts=61,
+        fixed={"discrimination": True},
+    )
 
     # Adjacent-category steps of the PCM are b_i + tau_ij here.
     steps = result.item_difficulty[:, None] + result.thresholds

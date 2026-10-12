@@ -12,98 +12,6 @@ from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 
 
-def _slow_log_likelihoods_2pl(
-    responses: np.ndarray,
-    quad_points: np.ndarray,
-    discrimination: np.ndarray,
-    difficulty: np.ndarray,
-) -> np.ndarray:
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    log_likes = np.zeros((n_persons, n_quad))
-
-    for q in range(n_quad):
-        theta = quad_points[q]
-        z = discrimination * (theta - difficulty)
-        probs = sigmoid(z)
-        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(n_items):
-                if responses[i, j] >= 0:
-                    if responses[i, j] == 1:
-                        ll += np.log(probs[j])
-                    else:
-                        ll += np.log(1 - probs[j])
-            log_likes[i, q] = ll
-
-    return log_likes
-
-
-def _slow_log_likelihoods_3pl(
-    responses: np.ndarray,
-    quad_points: np.ndarray,
-    discrimination: np.ndarray,
-    difficulty: np.ndarray,
-    guessing: np.ndarray,
-) -> np.ndarray:
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    log_likes = np.zeros((n_persons, n_quad))
-
-    for q in range(n_quad):
-        theta = quad_points[q]
-        z = discrimination * (theta - difficulty)
-        p_star = sigmoid(z)
-        probs = guessing + (1 - guessing) * p_star
-        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(n_items):
-                if responses[i, j] >= 0:
-                    if responses[i, j] == 1:
-                        ll += np.log(probs[j])
-                    else:
-                        ll += np.log(1 - probs[j])
-            log_likes[i, q] = ll
-
-    return log_likes
-
-
-def _slow_log_likelihoods_mirt(
-    responses: np.ndarray,
-    quad_points: np.ndarray,
-    discrimination: np.ndarray,
-    difficulty: np.ndarray,
-) -> np.ndarray:
-    n_persons = responses.shape[0]
-    n_quad = quad_points.shape[0]
-    n_items = responses.shape[1]
-
-    disc_sums = discrimination.sum(axis=1)
-    log_likes = np.zeros((n_persons, n_quad))
-
-    for q in range(n_quad):
-        theta_q = quad_points[q]
-        z = np.dot(discrimination, theta_q) - disc_sums * difficulty
-
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(n_items):
-                if responses[i, j] >= 0:
-                    p = sigmoid(z[j])
-                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-                    if responses[i, j] == 1:
-                        ll += np.log(p)
-                    else:
-                        ll += np.log(1 - p)
-            log_likes[i, q] = ll
-
-    return log_likes
-
-
 def _slow_log_likelihoods_grm(
     responses: np.ndarray,
     quad_points: np.ndarray,
@@ -181,119 +89,6 @@ def _with_numpy_backend_and_chunk(chunk: int):
 def _restore(previous: str, old_chunk: int) -> None:
     helpers._MAX_VECTOR_CHUNK_ENTRIES = old_chunk
     mirt.set_backend(previous)
-
-
-def test_2pl_vectorized_fallback_matches_reference() -> None:
-    previous, old_chunk = _with_numpy_backend_and_chunk(20)
-    try:
-        rng = np.random.default_rng(123)
-        responses = rng.integers(0, 3, size=(25, 7), dtype=np.int32)
-        responses[rng.random(size=responses.shape) < 0.15] = -1
-        quad_points = np.linspace(-3.5, 3.5, 17)
-        discrimination = rng.uniform(0.4, 2.2, size=7)
-        difficulty = rng.normal(0, 1, size=7)
-
-        expected = _slow_log_likelihoods_2pl(
-            responses, quad_points, discrimination, difficulty
-        )
-        actual = rb.compute_log_likelihoods_2pl(
-            responses, quad_points, discrimination, difficulty
-        )
-
-        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
-    finally:
-        _restore(previous, old_chunk)
-
-
-def test_3pl_vectorized_fallback_matches_reference() -> None:
-    previous, old_chunk = _with_numpy_backend_and_chunk(18)
-    try:
-        rng = np.random.default_rng(321)
-        responses = rng.integers(0, 2, size=(20, 6), dtype=np.int32)
-        responses[rng.random(size=responses.shape) < 0.2] = -1
-        quad_points = np.linspace(-4.0, 4.0, 19)
-        discrimination = rng.uniform(0.5, 2.0, size=6)
-        difficulty = rng.normal(0, 1, size=6)
-        guessing = rng.uniform(0.05, 0.35, size=6)
-
-        expected = _slow_log_likelihoods_3pl(
-            responses, quad_points, discrimination, difficulty, guessing
-        )
-        actual = rb.compute_log_likelihoods_3pl(
-            responses, quad_points, discrimination, difficulty, guessing
-        )
-
-        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
-    finally:
-        _restore(previous, old_chunk)
-
-
-def test_mirt_vectorized_fallback_matches_reference() -> None:
-    previous, old_chunk = _with_numpy_backend_and_chunk(24)
-    try:
-        rng = np.random.default_rng(456)
-        responses = rng.integers(0, 2, size=(18, 5), dtype=np.int32)
-        responses[rng.random(size=responses.shape) < 0.1] = -1
-        quad_points = rng.normal(size=(23, 2))
-        discrimination = rng.uniform(0.2, 1.6, size=(5, 2))
-        difficulty = rng.normal(0, 1, size=5)
-
-        expected = _slow_log_likelihoods_mirt(
-            responses, quad_points, discrimination, difficulty
-        )
-        actual = rb.compute_log_likelihoods_mirt(
-            responses, quad_points, discrimination, difficulty
-        )
-
-        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
-    finally:
-        _restore(previous, old_chunk)
-
-
-def test_eap_vectorized_fallback_matches_reference() -> None:
-    previous, old_chunk = _with_numpy_backend_and_chunk(45)
-    try:
-        rng = np.random.default_rng(616)
-        responses = rng.integers(0, 2, size=(24, 7), dtype=np.int32)
-        responses[rng.random(size=responses.shape) < 0.2] = -1
-        responses[0] = -1
-        quad_points = np.linspace(-3.5, 3.5, 17)
-        quad_weights = np.exp(-0.5 * quad_points**2)
-        quad_weights[[0, -1]] = 0.0
-        quad_weights /= quad_weights.sum()
-        discrimination = rng.uniform(0.4, 2.2, size=7)
-        difficulty = rng.normal(0, 1, size=7)
-
-        log_likes = _slow_log_likelihoods_2pl(
-            responses,
-            quad_points,
-            discrimination,
-            difficulty,
-        )
-        log_posterior = log_likes + np.log(quad_weights + 1e-300)
-        log_posterior -= np.max(log_posterior, axis=1, keepdims=True)
-        posterior = np.exp(log_posterior)
-        posterior /= posterior.sum(axis=1, keepdims=True)
-        expected_theta = posterior @ quad_points
-        expected_se = np.sqrt(
-            np.sum(
-                posterior * (quad_points[None, :] - expected_theta[:, None]) ** 2,
-                axis=1,
-            )
-        )
-
-        actual_theta, actual_se = rb.compute_eap_scores(
-            responses,
-            quad_points,
-            quad_weights,
-            discrimination,
-            difficulty,
-        )
-
-        np.testing.assert_allclose(actual_theta, expected_theta, rtol=1e-12, atol=1e-12)
-        np.testing.assert_allclose(actual_se, expected_se, rtol=1e-12, atol=1e-12)
-    finally:
-        _restore(previous, old_chunk)
 
 
 def test_grm_vectorized_fallback_matches_reference() -> None:
@@ -420,3 +215,129 @@ def test_polytomous_fallbacks_reject_out_of_range_categories() -> None:
                 )
     finally:
         _restore(previous, old_chunk)
+
+
+_POLYTOMOUS_BACKENDS = [
+    "numpy",
+    pytest.param(
+        "rust",
+        marks=pytest.mark.skipif(
+            not helpers.RUST_AVAILABLE, reason="Rust extension not built"
+        ),
+    ),
+]
+
+
+@pytest.fixture
+def polytomous_backend(request: pytest.FixtureRequest):
+    previous = mirt.get_backend()
+    mirt.set_backend(request.param)
+    try:
+        yield request.param
+    finally:
+        mirt.set_backend(previous)
+
+
+def _polytomous_cases() -> list[tuple[object, object, np.ndarray]]:
+    thresholds = np.array([[-0.5, 0.5], [-1.0, 0.8], [0.2, 1.1]])
+    steps = np.column_stack([np.zeros(3), thresholds])
+    return [
+        (rb.compute_log_likelihoods_grm, _slow_log_likelihoods_grm, thresholds),
+        (rb.compute_log_likelihoods_gpcm, _slow_log_likelihoods_gpcm, steps),
+    ]
+
+
+@pytest.mark.parametrize("polytomous_backend", _POLYTOMOUS_BACKENDS, indirect=True)
+def test_polytomous_likelihoods_treat_nan_as_missing(polytomous_backend: str) -> None:
+    # Regression: the NumPy path dropped every item whose column held a NaN,
+    # also for the persons who answered it.
+    responses = np.array([[0.0, 1.0, 2.0], [np.nan, 1.0, 2.0], [2.0, np.nan, 0.0]])
+    coded = np.where(np.isnan(responses), -1, responses).astype(np.int64)
+    quad_points = np.array([-2.0, 0.0, 2.0])
+    discrimination = np.array([0.8, 1.4, 2.0])
+    n_categories = np.array([3, 3, 3], dtype=np.int32)
+
+    for function, reference, locations in _polytomous_cases():
+        expected = reference(
+            coded, quad_points, discrimination, locations, n_categories
+        )
+        actual = function(
+            responses, quad_points, discrimination, locations, n_categories
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("polytomous_backend", _POLYTOMOUS_BACKENDS, indirect=True)
+def test_polytomous_likelihoods_do_not_wrap_large_codes(
+    polytomous_backend: str,
+) -> None:
+    # Regression: the native path cast int64 codes to int32, reading 2**33 as
+    # category 0 and -(2**32) + 1 as category 1.
+    quad_points = np.array([-1.0, 1.0])
+    discrimination = np.array([1.0, 1.5])
+    n_categories = np.array([3, 3], dtype=np.int32)
+    for function, reference, locations in _polytomous_cases():
+        locations = locations[:2]
+        for code in (2**31, 2**33):
+            with pytest.raises(IndexError, match="outside the item category range"):
+                function(
+                    np.array([[1, code]], dtype=np.int64),
+                    quad_points,
+                    discrimination,
+                    locations,
+                    n_categories,
+                )
+        missing = np.array([[1, -(2**32) + 1]], dtype=np.int64)
+        expected = reference(
+            np.array([[1, -1]]), quad_points, discrimination, locations, n_categories
+        )
+        actual = function(missing, quad_points, discrimination, locations, n_categories)
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("polytomous_backend", _POLYTOMOUS_BACKENDS, indirect=True)
+def test_polytomous_likelihoods_propagate_nan_parameters(
+    polytomous_backend: str,
+) -> None:
+    # Regression: the native kernels floored NaN probabilities at 1e-10.
+    responses = np.array([[0, 1, 2], [-1, 1, 2]])
+    quad_points = np.array([-1.0, 1.0])
+    discrimination = np.array([1.0, 1.2, 0.9])
+    n_categories = np.array([3, 3, 3], dtype=np.int32)
+    for function, _, locations in _polytomous_cases():
+        locations = locations.copy()
+        locations[0, -1] = np.nan
+        with np.errstate(invalid="ignore"):
+            actual = function(
+                responses, quad_points, discrimination, locations, n_categories
+            )
+        assert np.all(np.isnan(actual[0]))
+
+
+@pytest.mark.skipif(not helpers.RUST_AVAILABLE, reason="Rust extension unavailable")
+@pytest.mark.parametrize("parameter", ["discrimination", "location"])
+def test_native_polytomous_kernels_propagate_nan_to_the_persons_it_affects(
+    parameter: str,
+) -> None:
+    # Regression: f64::max(NaN, 1e-10) floored NaN category probabilities, so
+    # the kernels returned log(1e-10) where the parameter was NaN.
+    from mirt import mirt_rs
+
+    responses = np.array([[2, 1, 0], [-1, 1, 2]], dtype=np.int32)
+    quad_points = np.array([-1.0, 1.0])
+    n_categories = np.array([3, 3, 3], dtype=np.int32)
+    kernels = (
+        mirt_rs.compute_log_likelihoods_grm,
+        mirt_rs.compute_log_likelihoods_gpcm,
+    )
+    for kernel, (_, _, locations) in zip(kernels, _polytomous_cases(), strict=True):
+        discrimination = np.array([1.0, 1.2, 0.9])
+        locations = locations.copy()
+        if parameter == "discrimination":
+            discrimination[0] = np.nan
+        else:
+            locations[0, -1] = np.nan
+        actual = kernel(responses, quad_points, discrimination, locations, n_categories)
+        # Only the first person answered item 0, in its top category.
+        assert np.all(np.isnan(actual[0]))
+        assert np.all(np.isfinite(actual[1]))

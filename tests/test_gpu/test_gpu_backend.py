@@ -1,7 +1,7 @@
 """Tests for GPU backend functions.
 
 These tests verify numerical accuracy by comparing GPU results against
-NumPy/Rust implementations.
+the NumPy item models.
 """
 
 import numpy as np
@@ -12,6 +12,7 @@ from mirt._gpu_backend import (
     is_gpu_available,
     is_torch_available,
 )
+from mirt.models.dichotomous import ThreeParameterLogistic, TwoParameterLogistic
 
 pytestmark = pytest.mark.skipif(
     not is_torch_available(),
@@ -54,7 +55,6 @@ class TestConversionUtilities:
 class TestLogLikelihoods2PL:
     def test_compute_log_likelihoods_2pl_gpu_matches_numpy(self) -> None:
         from mirt._gpu_backend import compute_log_likelihoods_2pl_gpu
-        from mirt._rust_backend import compute_log_likelihoods_2pl
 
         rng = np.random.default_rng(42)
         n_persons, n_items, n_quad = 100, 20, 21
@@ -66,8 +66,10 @@ class TestLogLikelihoods2PL:
         discrimination = rng.uniform(0.5, 2.0, size=n_items)
         difficulty = rng.uniform(-2, 2, size=n_items)
 
-        result_numpy = compute_log_likelihoods_2pl(
-            responses, quad_points, discrimination, difficulty
+        result_numpy = (
+            TwoParameterLogistic(n_items)
+            .set_parameters(discrimination=discrimination, difficulty=difficulty)
+            .log_likelihood_batch(responses, quad_points[:, None])
         )
         result_gpu = compute_log_likelihoods_2pl_gpu(
             responses, quad_points, discrimination, difficulty
@@ -112,7 +114,6 @@ class TestLogLikelihoods2PL:
 class TestLogLikelihoods3PL:
     def test_compute_log_likelihoods_3pl_gpu_matches_numpy(self) -> None:
         from mirt._gpu_backend import compute_log_likelihoods_3pl_gpu
-        from mirt._rust_backend import compute_log_likelihoods_3pl
 
         rng = np.random.default_rng(42)
         n_persons, n_items, n_quad = 100, 20, 21
@@ -125,60 +126,18 @@ class TestLogLikelihoods3PL:
         difficulty = rng.uniform(-2, 2, size=n_items)
         guessing = rng.uniform(0.1, 0.3, size=n_items)
 
-        result_numpy = compute_log_likelihoods_3pl(
-            responses, quad_points, discrimination, difficulty, guessing
+        result_numpy = (
+            ThreeParameterLogistic(n_items)
+            .set_parameters(
+                discrimination=discrimination, difficulty=difficulty, guessing=guessing
+            )
+            .log_likelihood_batch(responses, quad_points[:, None])
         )
         result_gpu = compute_log_likelihoods_3pl_gpu(
             responses, quad_points, discrimination, difficulty, guessing
         )
 
         np.testing.assert_allclose(result_numpy, result_gpu, rtol=1e-5, atol=1e-8)
-
-
-class TestEStepComplete:
-    def test_e_step_complete_gpu_matches_numpy(self) -> None:
-        from mirt._gpu_backend import e_step_complete_gpu
-        from mirt._rust_backend import e_step_complete
-
-        rng = np.random.default_rng(42)
-        n_persons, n_items, n_quad = 100, 20, 21
-
-        responses = rng.integers(0, 2, size=(n_persons, n_items)).astype(np.int32)
-        responses[rng.random((n_persons, n_items)) < 0.1] = -1
-
-        quad_points = np.linspace(-4, 4, n_quad)
-        quad_weights = np.ones(n_quad) / n_quad
-        discrimination = rng.uniform(0.5, 2.0, size=n_items)
-        difficulty = rng.uniform(-2, 2, size=n_items)
-
-        posterior_numpy, marginal_numpy = e_step_complete(
-            responses, quad_points, quad_weights, discrimination, difficulty
-        )
-        posterior_gpu, marginal_gpu = e_step_complete_gpu(
-            responses, quad_points, quad_weights, discrimination, difficulty
-        )
-
-        np.testing.assert_allclose(posterior_numpy, posterior_gpu, rtol=1e-5, atol=1e-8)
-        np.testing.assert_allclose(marginal_numpy, marginal_gpu, rtol=1e-5, atol=1e-8)
-
-    def test_e_step_complete_gpu_posterior_sums_to_one(self) -> None:
-        from mirt._gpu_backend import e_step_complete_gpu
-
-        rng = np.random.default_rng(42)
-        n_persons, n_items, n_quad = 50, 10, 15
-
-        responses = rng.integers(0, 2, size=(n_persons, n_items)).astype(np.int32)
-        quad_points = np.linspace(-3, 3, n_quad)
-        quad_weights = np.ones(n_quad) / n_quad
-        discrimination = rng.uniform(0.5, 2.0, size=n_items)
-        difficulty = rng.uniform(-2, 2, size=n_items)
-
-        posterior, _ = e_step_complete_gpu(
-            responses, quad_points, quad_weights, discrimination, difficulty
-        )
-
-        row_sums = posterior.sum(axis=1)
-        np.testing.assert_allclose(row_sums, 1.0, rtol=1e-5, atol=1e-8)
 
 
 @pytest.mark.skipif(not GPU_AVAILABLE, reason="CUDA GPU not available")

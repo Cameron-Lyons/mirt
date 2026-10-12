@@ -14,6 +14,8 @@ from typing import Any, Literal, Protocol, TypeVar
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt.cat._native import uses_native_defaults
+
 
 class _Rule(Protocol):
     def should_stop(self, state: Any) -> bool: ...
@@ -49,6 +51,43 @@ def integer(value: Any, name: str, *, minimum: int) -> int:
     if result < minimum:
         raise ValueError(f"{name} must be {requirement}")
     return result
+
+
+def classification_confidence(value: Any, name: str = "confidence") -> float:
+    """Validate a one-sided classification confidence in ``(0.5, 1)``.
+
+    At or below 0.5 the critical value is not positive, so a classification
+    rule would stop after any first item.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be strictly between 0.5 and 1")
+    result = float(value)
+    if not 0.5 < result < 1.0:
+        raise ValueError(f"{name} must be strictly between 0.5 and 1")
+    return result
+
+
+def item_limit(rule: Any, length_rule: type, combined_rule: type) -> int | None:
+    """Return the test length by which ``rule`` certainly stops, or ``None``.
+
+    ``length_rule`` is the family's maximum-length rule and
+    ``combined_rule`` its combination; only unmodified instances of those
+    exact types count, since subclasses and replaced methods may stop
+    differently. An ``"or"`` combination stops by its
+    earliest nested limit and an ``"and"`` combination only once every nested
+    rule has a limit, by the latest. A combination's ``min_items`` can only
+    postpone the stop.
+    """
+    if uses_native_defaults(rule, length_rule):
+        return int(rule.max_items)
+    if not uses_native_defaults(rule, combined_rule):
+        return None
+    limits = [item_limit(nested, length_rule, combined_rule) for nested in rule.rules]
+    known = [limit for limit in limits if limit is not None]
+    if not known or (rule.operator == "and" and len(known) < len(limits)):
+        return None
+    limit = min(known) if rule.operator == "or" else max(known)
+    return max(limit, int(rule.min_items))
 
 
 def stable_count(value: Any) -> int:

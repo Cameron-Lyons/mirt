@@ -5,7 +5,7 @@ import pytest
 
 from mirt import fit_mirt
 from mirt.estimation.em import EMEstimator
-from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.quadrature import GaussHermiteQuadrature, build_quadrature
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models import GradedResponseModel, OneParameterLogistic, TwoParameterLogistic
 
@@ -65,8 +65,8 @@ def test_response_code_must_fit_its_own_item_even_below_global_category_maximum(
         fit_mirt(np.array([[0, 0, 0], [2, 1, 3]]), model="GRM", n_categories=[2, 3, 4])
 
 
-def test_unobserved_item_requires_declared_count_and_constant_zero_item_infers_binary():
-    responses = np.array([[0, -1, 0], [0, -1, 1], [0, -1, 2]])
+def test_unobserved_item_requires_declared_count_and_constant_items_are_rejected():
+    responses = np.array([[0, -1, 0], [1, -1, 1], [0, -1, 2]])
     with pytest.raises(MirtValidationError, match="items with no observed responses"):
         fit_mirt(responses, model="GRM")
     result = fit_mirt(
@@ -88,6 +88,21 @@ def test_unobserved_item_requires_declared_count_and_constant_zero_item_infers_b
         compute_standard_errors=False,
     )
     assert observed_only.model.n_categories == [2, 3]
+    # Like R, an item answered in one category only cannot be estimated, even
+    # with a declared category count.
+    constant = responses.copy()
+    constant[:, 0] = 0
+    for counts in (None, [2, 4, 3]):
+        with pytest.raises(
+            MirtDataError,
+            match=r"one observed response category and cannot be estimated: Q1 \(",
+        ):
+            fit_mirt(
+                constant[:, [0, 2]] if counts is None else constant,
+                model="GRM",
+                n_categories=counts,
+                item_names=["Q1", "Q3"] if counts is None else ["Q1", "Q2", "Q3"],
+            )
 
 
 @pytest.mark.parametrize("declared", [None, 4])
@@ -117,7 +132,8 @@ def test_sparse_graded_calibration_keeps_real_category_probabilities_valid(decla
     for item, count in enumerate(expected_counts):
         thresholds = result.model.thresholds[item, : count - 1]
         assert np.all(np.diff(thresholds) >= 0)
-    grid = GaussHermiteQuadrature(n_points=21)
+    # The fit's grid: 21 points per dimension are rectangular by default.
+    grid = build_quadrature(21, 1)
     fitted_probability = result.model.probability(grid.nodes)
     assert np.all(fitted_probability >= 0)
     np.testing.assert_allclose(fitted_probability.sum(axis=2), 1, atol=1e-14)

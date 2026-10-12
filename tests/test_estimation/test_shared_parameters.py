@@ -13,7 +13,7 @@ from mirt.estimation._shared_step import (
 from mirt.estimation.base import _free_shared_parameters
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.mcem import MCEMEstimator, QMCEMEstimator, StochasticEMEstimator
-from mirt.estimation.mcmc import MHRMEstimator, _set_item_vectors
+from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator, _set_item_vectors
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.se_methods import compute_se
 from mirt.estimation.standard_errors import (
@@ -300,7 +300,9 @@ def test_itemwise_curvature_covers_shared_parameters(method, complete_data_grsm)
 def test_complete_data_shared_errors_match_summed_item_curvature(rating_data):
     _, responses = rating_data["RSM"]
     responses = responses[:800]
-    estimator = EMEstimator(n_quadpts=15, se_method="complete_data")
+    estimator = EMEstimator(
+        n_quadpts=15, quadrature="gauss-hermite", se_method="complete_data"
+    )
     result = estimator.fit(RatingScaleModel(10, 4), responses)
     model = result.model
     quadrature = GaussHermiteQuadrature(15)
@@ -369,14 +371,27 @@ def test_estimators_without_a_shared_step_refuse_free_shared_parameters(
     np.testing.assert_array_equal(result.model.thresholds, [0.0, 1.0, 2.0])
 
 
-def test_mhrm_refusal_only_suggests_estimators_it_accepts(rating_data):
-    # MHRM also rejects masks, so advising them led to a second error.
+@pytest.mark.filterwarnings("ignore:MHRM stopped:RuntimeWarning")
+@pytest.mark.parametrize(
+    "estimator",
+    [
+        MHRMEstimator(n_cycles=5, burnin=1, seed=1, use_rust=False),
+        GibbsSampler(n_iter=5, burnin=1, seed=1, use_rust=False),
+    ],
+    ids=["mhrm", "gibbs"],
+)
+def test_sampler_refusal_suggests_masks_it_honors(estimator, rating_data):
+    # The samplers now hold fixed coordinates, so the advice to fix the shared
+    # thresholds leads to a fit that keeps them.
     _, responses = rating_data["RSM"]
-    estimator = MHRMEstimator(n_cycles=5, burnin=1, seed=1, use_rust=False)
     with pytest.raises(MirtModelError, match="cannot estimate thresholds") as error:
         estimator.fit(RatingScaleModel(10, 4), responses[:200])
     assert "EMEstimator or BLEstimator" in str(error.value)
-    assert "set_free_parameter_masks" not in str(error.value)
+    assert "set_free_parameter_masks" in str(error.value)
+    held = RatingScaleModel(10, 4)
+    held.set_free_parameter_masks({"thresholds": np.zeros(3, dtype=bool)})
+    result = estimator.fit(held, responses[:200])
+    np.testing.assert_array_equal(result.model.thresholds, [0.0, 1.0, 2.0])
 
 
 def test_mhrm_item_vectors_leave_shared_parameters_whole():
@@ -531,3 +546,20 @@ def test_shared_parameters_take_no_item_priors():
     assert fitted.log_posterior - fitted.log_likelihood == pytest.approx(
         float(difficulty_prior.sum())
     )
+
+
+@pytest.mark.parametrize("estimator", [EMEstimator, MCEMEstimator])
+def test_itemwise_estimators_refuse_free_model_level_parameters(estimator):
+    """Their item M-steps would leave the higher-order parameters unchanged."""
+    from mirt.models.cdm_advanced import HigherOrderCDM
+
+    class UnmarkedHigherOrderCDM(HigherOrderCDM):
+        dedicated_estimator = None
+
+    q_matrix = np.array([[1, 0], [0, 1], [1, 1], [1, 0]])
+    responses = np.random.default_rng(0).integers(0, 2, (40, 4))
+
+    with pytest.raises(MirtModelError, match="mirt.fit_higher_order_cdm"):
+        estimator(max_iter=2).fit(HigherOrderCDM(4, 2, q_matrix), responses)
+    with pytest.raises(MirtModelError, match="loadings, thresholds.*starting values"):
+        estimator(max_iter=2).fit(UnmarkedHigherOrderCDM(4, 2, q_matrix), responses)

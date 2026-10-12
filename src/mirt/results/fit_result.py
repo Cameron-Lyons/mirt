@@ -34,9 +34,14 @@ _MODEL_FIELDS = {"name", "n_items", "n_factors", "item_names", "n_categories"}
 _STRUCTURE_FIELDS = {
     "MIRT": "loading_pattern",
     "Bifactor": "specific_factors",
+    "GradedBifactor": "specific_factors",
     "Mixed": "components",
 }
-_OPTIONAL_MODEL_FIELDS = {"free_parameter_masks", *_STRUCTURE_FIELDS.values()}
+_OPTIONAL_MODEL_FIELDS = {
+    "free_parameter_masks",
+    "estimate_discrimination",
+    *_STRUCTURE_FIELDS.values(),
+}
 
 
 def _payload_error(message: str, *, value: Any = None) -> MirtValidationError:
@@ -103,24 +108,27 @@ def _model_structure(model: BaseItemModel) -> dict[str, Any]:
     """Return the structure ``from_dict`` needs beyond the family metadata.
 
     Multidimensional models record their loading pattern, bifactor
-    models their specific-factor labels, mixed-format models the
-    family and test items of each component, and any model with
-    ``set_free_parameter_masks`` restrictions its free masks.
+    models (dichotomous and graded) their specific-factor labels,
+    mixed-format models the family and test items of each component, and
+    any model with ``set_free_parameter_masks`` restrictions its free masks.
     """
-    from mirt.models.bifactor import BifactorModel
+    from mirt.models.bifactor import BifactorModel, GradedBifactorModel
     from mirt.models.mixed_format import MixedItemModel
     from mirt.models.multidimensional import MultidimensionalModel
 
     structure: dict[str, Any] = {}
     if isinstance(model, MultidimensionalModel):
         structure["loading_pattern"] = model.loading_pattern.tolist()
-    elif isinstance(model, BifactorModel):
+    elif isinstance(model, (BifactorModel, GradedBifactorModel)):
         structure["specific_factors"] = model.specific_factors.tolist()
     elif isinstance(model, MixedItemModel):
         structure["components"] = [
             {"name": str(component.model_name), "items": items.tolist()}
             for component, items in model.components
         ]
+    # A 1PL or PCM whose common discrimination was estimated.
+    if getattr(model, "estimate_discrimination", False):
+        structure["estimate_discrimination"] = True
     restricted = model._free_parameter_restrictions
     if restricted:
         masks = model.free_parameter_masks
@@ -160,18 +168,19 @@ def _multidimensional_from_payload(
     if (
         isinstance(n_factors, bool)
         or not isinstance(n_factors, Integral)
-        or n_factors < 2
+        or n_factors < 1
         or loadings.shape != (n_items, n_factors)
         or not np.all((loadings == 0.0) | (loadings == 1.0))
     ):
         raise MirtValidationError(
             "model.loading_pattern must be an (n_items, n_factors) matrix of "
-            "zeros and ones with n_factors >= 2",
+            "zeros and ones",
             parameter="model.loading_pattern",
             value=loadings.shape,
-            expected=f"({n_items}, n_factors >= 2)",
+            expected=f"({n_items}, n_factors)",
         )
-    exploratory = bool(np.all(loadings == 1.0))
+    # One factor is the confirmatory slope-intercept 2PL of model syntax.
+    exploratory = n_factors > 1 and bool(np.all(loadings == 1.0))
     return MultidimensionalModel(
         n_items,
         int(n_factors),
@@ -182,10 +191,18 @@ def _multidimensional_from_payload(
 
 
 def _bifactor_from_payload(
-    labels: Any, n_items: int, n_factors: Any, item_names: list[str]
+    labels: Any,
+    n_items: int,
+    n_factors: Any,
+    item_names: list[str],
+    n_categories: Any = None,
 ) -> BaseItemModel:
-    """Rebuild a ``BifactorModel`` from its specific-factor labels."""
-    from mirt.models.bifactor import BifactorModel
+    """Rebuild a bifactor model from its specific-factor labels.
+
+    With ``n_categories`` the model is a ``GradedBifactorModel``, otherwise a
+    dichotomous ``BifactorModel``.
+    """
+    from mirt.models.bifactor import BifactorModel, GradedBifactorModel
 
     if not isinstance(labels, list) or not all(
         isinstance(label, Integral) and not isinstance(label, bool) for label in labels
@@ -195,8 +212,20 @@ def _bifactor_from_payload(
             parameter="model.specific_factors",
             value=labels,
         )
+    model: BifactorModel | GradedBifactorModel
     try:
-        model = BifactorModel(n_items, labels, item_names=item_names)
+        if n_categories is None:
+            model = BifactorModel(n_items, labels, item_names=item_names)
+        else:
+            if not isinstance(n_categories, list) or len(n_categories) != n_items:
+                raise MirtValidationError(
+                    "model.n_categories must list one category count per item",
+                    parameter="model.n_categories",
+                    value=n_categories,
+                )
+            model = GradedBifactorModel(
+                n_items, labels, n_categories, item_names=item_names
+            )
     except ValueError as exc:
         raise MirtValidationError(
             str(exc), parameter="model.specific_factors", value=labels
@@ -317,8 +346,8 @@ def _model_from_payload(
     ):
         raise MirtValidationError(
             f"cannot rebuild model {name!r}; only fit_mirt model families and "
-            "multidimensional ('MIRT'), bifactor and mixed-format models are "
-            "supported",
+            "multidimensional ('MIRT'), bifactor ('Bifactor', 'GradedBifactor') "
+            "and mixed-format models are supported",
             parameter="model.name",
             value=name,
             expected=", ".join([*ITEM_MODEL_FAMILIES, *_STRUCTURE_FIELDS]),
@@ -344,7 +373,7 @@ def _model_from_payload(
     item_names = _validated_item_names(info)
     n_factors = info.get("n_factors", 1)
     n_categories = info.get("n_categories")
-    polytomous = name in POLYTOMOUS_FAMILIES or name == "Mixed"
+    polytomous = name in POLYTOMOUS_FAMILIES or name in ("Mixed", "GradedBifactor")
     if polytomous != (n_categories is not None):
         raise MirtValidationError(
             "model.n_categories must list category counts for polytomous models "
@@ -358,9 +387,9 @@ def _model_from_payload(
             model = _multidimensional_from_payload(
                 info["loading_pattern"], n_items, n_factors, item_names
             )
-        elif name == "Bifactor":
+        elif name in ("Bifactor", "GradedBifactor"):
             model = _bifactor_from_payload(
-                info["specific_factors"], n_items, n_factors, item_names
+                info["specific_factors"], n_items, n_factors, item_names, n_categories
             )
         elif name == "Mixed":
             model = _mixed_from_payload(
@@ -373,13 +402,17 @@ def _model_from_payload(
                 n_factors=n_factors,
                 n_categories=n_categories,
                 item_names=item_names,
+                estimate_discrimination=info.get("estimate_discrimination") is True,
             )
     except MirtModelError as exc:
         raise MirtValidationError(exc.message, parameter="model", value=name) from exc
     if (
         model.n_items != n_items
         or model.n_factors != n_factors
-        or (name == "Mixed" and _category_counts(model) != n_categories)
+        or (
+            name in ("Mixed", "GradedBifactor")
+            and _category_counts(model) != n_categories
+        )
     ):
         raise MirtValidationError(
             "model.n_items, n_factors and n_categories must match the model structure",
@@ -476,10 +509,12 @@ def _row_labels(model: BaseItemModel, name: str, items: list[str]) -> list[str]:
 def _indexed_by_item(model: BaseItemModel, name: str, shape: tuple[int, ...]) -> bool:
     """Whether a parameter has one leading row per item it covers.
 
-    Parameters shared by all items never do, even when their length happens
-    to equal the number of items.
+    Parameters shared by all items or global to the model never do, even
+    when their length happens to equal the number of items.
     """
-    shared: frozenset[str] = getattr(model, "_shared_parameters", frozenset())
+    shared: frozenset[str] = getattr(
+        model, "_shared_parameters", frozenset()
+    ) | getattr(model, "_global_parameters", frozenset())
     rows = _parameter_rows(model, name)
     return bool(shape) and shape[0] == len(rows) and name not in shared
 
@@ -527,23 +562,6 @@ def _free_parameter_labels(model: BaseItemModel) -> list[str]:
             index = tuple(int(i) for i in np.unravel_index(flat, values.shape))
             labels.append(_coordinate_label(name, index, rows, per_item))
     return labels
-
-
-def _compute_z_stats(
-    est: float,
-    err: float,
-    z_crit: float,
-) -> tuple[float, float, float, float]:
-    """Compute a stable z-value, p-value, and confidence interval."""
-    if err > 0 and np.isfinite(err) and np.isfinite(est):
-        from scipy import special
-
-        z = est / err
-        p = float(2.0 * special.ndtr(-abs(z)))
-        ci_low = est - z_crit * err
-        ci_high = est + z_crit * err
-        return z, p, ci_low, ci_high
-    return np.nan, np.nan, np.nan, np.nan
 
 
 def _array_statistics(
@@ -1142,8 +1160,8 @@ class FitResult:
         restricted by ``set_free_parameter_masks`` its
         ``free_parameter_masks``. Together with the parameters these let
         :meth:`from_dict` rebuild models of the ``fit_mirt`` families,
-        multidimensional ``fit_mirt(spec=...)`` and ``bfactor`` models, and
-        mixed-format models of those families.
+        multidimensional ``fit_mirt(spec=...)`` and ``bfactor`` models
+        (dichotomous and graded), and mixed-format models of those families.
         Parameters include ``latent_covariance`` and ``latent_mean`` when
         they were estimated; ``refit_recipe`` is not serialized.
         With standard errors, ``se_method`` and a ``vcov`` mapping of row
@@ -1209,10 +1227,10 @@ class FitResult:
         ``include_parameters=False`` cannot be reloaded. Models from the
         built-in ``fit_mirt`` families ("1PL", "2PL", "3PL", "4PL", "GRM",
         "GPCM", "PCM", "NRM"), multidimensional ``fit_mirt(spec=...)`` 2PL
-        models ("MIRT"), ``bfactor`` models ("Bifactor") and mixed-format
-        models of those families ("Mixed") are reconstructed and marked
-        fitted, so the result can be scored with :func:`mirt.fscores`
-        directly. Free-parameter restrictions, such as ``fixed`` coordinates
+        models ("MIRT"), ``bfactor`` models ("Bifactor" and, for graded
+        items, "GradedBifactor") and mixed-format models of those families
+        ("Mixed") are reconstructed and marked fitted, so the result can be
+        scored with :func:`mirt.fscores` directly. Free-parameter restrictions, such as ``fixed`` coordinates
         or a confirmatory loading pattern, are restored. Omitted standard
         errors are restored as unknown. Unknown fields, including standard
         errors for parameters the model does not have, are rejected so that

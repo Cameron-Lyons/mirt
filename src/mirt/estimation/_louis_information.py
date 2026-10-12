@@ -6,8 +6,8 @@ variance of the complete-data score. On a quadrature grid with a fixed prior
 mass both terms are finite sums, so the identity is exact. Only derivatives
 of each item's category log-probabilities at the nodes are needed. Built-in
 unidimensional 1PL-4PL, graded, partial-credit and rating-scale items use
-closed forms. The other supported built-ins, listed in
-:func:`supports_louis_information`, difference one item's curve at a time,
+closed forms. The other supported built-ins and custom item models, listed
+in :func:`supports_louis_information`, difference one item's curve at a time,
 which costs a few dozen curve evaluations per item rather than O(P^2)
 marginal likelihood evaluations. Parameters shared by all items, such as
 rating-scale thresholds, enter every item's derivatives and are accumulated
@@ -128,13 +128,15 @@ def _curve_product_types() -> tuple[type, ...]:
     Each type's ``log_likelihood_batch`` sums the clipped log ``probability``
     of every observed response, and every stored parameter belongs to one
     item, so item-local differences of ``probability`` give the exact
-    marginal information.
+    marginal information. A :class:`~mirt.models.custom.CustomItemModel`
+    evaluates its item type's callbacks the same way.
     """
     from mirt.models.compensatory import (
         DisjunctiveModel,
         NoncompensatoryModel,
         PartiallyCompensatoryModel,
     )
+    from mirt.models.custom import CustomItemModel
     from mirt.models.dichotomous import (
         ComplementaryLogLog,
         FiveParameterLogistic,
@@ -184,22 +186,24 @@ def _curve_product_types() -> tuple[type, ...]:
         ZeroInflated2PL,
         ZeroInflated3PL,
         HurdleIRT,
+        CustomItemModel,
     )
 
 
 def _uses_curve_product_hooks(model: BaseItemModel) -> bool:
     """Whether ``model`` is a curve-product built-in with its authored hooks.
 
-    ``MultidimensionalModel`` and ``BifactorModel`` are registered built-ins.
-    The types of :func:`_curve_product_types` are not registered, so their
-    curve and likelihood hooks qualify when :mod:`mirt` defines them and the
-    instance does not shadow them. Subclasses never qualify.
+    ``MultidimensionalModel``, ``BifactorModel`` and ``GradedBifactorModel``
+    are registered built-ins. The types of :func:`_curve_product_types` are
+    not registered, so their curve and likelihood hooks qualify when
+    :mod:`mirt` defines them and the instance does not shadow them.
+    Subclasses never qualify.
     """
-    from mirt.models.bifactor import BifactorModel
+    from mirt.models.bifactor import BifactorModel, GradedBifactorModel
     from mirt.models.multidimensional import MultidimensionalModel
 
     model_class = type(model)
-    if model_class in (BifactorModel, MultidimensionalModel):
+    if model_class in (BifactorModel, GradedBifactorModel, MultidimensionalModel):
         return uses_builtin_model_hooks(model, likelihood=True)
     if model_class not in _curve_product_types():
         return False
@@ -223,11 +227,12 @@ def supports_louis_information(model: BaseItemModel) -> bool:
     ``probability``, and each free parameter must belong to one item or, for
     the rating-scale families, to all items. Qualifying built-ins are 1PL-4PL
     with any number of factors, GRM, GPCM, PCM, NRM, RSM and GRSM,
-    ``MultidimensionalModel`` and ``BifactorModel``, and the 5PL,
-    complementary and negative log-log, unipolar log-logistic, partially
-    compensatory, noncompensatory, disjunctive, nested-logit, monotone
+    ``MultidimensionalModel``, ``BifactorModel`` and ``GradedBifactorModel``,
+    and the 5PL, complementary and negative log-log, unipolar log-logistic,
+    partially compensatory, noncompensatory, disjunctive, nested-logit, monotone
     polynomial and spline, sequential, continuation-ratio, adjacent-category,
-    GGUM, ideal-point, hyperbolic cosine, zero-inflated and hurdle models.
+    GGUM, ideal-point, hyperbolic cosine, zero-inflated and hurdle models,
+    and :class:`~mirt.models.custom.CustomItemModel` with callback curves.
     Subclasses and models with replaced curve or likelihood hooks do not
     qualify. A mixed-format model qualifies when each of its components does;
     a component's shared parameters belong to all of its own items. Other
@@ -464,6 +469,16 @@ def _analytic_terms(
     return first, second
 
 
+def _domain_bounds(model: BaseItemModel, name: str) -> tuple[float, float]:
+    """Return the values a curve accepts for a parameter, from custom bounds."""
+    from mirt.models.custom import CustomItemModel
+
+    if not isinstance(model, CustomItemModel):
+        return (-np.inf, np.inf)
+    low, high = model.item_type.par_bounds.get(name, (-np.inf, np.inf))
+    return (float(low), float(high))
+
+
 def _numerical_terms(
     model: BaseItemModel,
     item: int,
@@ -471,7 +486,14 @@ def _numerical_terms(
     coordinates: list[tuple[str, tuple[int, ...], int]],
     n_categories: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Central differences of one item's clipped category log-probabilities."""
+    """Central differences of one item's clipped category log-probabilities.
+
+    The callbacks of a custom item type need not accept values outside the
+    type's parameter bounds, so the stencil of a coordinate within a step of
+    a bound is centered a step inside it. Such coordinates are held fixed
+    when they lie on the bound, and are otherwise differenced at most a step
+    away from their value.
+    """
     names = {name for name, _, _ in coordinates}
     original = {name: model._parameters[name] for name in names}
     # Shared coordinates carry their full storage index.
@@ -487,6 +509,12 @@ def _numerical_terms(
         dtype=np.float64,
     )
     steps = _DERIVATIVE_STEP * np.maximum(1.0, np.abs(centers))
+    domain = np.array(
+        [_domain_bounds(model, name) for name, _, _ in coordinates], dtype=np.float64
+    )
+    low, high = domain[:, 0], domain[:, 1]
+    room = high - low > 4.0 * steps
+    shifts = np.where(room, np.clip(centers, low + steps, high - steps) - centers, 0.0)
 
     def log_probability(
         offsets: dict[int, float],
@@ -508,18 +536,19 @@ def _numerical_terms(
         first = np.empty((k, *center.shape))
         second = np.empty((k, k, *center.shape))
         for row in range(k):
-            h = steps[row]
-            plus = log_probability({row: h})
-            minus = log_probability({row: -h})
+            h, s = steps[row], shifts[row]
+            plus = log_probability({row: s + h})
+            minus = log_probability({row: s - h})
+            middle = center if s == 0.0 else log_probability({row: s})
             first[row] = (plus - minus) / (2.0 * h)
-            second[row, row] = (plus - 2.0 * center + minus) / h**2
+            second[row, row] = (plus - 2.0 * middle + minus) / h**2
             for column in range(row + 1, k):
-                g = steps[column]
+                g, t = steps[column], shifts[column]
                 cross = (
-                    log_probability({row: h, column: g})
-                    - log_probability({row: h, column: -g})
-                    - log_probability({row: -h, column: g})
-                    + log_probability({row: -h, column: -g})
+                    log_probability({row: s + h, column: t + g})
+                    - log_probability({row: s + h, column: t - g})
+                    - log_probability({row: s - h, column: t + g})
+                    + log_probability({row: s - h, column: t - g})
                 ) / (4.0 * h * g)
                 second[row, column] = cross
                 second[column, row] = cross

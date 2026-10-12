@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from mirt.exceptions import MirtValidationError
 from mirt.models.dynamic import (
     GrowthMixtureModel,
     NonlinearGrowthModel,
@@ -110,7 +111,59 @@ class TestPiecewiseGrowthModel:
             time_values, observations, max_changepoints=1
         )
 
-        assert len(changepoints) <= 1
+        np.testing.assert_array_equal(changepoints, [2.0])
+
+    @pytest.mark.parametrize(
+        ("slopes", "changepoint"),
+        [((1.0, 0.2), 5.0), ((0.2, 1.0), 3.0), ((0.5, -0.5), 5.0)],
+    )
+    def test_detect_changepoints_in_trending_trajectories(self, slopes, changepoint):
+        """A slope change is found whether or not the trajectory reverses."""
+        model = PiecewiseGrowthModel(
+            n_pieces=2,
+            changepoints=np.array([changepoint]),
+            slope_means=np.array(slopes),
+            slope_vars=np.array([0.01, 0.01]),
+            residual_variance=0.1,
+        )
+        time_values = np.arange(11.0)
+        theta, _, _ = model.simulate(500, time_values, seed=0)
+        theta[np.random.default_rng(1).random(theta.shape) < 0.1] = np.nan
+
+        changepoints = model.detect_changepoints(time_values, theta, max_changepoints=2)
+
+        np.testing.assert_array_equal(changepoints, [changepoint])
+
+    def test_detect_changepoints_keeps_straight_noisy_trajectories(self):
+        model = PiecewiseGrowthModel(
+            n_pieces=1,
+            slope_means=np.array([0.3]),
+            slope_vars=np.array([0.05]),
+            residual_variance=0.5,
+        )
+        time_values = np.arange(11.0)
+        for seed in range(10):
+            theta, _, _ = model.simulate(100, time_values, seed=seed)
+            assert model.detect_changepoints(time_values, theta).size == 0
+
+    @pytest.mark.parametrize(
+        ("time_values", "observations", "options"),
+        [
+            (np.arange(4.0), np.zeros((2, 3)), {}),
+            (np.array([0.0, np.nan, 2.0]), np.zeros((2, 3)), {}),
+            (np.arange(3.0), np.array([[0.0, np.inf, 1.0]]), {}),
+            (np.arange(3.0), np.zeros((2, 3)), {"max_changepoints": -1}),
+            (np.arange(3.0), np.zeros((2, 3)), {"max_changepoints": 1.5}),
+            (np.arange(3.0), np.array([[0.0, np.nan, np.nan]]), {}),
+        ],
+    )
+    def test_detect_changepoints_validates_inputs(
+        self, time_values, observations, options
+    ):
+        with pytest.raises(ValueError):
+            PiecewiseGrowthModel(n_pieces=1).detect_changepoints(
+                time_values, observations, **options
+            )
 
 
 class TestNonlinearGrowthModel:
@@ -760,6 +813,170 @@ class TestGrowthMixtureMaskedLikelihood:
             expected,
             rtol=1e-14,
         )
+
+
+class TestGrowthMixtureVarianceEstimation:
+    """ECM estimation of the shared random-effect and residual variances."""
+
+    def test_bic_selects_the_generating_number_of_classes(self):
+        time_values = np.arange(6.0)
+        one_class = GrowthMixtureModel(
+            n_classes=1,
+            class_intercepts=np.array([0.0]),
+            class_slopes=np.array([0.3]),
+            intercept_var=1.0,
+            slope_var=0.1,
+            residual_variance=0.5,
+        )
+        two_classes = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.array([0.4, 0.6]),
+            class_intercepts=np.array([-1.5, 1.0]),
+            class_slopes=np.array([0.5, -0.2]),
+            intercept_var=0.5,
+            slope_var=0.05,
+            residual_variance=0.3,
+        )
+
+        for source, expected in ((one_class, 1), (two_classes, 2)):
+            observations, _ = source.simulate(600, time_values, seed=3)
+            # Start every fit from the default variances, not the truth.
+            fits = {
+                k: GrowthMixtureModel(n_classes=k).fit(observations, time_values)
+                for k in (1, 2, 3)
+            }
+            assert min(fits, key=lambda k: fits[k].bic) == expected
+            fitted = fits[expected].model
+            np.testing.assert_allclose(
+                [fitted.intercept_var, fitted.slope_var, fitted.residual_variance],
+                [source.intercept_var, source.slope_var, source.residual_variance],
+                rtol=0.15,
+            )
+
+    def test_one_variance_update_matches_dense_reference(self):
+        start = {
+            "n_classes": 2,
+            "growth_type": "piecewise",
+            "class_proportions": np.array([0.45, 0.55]),
+            "class_intercepts": np.array([-0.7, 0.8]),
+            "class_slopes": np.array([0.2, -0.1]),
+            "class_post_slopes": np.array([0.5, -0.4]),
+            "changepoint": 1.5,
+            "intercept_var": 0.4,
+            "slope_var": 0.2,
+            "residual_variance": 0.3,
+        }
+        time_values = np.linspace(-1.0, 4.0, 6)
+        observations, _ = GrowthMixtureModel(**start).simulate(40, time_values, seed=5)
+        observations[np.random.default_rng(6).random(observations.shape) < 0.3] = np.nan
+        observations[:, 0] = np.where(
+            np.isnan(observations).all(axis=1), 0.1, observations[:, 0]
+        )
+        # The coefficient update is unchanged and uses the starting variances.
+        fixed = GrowthMixtureModel(**start, estimate_variances=False)
+        fixed.fit_em(observations, time_values, max_iter=1)
+        model = GrowthMixtureModel(**start)
+        model.fit_em(observations, time_values, max_iter=1)
+        np.testing.assert_allclose(model.class_intercepts, fixed.class_intercepts)
+        np.testing.assert_allclose(model.class_post_slopes, fixed.class_post_slopes)
+
+        trajectories = np.vstack(
+            [fixed.compute_class_trajectory(k, time_values) for k in range(2)]
+        )
+        effect_covariance = np.diag([start["intercept_var"], start["slope_var"]])
+        residual_variance = start["residual_variance"]
+        effect_squares = np.zeros(2)
+        residual_squares = 0.0
+        for row in observations:
+            observed = ~np.isnan(row)
+            basis = np.column_stack([np.ones(observed.sum()), time_values[observed]])
+            covariance = (
+                basis @ effect_covariance @ basis.T
+                + residual_variance * np.eye(observed.sum())
+            )
+            gain = effect_covariance @ basis.T @ np.linalg.inv(covariance)
+            effect_variance = effect_covariance - gain @ basis @ effect_covariance
+            residuals = row[observed] - trajectories[:, observed]
+            log_weights = np.log(fixed.class_proportions) - 0.5 * np.einsum(
+                "ki,ij,kj->k", residuals, np.linalg.inv(covariance), residuals
+            )
+            weights = np.exp(log_weights - log_weights.max())
+            weights /= weights.sum()
+            for weight, residual in zip(weights, residuals, strict=True):
+                effect_mean = gain @ residual
+                effect_squares += weight * (effect_mean**2 + np.diag(effect_variance))
+                residual_squares += weight * (
+                    np.sum((residual - basis @ effect_mean) ** 2)
+                    + np.trace(basis @ effect_variance @ basis.T)
+                )
+
+        np.testing.assert_allclose(
+            [model.intercept_var, model.slope_var],
+            effect_squares / len(observations),
+            rtol=1e-10,
+        )
+        assert model.residual_variance == pytest.approx(
+            residual_squares / np.isfinite(observations).sum(), rel=1e-10
+        )
+
+    def test_iterations_increase_the_log_likelihood(self):
+        time_values = np.arange(5.0)
+        observations, _ = GrowthMixtureModel(
+            n_classes=2,
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.4, -0.2]),
+            intercept_var=0.8,
+            slope_var=0.05,
+            residual_variance=0.4,
+        ).simulate(200, time_values, seed=8)
+        observations[np.random.default_rng(9).random(observations.shape) < 0.2] = np.nan
+        observations = observations[np.isfinite(observations).any(axis=1)]
+        model = GrowthMixtureModel(n_classes=2)
+
+        log_likelihoods = [
+            model.fit_em(observations, time_values, max_iter=1)["log_likelihood"]
+            for _ in range(30)
+        ]
+
+        assert np.all(np.diff(log_likelihoods) >= -1e-8)
+        assert log_likelihoods[-1] > log_likelihoods[0] + 1.0
+        assert model.residual_variance == pytest.approx(0.4, rel=0.25)
+
+    def test_fixed_variances_are_left_unchanged(self):
+        time_values = np.arange(5.0)
+        observations, _ = GrowthMixtureModel(n_classes=2).simulate(
+            50, time_values, seed=10
+        )
+        model = GrowthMixtureModel(
+            n_classes=2,
+            intercept_var=0.7,
+            slope_var=0.0,
+            residual_variance=0.2,
+            estimate_variances=False,
+        )
+
+        result = model.fit(observations, time_values)
+
+        assert (model.intercept_var, model.slope_var, model.residual_variance) == (
+            0.7,
+            0.0,
+            0.2,
+        )
+        assert result.n_parameters == 5
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"n_classes": 0},
+            {"n_classes": True},
+            {"n_classes": 2.0},
+            {"n_classes": 2, "growth_type": "bogus"},
+            {"n_classes": 2, "estimate_variances": "yes"},
+        ],
+    )
+    def test_constructor_rejects_invalid_options(self, options):
+        with pytest.raises(MirtValidationError):
+            GrowthMixtureModel(**options)
 
 
 class TestGrowthModelIntegration:

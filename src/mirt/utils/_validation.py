@@ -47,8 +47,21 @@ def validate_positive_scalar(value: float, parameter: str) -> float:
 
 
 def validate_alpha(alpha: float) -> float:
-    """Return a significance level strictly between 0 and 1."""
-    value = validate_finite_scalar(alpha, "alpha")
+    """Return a significance level strictly between 0 and 1.
+
+    This is the one significance-level validator of the package; result
+    objects and person-fit tests use it too. Booleans, arrays, non-numeric
+    and non-finite values are rejected.
+    """
+    try:
+        value = validate_finite_scalar(alpha, "alpha")
+    except MirtValidationError:
+        raise MirtValidationError(
+            "alpha must be a finite number",
+            parameter="alpha",
+            value=alpha,
+            expected="0 < alpha < 1",
+        ) from None
     if not 0.0 < value < 1.0:
         raise MirtValidationError(
             "alpha must be between 0 and 1",

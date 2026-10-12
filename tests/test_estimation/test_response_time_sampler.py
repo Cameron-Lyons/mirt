@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, cast
 
 import numpy as np
@@ -21,6 +22,20 @@ from mirt.exceptions import MirtValidationError
 from mirt.models.response_time import ResponseTimeModel
 
 
+def _scalar_log_probability(
+    response: int,
+    discrimination: float,
+    difficulty: float,
+    guessing: float | None,
+    theta: float,
+) -> float:
+    """Return one clipped accuracy log probability."""
+    logistic = float(sigmoid(discrimination * (theta - difficulty)))
+    probability = logistic if guessing is None else guessing + (1 - guessing) * logistic
+    probability = float(np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON))
+    return np.log(probability) if response == 1 else np.log1p(-probability)
+
+
 def _scalar_accuracy_update(
     sampler: ResponseTimeGibbsSampler,
     responses: np.ndarray,
@@ -28,15 +43,25 @@ def _scalar_accuracy_update(
     discrimination: np.ndarray,
     difficulty: np.ndarray,
     rng: np.random.Generator,
+    guessing: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run the scalar accuracy update; prior and walk both live on log a."""
+    """Run the accuracy update one item and person at a time.
+
+    The prior and the walk both live on log a, and the likelihood is the 3PL
+    whenever guessing parameters are supplied.
+    """
+    n_items = len(discrimination)
+    log_disc_steps = rng.normal(0.0, 0.1, n_items)
+    diff_steps = rng.normal(0.0, 0.1, n_items)
+    log_uniform = np.log(rng.random(n_items))
     updated_discrimination = discrimination.copy()
     updated_difficulty = difficulty.copy()
-    for item_idx in range(len(discrimination)):
+    for item_idx in range(n_items):
         log_disc_current = np.log(discrimination[item_idx])
-        log_disc_proposed = log_disc_current + rng.normal(0.0, 0.1)
+        log_disc_proposed = log_disc_current + log_disc_steps[item_idx]
         disc_proposed = np.exp(log_disc_proposed)
-        diff_proposed = difficulty[item_idx] + rng.normal(0.0, 0.1)
+        diff_proposed = difficulty[item_idx] + diff_steps[item_idx]
+        guess = None if guessing is None else guessing[item_idx]
         log_like_current = 0.0
         log_like_proposed = 0.0
 
@@ -44,25 +69,16 @@ def _scalar_accuracy_update(
             response = responses[person_idx, item_idx]
             if response < 0:
                 continue
-            current = np.clip(
-                sigmoid(
-                    discrimination[item_idx]
-                    * (theta[person_idx] - difficulty[item_idx])
-                ),
-                PROB_EPSILON,
-                1.0 - PROB_EPSILON,
+            log_like_current += _scalar_log_probability(
+                response,
+                discrimination[item_idx],
+                difficulty[item_idx],
+                guess,
+                theta[person_idx],
             )
-            proposed = np.clip(
-                sigmoid(disc_proposed * (theta[person_idx] - diff_proposed)),
-                PROB_EPSILON,
-                1.0 - PROB_EPSILON,
+            log_like_proposed += _scalar_log_probability(
+                response, disc_proposed, diff_proposed, guess, theta[person_idx]
             )
-            if response == 1:
-                log_like_current += np.log(current)
-                log_like_proposed += np.log(proposed)
-            else:
-                log_like_current += np.log(1.0 - current)
-                log_like_proposed += np.log(1.0 - proposed)
 
         log_prior_current = (
             -0.5
@@ -86,7 +102,7 @@ def _scalar_accuracy_update(
             - log_like_current
             - log_prior_current
         )
-        if np.log(rng.random()) < log_acceptance:
+        if log_uniform[item_idx] < log_acceptance:
             updated_discrimination[item_idx] = disc_proposed
             updated_difficulty[item_idx] = diff_proposed
 
@@ -94,6 +110,7 @@ def _scalar_accuracy_update(
 
 
 def _scalar_guessing_update(
+    priors: RTModelPriors,
     responses: np.ndarray,
     theta: np.ndarray,
     discrimination: np.ndarray,
@@ -101,41 +118,47 @@ def _scalar_guessing_update(
     guessing: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Run the former scalar guessing update as a reference."""
+    """Run the logit-scale guessing update one item at a time.
+
+    ``eta = logit(c / U)`` moves by a symmetric walk; the target on that
+    scale is the 3PL likelihood, the Beta prior density of ``c`` and the
+    Jacobian ``c (U - c) / U``.
+    """
+    upper = priors.guess_upper
+    n_items = len(guessing)
+    steps = rng.normal(0.0, 0.3, n_items)
+    log_uniform = np.log(rng.random(n_items))
     updated = guessing.copy()
-    for item_idx in range(len(guessing)):
-        proposed_guess = np.clip(guessing[item_idx] + rng.normal(0.0, 0.02), 0.01, 0.5)
-        log_like_current = 0.0
-        log_like_proposed = 0.0
-        for person_idx in range(len(theta)):
-            response = responses[person_idx, item_idx]
-            if response < 0:
-                continue
-            logistic = sigmoid(
-                discrimination[item_idx] * (theta[person_idx] - difficulty[item_idx])
+
+    def log_target(item_idx: int, guess: float) -> float:
+        log_likelihood = sum(
+            _scalar_log_probability(
+                responses[person_idx, item_idx],
+                discrimination[item_idx],
+                difficulty[item_idx],
+                guess,
+                theta[person_idx],
             )
-            current = np.clip(
-                guessing[item_idx] + (1.0 - guessing[item_idx]) * logistic,
-                PROB_EPSILON,
-                1.0 - PROB_EPSILON,
-            )
-            proposed = np.clip(
-                proposed_guess + (1.0 - proposed_guess) * logistic,
-                PROB_EPSILON,
-                1.0 - PROB_EPSILON,
-            )
-            if response == 1:
-                log_like_current += np.log(current)
-                log_like_proposed += np.log(proposed)
-            else:
-                log_like_current += np.log(1.0 - current)
-                log_like_proposed += np.log(1.0 - proposed)
-        if np.log(rng.random()) < log_like_proposed - log_like_current:
-            updated[item_idx] = proposed_guess
+            for person_idx in range(len(theta))
+            if responses[person_idx, item_idx] >= 0
+        )
+        log_prior = stats.beta.logpdf(guess, priors.guess_alpha, priors.guess_beta)
+        log_jacobian = np.log(guess) + np.log(upper - guess) - np.log(upper)
+        return float(log_likelihood + log_prior + log_jacobian)
+
+    for item_idx in range(n_items):
+        eta = np.log(guessing[item_idx] / (upper - guessing[item_idx]))
+        proposed = upper / (1.0 + np.exp(-(eta + steps[item_idx])))
+        log_ratio = log_target(item_idx, proposed) - log_target(
+            item_idx, guessing[item_idx]
+        )
+        if log_uniform[item_idx] < log_ratio:
+            updated[item_idx] = proposed
     return updated
 
 
-def test_vectorized_item_updates_match_scalar_reference() -> None:
+@pytest.mark.parametrize("accuracy_model", ["2PL", "3PL"])
+def test_vectorized_item_updates_match_scalar_reference(accuracy_model: str) -> None:
     fixture_rng = np.random.default_rng(83)
     responses = fixture_rng.integers(0, 2, size=(45, 7), dtype=np.int32)
     responses[fixture_rng.random(responses.shape) < 0.12] = -1
@@ -143,7 +166,11 @@ def test_vectorized_item_updates_match_scalar_reference() -> None:
     discrimination = fixture_rng.lognormal(0.0, 0.2, size=responses.shape[1])
     difficulty = fixture_rng.normal(0.0, 0.5, size=responses.shape[1])
     guessing = fixture_rng.uniform(0.1, 0.3, size=responses.shape[1])
-    sampler = ResponseTimeGibbsSampler(n_iter=4, burnin=2, use_rust=False)
+    accuracy_guessing = guessing if accuracy_model == "3PL" else None
+    priors = RTModelPriors(guess_alpha=2.0, guess_beta=6.0, guess_upper=0.4)
+    sampler = ResponseTimeGibbsSampler(
+        n_iter=4, burnin=2, priors=priors, use_rust=False
+    )
     reference_rng = np.random.default_rng(191)
     vectorized_rng = np.random.default_rng(191)
 
@@ -154,8 +181,10 @@ def test_vectorized_item_updates_match_scalar_reference() -> None:
         discrimination,
         difficulty,
         reference_rng,
+        accuracy_guessing,
     )
     expected_guess = _scalar_guessing_update(
+        priors,
         responses,
         theta,
         expected_disc,
@@ -169,6 +198,7 @@ def test_vectorized_item_updates_match_scalar_reference() -> None:
         discrimination,
         difficulty,
         vectorized_rng,
+        guess=accuracy_guessing,
     )
     actual_guess = sampler._sample_guessing_params(
         responses,
@@ -181,7 +211,125 @@ def test_vectorized_item_updates_match_scalar_reference() -> None:
 
     assert_array_equal(actual_disc, expected_disc)
     assert_array_equal(actual_diff, expected_diff)
-    assert_array_equal(actual_guess, expected_guess)
+    assert_allclose(actual_guess, expected_guess, rtol=1e-12, atol=0.0)
+    assert np.any(actual_disc != discrimination)
+    assert np.any(actual_guess != guessing)
+
+
+def test_3pl_accuracy_update_uses_the_3pl_likelihood() -> None:
+    """Regression: the (a, b) step ignored guessing and targeted the 2PL.
+
+    With ability and guessing held at their generating values the old step
+    settled at a = [0.70, 0.95, 1.09, 1.07, 0.87] and b about 0.5 too low for
+    a = [0.8, ..., 2.0] (N = 20000); the 3PL step stays at the truth.
+    """
+    discrimination = np.array([0.8, 1.4, 2.0])
+    difficulty = np.array([-0.8, 0.0, 0.8])
+    guessing = np.full(3, 0.25)
+    generator = ResponseTimeModel(
+        n_items=3,
+        accuracy_model="3PL",
+        discrimination=discrimination,
+        difficulty=difficulty,
+        guessing=guessing,
+        use_rust=False,
+    )
+    responses, _, theta, _ = generator.simulate(6000, seed=3)
+    sampler = ResponseTimeGibbsSampler(n_iter=2, burnin=1)
+    rng = np.random.default_rng(7)
+    current_disc, current_diff = discrimination.copy(), difficulty.copy()
+    disc_draws, diff_draws = [], []
+    for iteration in range(700):
+        current_disc, current_diff = sampler._sample_accuracy_params(
+            responses, theta, current_disc, current_diff, rng, guess=guessing
+        )
+        if iteration >= 200:
+            disc_draws.append(current_disc)
+            diff_draws.append(current_diff)
+
+    assert_allclose(np.mean(disc_draws, axis=0), discrimination, atol=0.2)
+    assert_allclose(np.mean(diff_draws, axis=0), difficulty, atol=0.15)
+
+
+def test_guessing_update_samples_its_exact_conditional() -> None:
+    """Regression: clipped proposals piled 24% of the draws on c = 0.01.
+
+    Every item has the same generating parameters and its own responses, so
+    the chains are independent replicates of a one-dimensional conditional
+    that a grid evaluates exactly.
+    """
+    n_persons, n_items = 300, 12
+    generator = ResponseTimeModel(
+        n_items=n_items,
+        accuracy_model="3PL",
+        discrimination=np.ones(n_items),
+        difficulty=np.full(n_items, 1.5),
+        guessing=np.full(n_items, 0.02),
+        use_rust=False,
+    )
+    responses, _, theta, _ = generator.simulate(n_persons, seed=11)
+    sampler = ResponseTimeGibbsSampler(n_iter=2, burnin=1)
+    rng = np.random.default_rng(3)
+    discrimination = np.ones(n_items)
+    difficulty = np.full(n_items, 1.5)
+    guessing = np.full(n_items, 0.1)
+    draws = []
+    for iteration in range(3000):
+        guessing = sampler._sample_guessing_params(
+            responses, theta, discrimination, difficulty, guessing, rng
+        )
+        if iteration >= 300:
+            draws.append(guessing)
+    draws_array = np.asarray(draws)
+
+    grid = np.linspace(0.0, 0.5, 4001)[1:-1]
+    logistic = sigmoid(theta - 1.5)
+    probability = grid[:, None] + (1.0 - grid[:, None]) * logistic[None, :]
+    exact_means = []
+    for item_idx in range(n_items):
+        correct = responses[:, item_idx] == 1
+        log_density = np.sum(
+            np.where(correct, np.log(probability), np.log1p(-probability)), axis=1
+        )
+        weights = np.exp(log_density - log_density.max())
+        exact_means.append(np.sum(weights * grid) / np.sum(weights))
+
+    assert np.all((draws_array > 0.0) & (draws_array < 0.5))
+    assert np.mean(draws_array == draws_array.min()) < 0.01
+    assert abs(np.mean(draws_array.mean(axis=0) - exact_means)) < 0.002
+
+
+def test_guessing_prior_is_stationary_without_responses() -> None:
+    """With no observed accuracy the guessing draws follow the Beta prior."""
+    priors = RTModelPriors(guess_alpha=3.0, guess_beta=9.0, guess_upper=0.6)
+    sampler = ResponseTimeGibbsSampler(n_iter=2, burnin=1, priors=priors)
+    rng = np.random.default_rng(0)
+    n_items = 200
+    responses = np.full((2, n_items), -1, dtype=np.int32)
+    guessing = np.full(n_items, 0.2)
+    draws = []
+    for iteration in range(1200):
+        guessing = sampler._sample_guessing_params(
+            responses,
+            np.zeros(2),
+            np.ones(n_items),
+            np.zeros(n_items),
+            guessing,
+            rng,
+        )
+        if iteration >= 200:
+            draws.append(guessing)
+    draws_array = np.asarray(draws)
+
+    # Beta(3, 9) truncated to (0, 0.6), integrated on a fine grid.
+    grid = np.linspace(0.0, 0.6, 6001)
+    weights = stats.beta.pdf(grid, 3.0, 9.0)
+    weights /= weights.sum()
+    expected_mean = np.sum(weights * grid)
+    expected_sd = np.sqrt(np.sum(weights * grid**2) - expected_mean**2)
+
+    assert abs(draws_array.mean() - expected_mean) < 0.005
+    assert abs(draws_array.std() - expected_sd) < 0.005
 
 
 def _reference_time_update(
@@ -586,3 +734,204 @@ def test_waic_remains_finite_for_extreme_log_likelihoods() -> None:
 
     assert np.isfinite(actual)
     assert actual == pytest.approx(expected)
+
+
+def test_population_draw_fixes_identification_and_targets_regression() -> None:
+    """The ability-speed mean is zero and Var(theta) is one in every draw.
+
+    The free entries follow the conjugate regression of speed on ability, so
+    with many persons Cov(theta, tau) concentrates at S_xy / S_xx.
+    """
+    data_rng = np.random.default_rng(4)
+    theta = data_rng.normal(size=4000)
+    tau = -0.4 * theta + 0.5 * data_rng.normal(size=4000)
+    sampler = ResponseTimeGibbsSampler(n_iter=2, burnin=1)
+    rng = np.random.default_rng(1)
+    draws = np.asarray(
+        [sampler._sample_population_params(theta, tau, rng) for _ in range(400)]
+    )
+
+    assert np.all(draws[:, 0, 0] == 1.0)
+    assert_allclose(draws[:, 0, 1], draws[:, 1, 0])
+    slope = (theta @ tau) / (theta @ theta)
+    residual = np.mean((tau - slope * theta) ** 2)
+    assert abs(draws[:, 0, 1].mean() - slope) < 0.01
+    assert abs((draws[:, 1, 1] - draws[:, 0, 1] ** 2).mean() - residual) < 0.01
+
+
+def test_fit_is_identified_and_recovers_2pl_parameters() -> None:
+    """Regression: free mu and Var(theta) let the chain drift without bound.
+
+    The time intensities followed mu_tau towards the N(0, 4) prior mean
+    (bias -0.39 after 3000 sweeps at N = 1500) and R-hat never converged.
+    """
+    rng = np.random.default_rng(1)
+    n_items = 8
+    discrimination = rng.uniform(0.8, 2.0, n_items)
+    difficulty = rng.normal(0.0, 1.0, n_items)
+    time_intensity = rng.normal(3.5, 0.4, n_items)
+    generator = ResponseTimeModel(
+        n_items=n_items,
+        discrimination=discrimination,
+        difficulty=difficulty,
+        time_discrimination=rng.uniform(1.0, 2.0, n_items),
+        time_intensity=time_intensity,
+        ability_speed_cov=np.array([[1.0, -0.4], [-0.4, 0.25]]),
+    )
+    responses, response_times, _, _ = generator.simulate(300, seed=11)
+
+    result = ResponseTimeGibbsSampler(n_iter=400, burnin=200, seed=1).fit(
+        responses, response_times
+    )
+
+    assert result.chains is not None
+    assert np.all(result.chains["mu_theta"] == 0.0)
+    assert np.all(result.chains["mu_tau"] == 0.0)
+    assert np.all(result.chains["sigma_11"] == 1.0)
+    assert_array_equal(result.model.ability_speed_mean, np.zeros(2))
+    assert result.model.ability_speed_cov[0, 0] == 1.0
+    assert not {"mu_theta", "mu_tau", "sigma_11"} & set(result.rhat)
+    assert abs(np.mean(result.model.time_intensity - time_intensity)) < 0.1
+    ratio = result.model.discrimination.mean() / discrimination.mean()
+    assert 0.8 < ratio < 1.2
+    assert -0.55 < result.model.ability_speed_cov[0, 1] < -0.2
+    assert 0.15 < result.model.ability_speed_cov[1, 1] < 0.35
+
+
+def test_fit_recovers_3pl_parameters() -> None:
+    """Regression: 3PL fits returned mean a 0.41 (true 1.36) and c 0.04."""
+    rng = np.random.default_rng(2)
+    n_items = 10
+    discrimination = rng.uniform(0.8, 2.0, n_items)
+    difficulty = rng.normal(0.0, 1.0, n_items)
+    generator = ResponseTimeModel(
+        n_items=n_items,
+        accuracy_model="3PL",
+        discrimination=discrimination,
+        difficulty=difficulty,
+        guessing=np.full(n_items, 0.2),
+        time_discrimination=rng.uniform(1.0, 2.0, n_items),
+        time_intensity=rng.normal(3.5, 0.4, n_items),
+    )
+    responses, response_times, _, _ = generator.simulate(1000, seed=12)
+
+    result = ResponseTimeGibbsSampler(n_iter=1000, burnin=500, seed=2).fit(
+        responses, response_times, accuracy_model="3PL"
+    )
+
+    model = result.model
+    assert model.guessing is not None
+    ratio = model.discrimination.mean() / discrimination.mean()
+    assert 0.75 < ratio < 1.3
+    assert abs(model.guessing.mean() - 0.2) < 0.06
+    assert np.corrcoef(model.difficulty, difficulty)[0, 1] > 0.9
+    assert abs(np.mean(model.difficulty - difficulty)) < 0.25
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("accuracy_model", ["2PL", "3PL"])
+def test_long_chain_recovery_is_stationary(accuracy_model: str) -> None:
+    """Longer seeded fits recover the generating parameters and converge."""
+    rng = np.random.default_rng(1)
+    n_items = 20
+    discrimination = rng.uniform(0.8, 2.0, n_items)
+    difficulty = rng.normal(0.0, 1.0, n_items)
+    time_intensity = rng.normal(3.5, 0.4, n_items)
+    generator = ResponseTimeModel(
+        n_items=n_items,
+        accuracy_model=accuracy_model,
+        discrimination=discrimination,
+        difficulty=difficulty,
+        guessing=np.full(n_items, 0.2) if accuracy_model == "3PL" else None,
+        time_discrimination=rng.uniform(1.0, 2.0, n_items),
+        time_intensity=time_intensity,
+        ability_speed_cov=np.array([[1.0, -0.4], [-0.4, 0.25]]),
+    )
+    responses, response_times, _, _ = generator.simulate(1500, seed=3)
+
+    result = ResponseTimeGibbsSampler(n_iter=3000, burnin=1000, seed=5).fit(
+        responses, response_times, accuracy_model=accuracy_model
+    )
+
+    model = result.model
+    # 3PL item parameters mix slowly (effective sizes near 20 of 2000 draws),
+    # so a single chain gets a looser split R-hat bound.
+    assert max(result.rhat.values()) < (1.1 if accuracy_model == "2PL" else 1.2)
+    assert abs(np.mean(model.time_intensity - time_intensity)) < 0.05
+    assert abs(model.discrimination.mean() / discrimination.mean() - 1.0) < 0.1
+    assert abs(np.mean(model.difficulty - difficulty)) < 0.1
+    assert abs(model.ability_speed_cov[0, 1] + 0.4) < 0.06
+    if accuracy_model == "3PL":
+        assert model.guessing is not None
+        assert abs(model.guessing.mean() - 0.2) < 0.04
+
+
+def test_dic_and_waic_pair_draws_with_their_item_parameters() -> None:
+    """Regression: every person draw was evaluated at posterior-mean items."""
+    generating_model = ResponseTimeModel(5, use_rust=False)
+    responses, response_times, _, _ = generating_model.simulate(60, seed=8)
+    sampler = ResponseTimeGibbsSampler(n_iter=160, burnin=60, seed=9)
+    result = sampler.fit(responses, response_times)
+    response_codes, log_rt = sampler._validate_fit_data(
+        responses, response_times, "2PL"
+    )
+    chains, theta, tau = sampler._run_chain(
+        response_codes, log_rt, "2PL", np.random.default_rng(9), 0
+    )
+
+    pointwise = np.asarray(
+        [
+            ResponseTimeModel(
+                5,
+                discrimination=chains["discrimination"][draw],
+                difficulty=chains["difficulty"][draw],
+                time_discrimination=chains["time_discrimination"][draw],
+                time_intensity=chains["time_intensity"][draw],
+                use_rust=False,
+            ).joint_log_likelihood(response_codes, log_rt, theta[draw], tau[draw])
+            for draw in range(theta.shape[0])
+        ]
+    )
+    deviance_at_mean = -2.0 * np.sum(
+        result.model.joint_log_likelihood(
+            response_codes, log_rt, theta.mean(axis=0), tau.mean(axis=0)
+        )
+    )
+    mean_deviance = np.mean(-2.0 * pointwise.sum(axis=1))
+    expected_dic = 2.0 * mean_deviance - deviance_at_mean
+    lppd = np.sum(logsumexp(pointwise, axis=0) - np.log(theta.shape[0]))
+    expected_waic = -2.0 * (lppd - np.sum(np.var(pointwise, axis=0, ddof=1)))
+
+    assert result.dic == pytest.approx(expected_dic, rel=1e-10)
+    assert result.waic == pytest.approx(expected_waic, rel=1e-10)
+    assert result.log_likelihood == pytest.approx(
+        np.mean(pointwise.sum(axis=1)), rel=1e-10
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"guess_alpha": 0.0}, "guess_alpha"),
+        ({"guess_beta": np.nan}, "guess_beta"),
+        ({"guess_upper": 0.0}, "guess_upper"),
+        ({"guess_upper": 1.5}, "guess_upper"),
+        ({"guess_upper": "high"}, "guess_upper"),
+        ({"guess_upper": True}, "guess_upper"),
+    ],
+)
+def test_guessing_prior_configuration_is_validated(
+    kwargs: dict[str, Any], match: str
+) -> None:
+    with pytest.raises(MirtValidationError, match=match):
+        RTModelPriors(**kwargs)
+
+
+def test_population_mean_priors_are_deprecated_and_ignored() -> None:
+    with pytest.warns(DeprecationWarning, match="mu_mean"):
+        RTModelPriors(mu_mean=np.array([0.5, 0.0]))
+    with pytest.warns(DeprecationWarning, match="mu_cov"):
+        RTModelPriors(mu_cov=np.eye(2))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        RTModelPriors(mu_mean=np.zeros(2), mu_cov=10.0 * np.eye(2))

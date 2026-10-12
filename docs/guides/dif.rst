@@ -43,18 +43,40 @@ Methods
 * ``lord`` — Lord's chi-square, an alias of ``wald``.
 * ``raju`` — Raju's signed and unsigned areas between the linked response
   curves over theta in [-4, 4]. Areas are descriptive: ``p_value`` is
-  ``NaN`` and the ETS class uses the signed area alone.
+  ``NaN`` and the ETS class uses the effect alone.
 
 ``effect_size`` is the focal-minus-reference item location (difficulty, or
 the mean threshold) on the common scale, or the signed area for ``raju``.
 Positive values mean the item is harder for the focal group. Results also
 report ``df``, ``tested`` and ``converged`` for every item.
 
+``classification`` follows the ETS A/B/C rules (Zwick, 2012), which are
+defined on a log-odds or score scale rather than the theta scale of
+``effect_size``. ``ets_effect`` therefore reports the model-implied effect
+behind each class, computed from the two groups' fitted response curves
+matched on ability and weighted by their ability distributions:
+
+* binary items — the MH D-DIF, ``-2.35`` times the log of the
+  Mantel-Haenszel common odds ratio. Class A is ``|D| < 1``, B ``1 <= |D|
+  < 1.5`` and C ``|D| >= 1.5``. A 2PL location shift ``db`` gives
+  ``D = -2.35 * a * db``, so a steep item with a small shift can be class C
+  and a flat item with a large shift class B; under the 1PL ``D`` is
+  ``-2.35 * effect_size``.
+* GRM and GPCM items — the standardized mean difference (focal minus
+  reference expected item score, averaged over the focal ability
+  distribution) divided by the total-group item-score standard deviation.
+  Class A is ``|SMD/SD| <= 0.17``, B up to 0.25 and C above.
+
+Negative ``ets_effect`` values disadvantage the focal group. Every class
+except A also requires an adjusted p-value of at most 0.05.
+
 Anchors and schemes
 -------------------
 
-``anchors`` lists items assumed free of DIF, by index or by name (DataFrame
-column names, otherwise ``Item_0``, ``Item_1``, ...). They are not tested.
+``anchors`` lists items assumed free of DIF, by 0-based index or by name
+(DataFrame column names, otherwise ``Item_1``, ``Item_2``, ... as in
+:func:`mirt.fit_mirt` and :func:`mirt.itemfit`). They are not tested.
+:func:`mirt.dif` labels its rows by these names.
 Likelihood ratio tests hold them equal across groups in every model; ``wald``
 and ``raju`` link the groups over them. Without anchors, a likelihood-ratio test
 uses every other item as an anchor, and ``wald`` and ``raju`` link on all
@@ -158,6 +180,13 @@ reports ``linking_constants`` and ``anchor_items``.
    )
    print(dtf["DTF"], dtf["confidence_interval"])
 
+Only ``method="signed"`` reports a ``p_value``, the normal test of
+``DTF / DTF_SE``, as R's ``mirt::DTF`` tests only the signed statistic. An
+unsigned DTF is positive whenever the estimated curves differ, so its
+bootstrap interval never contains zero and ``|DTF| / DTF_SE`` is no test:
+treat the unsigned value and its ``confidence_interval`` as an effect size,
+for which ``p_value`` is ``NaN``.
+
 Set ``n_bootstrap=0`` when only the descriptive score curves and effect size
 are needed. The result reports successful and failed bootstrap replicate
 counts so uncertainty estimates can be audited. For larger studies,
@@ -166,20 +195,33 @@ preserving seeded results; the serial default is ``n_jobs=1``, and ``-1``
 uses all available CPU cores. The same option is available on
 :func:`mirt.reliability_invariance`.
 
+``dtf["item_dif"]`` breaks the score difference down by item, like R's
+``DRF(..., DIF=TRUE)`` (Chalmers, 2018): ``sDIF``, ``uDIF`` and ``dDIF`` are
+each item's signed, unsigned and root-mean-square expected-score difference
+(reference minus focal) under the same ability weighting, with bootstrap
+``_SE`` and ``_ci`` entries from the same replicates. The ``sDIF`` values
+sum to the signed DTF, and only ``sDIF`` has a p-value (``sDIF_p_value``).
+
 :func:`mirt.compute_drf` and :func:`mirt.compute_item_drf` compare
 information curves after linking the focal calibration onto the reference
 scale, by default over all items (``anchor_items`` overrides this).
-Marginal reliabilities remain within-group quantities.
+Marginal reliabilities remain within-group quantities. These are
+differential information functions; R's ``mirt::DRF`` expected-score
+statistics correspond to :func:`mirt.compute_dtf` and its ``item_dif``.
 
 SIBTEST inference
 -----------------
 
-:func:`mirt.sibtest` compares complete binary responses within matching-score
-strata. Its uniform effect ``beta`` is a pooled-population weighted average of
-reference-minus-focal suspect scores. ``beta_se`` uses the within-group
-sampling variances in each stratum. ``correction=True`` applies the
-Shealy–Stout true-score regression correction using each group's KR-20
-matching-subtest reliability and neighboring conditional suspect-score means.
+:func:`mirt.sibtest` compares responses within matching-score strata. Items
+may be binary or polytomous (non-negative integer scores): scores are
+item-score sums, as in the Poly-SIBTEST of `Chang, Mazzeo and Roussos (1996)
+<https://doi.org/10.1111/j.1745-3984.1996.tb00496.x>`_, and several
+``suspect_items`` test their summed score as a bundle. Its uniform effect
+``beta`` is a pooled-population weighted average of reference-minus-focal
+suspect scores. ``beta_se`` uses the within-group sampling variances in each
+stratum. ``correction=True`` applies the Shealy–Stout true-score regression
+correction using each group's coefficient-alpha matching-subtest reliability
+(KR-20 for binary items) and neighboring conditional suspect-score means.
 
 .. code-block:: python
 
@@ -202,19 +244,60 @@ are estimable and one when a single region is estimable. The reported crossing
 effect is an absolute score-area difference; its ``z`` is descriptive, and
 ``p_value`` comes from the chi-square test. ``crossing_point`` and ``n_strata``
 report the estimated location and number of retained score strata.
+``n_permutations`` replaces the chi-square test with the randomization test of
+`Li and Stout (1996) <https://doi.org/10.1007/BF02294041>`_, as R mirt's
+``randomize = TRUE``: each stratum's difference is flipped in sign at random,
+the crossing is re-estimated, and ``p_value`` is the share of permutations
+whose crossing effect is at least the observed one. ``chi2`` is then ``NaN``
+and ``df`` zero; ``random_state`` seeds the draws.
 
 ``min_cell_size`` requires at least that many persons in each group at a
 matching score; its default is two, the minimum needed to estimate sampling
 variance. Larger minima exclude sparse cells. Corrected analysis also needs
 at least two matching items, positive matching reliability in both groups,
-and observed neighboring scores for the regression slopes. Missing responses
-are rejected. Unestimable tests return ``NaN`` p-values and zero degrees of
-freedom, so they are never flagged as significant.
+and observed neighboring scores for the regression slopes. NaN and negative
+codes are missing: they raise an error unless ``na_rm=True``, which, like R's
+``na.rm``, removes every person with a missing response anywhere in ``data``.
+Unestimable tests return ``NaN`` p-values and zero degrees of freedom, so
+they are never flagged as significant.
+
+With more than two groups, :func:`mirt.sibtest` runs the joint GSIBTEST of
+`Chalmers and Zheng (2023) <https://doi.org/10.1080/08957347.2023.2201703>`_.
+``contrasts`` has one column per sorted group label; by default, as in R, the
+first group is compared with each other group. ``beta``, ``beta_se`` and
+``z`` then hold one value per contrast, ``beta_covariance`` their covariance,
+and ``chi2`` is the Wald statistic on ``df`` (the number of contrasts) degrees
+of freedom. The multi-group crossing statistic has no asymptotic reference,
+so its ``p_value`` needs ``n_permutations``. ``pairwise=True`` instead runs a
+two-group test for every pair of groups, listed as (reference, focal) labels
+in ``pairs``.
+
+``convention="mirt"`` reproduces R mirt's ``SIBTEST``. R's ``Jmin`` keeps
+scores with more than ``Jmin`` persons, so pair it with
+``min_cell_size=Jmin + 1`` (6 for R's default). R also drops the lowest and highest observed
+matching scores and any score at which a compared group's suspect score is
+constant; with more than two groups it keeps a score when the groups of any
+one contrast qualify. It locates crossings by a regression over every score
+observed in both groups whose larger group holds over 1% of the persons,
+with zero difference at unretained scores, and rounds the location to one
+significant digit. One difference remains: where a neighboring score is
+unobserved in a compared group, R extrapolates with a zero conditional mean,
+while the package leaves that stratum out.
+
+.. code-block:: python
+
+   # R: SIBTEST(dat, group, suspect_set = 1, randomize = TRUE)
+   mirt.sibtest(
+       data, groups, [0], method="crossing", convention="mirt",
+       min_cell_size=6, n_permutations=1000, random_state=1,
+   )
 
 :func:`mirt.sibtest_items` shares matching-score totals and reliability moments
-across items and returns the same inference fields as arrays. Its
+across items and returns the same inference fields as arrays (one row per
+item, with a column per contrast or pair for more than two groups). Its
 ``p_adjust`` option supports ``"none"``, ``"bonferroni"``, ``"holm"``, and
-``"fdr_bh"``. Both APIs accept ``focal_group``; reversing it reverses the
+``"fdr_bh"``; with ``pairwise=True`` each pair is its own family, as in R.
+Both APIs accept ``focal_group`` for two groups; reversing it reverses the
 uniform effect while preserving its two-sided p-value. The original correction
 and standard-error formulation is described by `Shealy and Stout (1993)
 <https://doi.org/10.1007/BF02294572>`_.
@@ -225,7 +308,11 @@ Related utilities
 * :func:`mirt.sibtest` — SIBTEST
 * :func:`mirt.diagnostics.compute_grdif` — multi-group GRDIF with robust
   scaling and itemwise multiplicity control; a fast residual screen that does
-  not refit models per item
+  not refit models per item. Squared residuals are compared net of their
+  model expectation given each person's ability, so group impact is not
+  flagged. Abilities are ML estimates by default, as in ``irtQ``; EAP and
+  MAP shrink them toward the pooled mean, which makes GRDIF_R liberal when
+  the groups differ in ability.
 * :func:`mirt.diagnostics.grdif_effect_size` — spread of the GRDIF residual
   moments across groups, from the calibration and final abilities of
   :func:`mirt.diagnostics.compute_grdif` (no refit)

@@ -63,3 +63,39 @@ def test_invalid_category_definitions_raise(n_categories, match):
 def test_response_above_declared_category_range_raises():
     with pytest.raises(ValueError, match="outside n_categories"):
         check_response_pattern(np.array([[0, 2]]), n_categories=2)
+
+
+def test_align_response_columns_selects_named_items_in_model_order():
+    pl = pytest.importorskip("polars")
+    from mirt.utils.data import align_response_columns
+
+    frame = pl.DataFrame({"id": [1, 2], "b": [0, 1], "a": [1, None]})
+
+    aligned = align_response_columns(frame, ["a", "b"])
+
+    assert isinstance(aligned, pl.DataFrame)
+    assert aligned.columns == ["a", "b"]
+    assert align_response_columns(frame, ["id", "b", "a"]) is frame
+    # Duplicate model labels cannot select columns, so order is kept.
+    assert align_response_columns(frame, ["a", "a", "b"]) is frame
+
+
+def test_align_response_columns_reports_missing_named_items():
+    pd = pytest.importorskip("pandas")
+    from mirt.exceptions import MirtDataError
+    from mirt.utils.data import align_response_columns
+
+    frame = pd.DataFrame(np.zeros((2, 3), dtype=int), columns=[10, 20, 30])
+    assert align_response_columns(frame, ["30", "10"]).columns.tolist() == [30, 10]
+
+    names = [f"item{index}" for index in range(12)]
+    with pytest.raises(MirtDataError, match=r"item0, .*item9, \.\.\. \(12 in total\)"):
+        align_response_columns(frame, names)
+
+
+def test_dead_data_expand_table_is_removed():
+    import mirt.utils.data as data_module
+    from mirt.utils import expand_table
+
+    assert not hasattr(data_module, "expand_table")
+    assert expand_table.__module__ == "mirt.utils.transform"

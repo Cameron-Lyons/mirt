@@ -150,8 +150,9 @@ def simdata(
     Parameters
     ----------
     model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM", "ZI-2PL", "ZI-3PL", "HURDLE"}, item model or FitResult, default="2PL"
-        IRT model to simulate from. A dichotomous or polytomous item model,
-        or a fit result wrapping one, simulates from its current parameters;
+        IRT model to simulate from. A dichotomous, polytomous or
+        :class:`~mirt.CustomItemModel` item model, or a fit result wrapping
+        one, simulates from its current parameters;
         then only ``n_persons``, ``theta`` and ``seed`` apply, and abilities
         default to standard normal draws on every model factor, or to normal
         draws with a fit result's estimated ``latent_mean`` and
@@ -198,7 +199,12 @@ def simdata(
         for GPCM step parameters.
         If None, equally spaced around difficulty.
     seed : int, optional
-        Random seed for reproducibility.
+        Random seed for reproducibility. A seed reproduces the responses on
+        the same backend. Unidimensional dichotomous (except 4PL), graded and
+        generalized partial credit responses are drawn by the native
+        extension's own generator when it is in use, so
+        ``set_backend("numpy")`` or an installation without the extension
+        draws different responses for the same seed.
     steps : ndarray of shape (n_items, n_categories-1), optional
         Step parameters for GPCM and PCM models.
     slopes : ndarray, optional
@@ -528,16 +534,19 @@ def _simulate_from_model(
     theta: NDArray[np.float64] | None,
     seed: int | None,
 ) -> NDArray[np.int_]:
-    """Simulate responses from a dichotomous or polytomous model object."""
+    """Simulate responses from a dichotomous, polytomous or custom model."""
     from mirt._categorical import draw_item_responses
     from mirt.models.base import DichotomousItemModel, PolytomousItemModel
+    from mirt.models.custom import CustomItemModel
     from mirt.results._common import resolve_latent_prior
 
     item_model, latent_mean, latent_cov = resolve_latent_prior(model)
-    if not isinstance(item_model, (DichotomousItemModel, PolytomousItemModel)):
+    if not isinstance(
+        item_model, (DichotomousItemModel, PolytomousItemModel, CustomItemModel)
+    ):
         raise ValueError(
             "model must be a simulation model name, a dichotomous or polytomous "
-            "item model, or a FitResult wrapping one"
+            "item model, a CustomItemModel, or a FitResult wrapping one"
         )
     if n_items is not None and n_items != item_model.n_items:
         raise ValueError(f"n_items must match the model's {item_model.n_items} items")
@@ -574,9 +583,7 @@ def _simulate_from_model(
         if not np.all(np.isfinite(theta_values)):
             raise ValueError("theta must contain finite values")
 
-    width = (
-        item_model.max_categories if isinstance(item_model, PolytomousItemModel) else 1
-    )
+    width = item_model.max_categories if item_model.is_polytomous else 1
     chunk_size = max(1, _MAX_POLYTOMOUS_CHUNK_ENTRIES // (item_model.n_items * width))
     return draw_item_responses(
         item_model, theta_values, rng, chunk_size=chunk_size, dtype=np.int_

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from numbers import Real
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt.cat._names import resolve_name
+from mirt.cat._native import register_native_defaults as _register_native_defaults
 from mirt.cat._stopping_common import (
     ChangeTracker,
+    classification_confidence,
     combination_operator,
     finite_real,
     integer,
@@ -156,6 +158,7 @@ class AvgSEStop(MCATStoppingRule):
         return f"Average SE threshold reached (mean SE <= {self.threshold})"
 
 
+@_register_native_defaults
 class MaxItemsMCATStop(MCATStoppingRule):
     """Stop after a maximum number of items.
 
@@ -243,13 +246,7 @@ class CompositeClassificationStop(MCATStoppingRule):
         if not np.any(values != 0.0):
             raise ValueError("weights must contain at least one nonzero value")
         cut_value = finite_real(cut_score, "cut_score")
-        if (
-            isinstance(confidence, (bool, np.bool_))
-            or not isinstance(confidence, Real)
-            or not 0.5 < float(confidence) < 1.0
-        ):
-            raise ValueError("confidence must be strictly between 0.5 and 1")
-        confidence_value = float(confidence)
+        confidence_value = classification_confidence(confidence)
 
         from scipy.special import ndtri
 
@@ -325,6 +322,7 @@ class CompositeClassificationStop(MCATStoppingRule):
         self._classification = None
 
 
+@_register_native_defaults
 class CombinedMCATStop(MCATStoppingRule):
     """Combine multiple MCAT stopping rules with logical operators.
 
@@ -384,6 +382,8 @@ def create_mcat_stopping_rule(
     method : str
         Stopping rule name. One of: "trace", "determinant", "max_se",
         "avg_se", "max_items", "theta_change", "classification", "combined".
+        Names match regardless of case and surrounding whitespace, and
+        ``"-"`` is accepted for ``"_"``.
     **kwargs
         Additional keyword arguments passed to the rule constructor.
 
@@ -408,10 +408,5 @@ def create_mcat_stopping_rule(
         "combined": CombinedMCATStop,
     }
 
-    if method not in rules:
-        valid = ", ".join(rules.keys())
-        raise ValueError(
-            f"Unknown MCAT stopping rule '{method}'. Valid options: {valid}"
-        )
-
-    return rules[method](**kwargs)
+    _, rule_class = resolve_name(method, rules, kind="MCAT stopping rule")
+    return rule_class(**kwargs)

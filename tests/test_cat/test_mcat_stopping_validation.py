@@ -209,3 +209,101 @@ def test_cat_and_mcat_families_stay_separate():
     assert isinstance(CombinedMCATStop([MaxSEStop()]), MCATStoppingRule)
     assert not isinstance(CombinedMCATStop([MaxSEStop()]), StoppingRule)
     assert not isinstance(CombinedStop([ThetaChangeStop()]), MCATStoppingRule)
+
+
+@pytest.mark.parametrize("confidence", [0.3, 0.5, 1.0, True, np.nan])
+def test_classification_rules_share_confidence_validation(confidence):
+    """Confidence at or below one half would stop after any first item."""
+    from mirt.cat.stopping import ClassificationStop
+
+    with pytest.raises(ValueError, match="strictly between 0.5 and 1"):
+        ClassificationStop(cut_score=0.0, confidence=confidence)
+    with pytest.raises(ValueError, match="strictly between 0.5 and 1"):
+        CompositeClassificationStop([1.0, 1.0], cut_score=0.0, confidence=confidence)
+
+
+def test_classification_rules_accept_valid_confidence():
+    from mirt.cat.stopping import ClassificationStop
+
+    assert ClassificationStop(cut_score=0.0, confidence=0.95).confidence == 0.95
+    composite = CompositeClassificationStop([1.0, 1.0], cut_score=0.0, confidence=0.95)
+    assert composite.confidence == 0.95
+
+
+def test_low_confidence_no_longer_stops_an_uncertain_session():
+    from mirt.cat.stopping import ClassificationStop
+
+    with pytest.raises(ValueError):
+        ClassificationStop(cut_score=0.0, confidence=0.3)
+    rule = ClassificationStop(cut_score=0.0, confidence=0.55)
+    uncertain = CATState(
+        theta=0.05,
+        standard_error=2.0,
+        items_administered=[0],
+        responses=[1],
+        n_items=1,
+    )
+
+    assert rule.should_stop(uncertain) is False
+
+
+@pytest.mark.parametrize(
+    ("rule", "expected"),
+    [
+        (lambda: ThetaChangeStop(), None),
+        (lambda: CombinedStop([ThetaChangeStop()]), None),
+        (lambda: _max_items(12), 12),
+        (lambda: CombinedStop([ThetaChangeStop(), _max_items(12)]), 12),
+        (lambda: CombinedStop([_max_items(15), _max_items(12)]), 12),
+        (lambda: CombinedStop([_max_items(12)], min_items=14), 14),
+        (lambda: CombinedStop([ThetaChangeStop(), _max_items(12)], "and"), None),
+        (lambda: CombinedStop([_max_items(15), _max_items(12)], "and"), 15),
+        (
+            lambda: CombinedStop(
+                [ThetaChangeStop(), CombinedStop([ThetaChangeStop(), _max_items(9)])]
+            ),
+            9,
+        ),
+    ],
+)
+def test_item_limit_follows_rule_composition(rule, expected):
+    from mirt.cat._stopping_common import item_limit
+    from mirt.cat.stopping import MaxItemsStop
+
+    assert item_limit(rule(), MaxItemsStop, CombinedStop) == expected
+
+
+def test_item_limit_ignores_subclasses_that_may_stop_later():
+    from mirt.cat._stopping_common import item_limit
+    from mirt.cat.stopping import MaxItemsStop
+
+    class LaterStop(MaxItemsStop):
+        def should_stop(self, state):
+            return state.n_items >= 2 * self.max_items
+
+    assert item_limit(LaterStop(5), MaxItemsStop, CombinedStop) is None
+    assert item_limit(MaxItemsMCATStop(5), MaxItemsMCATStop, CombinedMCATStop) == 5
+
+
+def _max_items(count):
+    from mirt.cat.stopping import MaxItemsStop
+
+    return MaxItemsStop(count)
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs"),
+    [
+        ("Trace", {}),
+        ("max-se", {}),
+        ("MAX_ITEMS", {"max_items": 5}),
+        ("theta-change", {}),
+    ],
+)
+def test_mcat_factory_names_match_the_shared_rule(name, kwargs):
+    from mirt.cat.mcat_stopping import create_mcat_stopping_rule
+
+    expected = create_mcat_stopping_rule(
+        name.strip().lower().replace("-", "_"), **kwargs
+    )
+    assert type(create_mcat_stopping_rule(name, **kwargs)) is type(expected)

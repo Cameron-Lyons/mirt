@@ -1,7 +1,10 @@
+import warnings
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+from mirt.exceptions import MirtValidationError
 from mirt.models.dynamic import NonlinearGrowthModel
 
 
@@ -90,7 +93,44 @@ def test_compute_theta_rejects_incompatible_person_counts():
 
 
 def test_compute_theta_rejects_unknown_growth_type():
-    model = NonlinearGrowthModel(growth_type="linear")
+    model = NonlinearGrowthModel()
+    model.growth_type = "linear"
 
     with pytest.raises(ValueError, match="Unknown growth type"):
         model.compute_theta(np.array([0.0, 1.0]))
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"growth_type": "linear"}, "growth_type"),
+        ({"rate": np.nan}, "rate must be finite"),
+        ({"asymptote": np.array([1.0, 2.0])}, "asymptote must be a finite scalar"),
+        ({"inflection": "early"}, "inflection must be a finite scalar"),
+        ({"residual_variance": -0.1}, "residual_variance must be finite and non"),
+        ({"rate_var": np.inf}, "rate_var must be finite and non"),
+    ],
+)
+def test_constructor_rejects_invalid_options(options, message):
+    with pytest.raises(MirtValidationError, match=message):
+        NonlinearGrowthModel(**options)
+
+
+@pytest.mark.parametrize("growth_type", ["logistic", "gompertz"])
+def test_growth_velocity_is_finite_and_exact_in_saturated_tails(growth_type):
+    model = NonlinearGrowthModel(growth_type=growth_type, asymptote=2.0, rate=50.0)
+    times = np.array([-20.0, -15.0, -0.01, 0.0, 0.01, 15.0, 20.0])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        velocity = model.growth_velocity(times)
+
+    step = 1e-7
+    with np.errstate(over="ignore"):
+        central = (
+            model.compute_theta(times + step) - model.compute_theta(times - step)
+        ) / (2.0 * step)
+    assert_allclose(velocity, central, rtol=1e-7, atol=1e-9)
+    assert_allclose(velocity[[0, 1, 5, 6]], 0.0, atol=1e-300)
+    if growth_type == "logistic":
+        assert velocity[3] == pytest.approx(2.0 * 50.0 / 4.0)

@@ -111,11 +111,16 @@ def test_fit_evaluates_and_normalizes_each_importance_draw_once(method, monkeypa
     result = estimator.fit(model, responses)
     assert result.n_iterations == 3
     importance = method not in ("posterior", "stochastic")
+    # Each E-step evaluates its draws once, or once per Metropolis step, and
+    # MCEM and QMCEM refresh the last draw at max_iter; stochastic EM
+    # averages its iterates instead.
+    draws = 3 * (1 if importance else 21) + (method != "stochastic")
     # MCEM's ascent check evaluates the draws of iterations two and three at
     # the previous iterate, without normalizing them; their likelihoods at the
     # current iterate come from the E-step.
     ascent = 2 if method in ("importance", "posterior") else 0
-    assert calls["probability"] == (4 if importance else 64) + ascent
+    # The reported log-likelihood integrates once over the prior grid.
+    assert calls["probability"] == draws + ascent + 1
     assert calls["normalization"] == (4 if importance else 0)
 
 
@@ -129,10 +134,15 @@ def test_fit_releases_previous_draw_and_keeps_final_draw_for_errors(
     probability = model.probability
     draws = []
     final_weights = None
+    # Posterior chains continue in place in the previous draw's buffer, which
+    # a larger MCEM sample replaces.
+    chained = method in ("posterior", "stochastic")
 
     def check_previous_draw(*args, **kwargs):
         if draws and len(draws) < 3:
-            assert all(reference() is None for reference in draws[-1])
+            samples, weights = draws[-1]
+            assert weights() is None
+            assert chained or samples() is None
         return probability(*args, **kwargs)
 
     def remember_draw(model, responses, samples, weights):
@@ -181,10 +191,13 @@ def test_interrupted_fit_releases_previous_draw_and_can_be_retried(method, monke
     model, responses, mean, covariance = _input("2pl")
     probability, m_step = model.probability, estimator._m_step_mc
     previous = []
+    # Posterior chains continue from the previous draw, which the interrupted
+    # E-step still holds.
+    chained = method in ("posterior", "stochastic")
 
     def interrupt_next_draw(*args, **kwargs):
         if previous:
-            assert all(reference() is None for reference in previous)
+            assert all(reference() is None for reference in previous[chained:])
             raise RuntimeError("interrupted E-step")
         return probability(*args, **kwargs)
 
@@ -216,6 +229,9 @@ def test_interrupted_fit_releases_previous_draw_and_can_be_retried(method, monke
         _assert_fit_values_close(parameters, expected.model.parameters[name])
 
 
+# A one-iteration fit evaluates its E-step draws (once per Metropolis step
+# for posterior chains) and their likelihood estimate; MCEM and QMCEM refresh
+# the draws at max_iter, and every fit integrates once over the prior grid.
 _HOOK_CASES = (
     [
         (method, hook, expected)
@@ -223,14 +239,16 @@ _HOOK_CASES = (
         for hook, expected in (
             ("_e_step_mc", 1),
             ("_estimate_marginal_ll", 1),
-            ("_refresh_mc_state", 2),
+            ("_refresh_mc_state", 1 if method == "stochastic" else 2),
             (
                 "_sample_log_likelihoods",
-                2
+                3
                 if method in ("sobol", "halton")
                 else 23
-                if method in ("posterior", "stochastic")
-                else 3,
+                if method == "stochastic"
+                else 24
+                if method == "posterior"
+                else 4,
             ),
         )
     ]
@@ -309,9 +327,12 @@ def test_custom_model_likelihoods_keep_fresh_evaluation(method, binding, monkeyp
         monkeypatch.setattr(model, hook, MethodType(changing_likelihood, model))
     monkeypatch.setattr(estimator, "_m_step_mc", lambda *args: None)
     result = estimator.fit(model, np.array([[0], [1], [-1]]))
-    expected_calls = 23 if method in ("posterior", "stochastic") else 3
+    # The E-step, its likelihood estimate and, except for stochastic EM, the
+    # refresh at max_iter, then the integration over the prior grid.
+    expected_calls = {"posterior": 24, "stochastic": 23}.get(method, 4)
     assert calls == expected_calls
-    assert result.log_likelihood == -3.0 * expected_calls
+    # The reported likelihood uses the custom likelihood of the last call.
+    assert result.log_likelihood == pytest.approx(-3.0 * expected_calls)
 
 
 def test_qmcem_keeps_a_changed_base_sample_callback(monkeypatch):
@@ -327,4 +348,5 @@ def test_qmcem_keeps_a_changed_base_sample_callback(monkeypatch):
     monkeypatch.setattr(MCEMEstimator, "_sample_log_likelihoods", counted)
     monkeypatch.setattr(estimator, "_m_step_mc", lambda *args: None)
     estimator.fit(TwoParameterLogistic(1), np.array([[0], [1], [-1]]))
-    assert calls == 2
+    # The E-step's estimate, the refresh at max_iter and the prior grid.
+    assert calls == 3

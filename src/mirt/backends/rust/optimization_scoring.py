@@ -34,7 +34,7 @@ def try_optimized_scores(
         ThreeParameterLogistic,
         TwoParameterLogistic,
     )
-    from mirt.scoring._common import resolve_n_jobs
+    from mirt.utils._parallel import resolve_n_jobs
 
     if (
         not rust_enabled()

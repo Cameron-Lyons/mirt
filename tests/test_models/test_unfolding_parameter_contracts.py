@@ -1,6 +1,7 @@
 """Independent unfolding equations identify estimated model coordinates."""
 
 from copy import deepcopy
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -235,6 +236,59 @@ def test_ggum_fit_reports_independent_aic_count_and_exact_pattern_likelihood():
     assert_allclose(fitted.log_likelihood, reference_ll, atol=1e-10)
     assert_allclose(fitted.aic, -2 * reference_ll + 2 * 15)
     assert_allclose(fitted.bic, -2 * reference_ll + 15 * np.log(len(responses)))
+
+
+@pytest.mark.parametrize(
+    ("column", "offset", "message"),
+    [
+        (lambda c: c, 1e-9, "center threshold must be zero"),
+        (lambda c: c + 1, 1e-9, "thresholds must be symmetric"),
+        (lambda c: 2 * c + 1, 1.0, "padded thresholds must be zero"),
+    ],
+)
+def test_ggum_threshold_validation_names_the_first_invalid_item(
+    column, offset, message
+):
+    counts = [3, 5, 2, 4]
+    model = _random_ggum(counts)
+    corrupted = model.thresholds.copy()
+    # Items 2 and 3 are narrower than item 1, so both rows have padding.
+    for item in (3, 2):
+        thresholds = model.thresholds.copy()
+        thresholds[item, column(counts[item] - 1)] += offset
+        corrupted[item] = thresholds[item]
+        with pytest.raises(MirtValidationError, match=f"item {item} {message}"):
+            model.set_parameters(thresholds=thresholds)
+        with pytest.raises(MirtValidationError, match=f"item {item} {message}"):
+            model.set_item_parameter(item, "thresholds", thresholds[item])
+    with pytest.raises(MirtValidationError, match=f"item 2 {message}"):
+        model.set_parameters(thresholds=corrupted)
+    # Values within the 1e-12 tolerance are accepted.
+    thresholds = model.thresholds.copy()
+    thresholds[0, 2] += 5e-13
+    model.set_parameters(thresholds=thresholds)
+
+
+def test_ggum_item_threshold_updates_validate_only_the_edited_row():
+    model = _random_ggum([3, 5, 4, 6])
+    updated = model.thresholds[2].copy()
+    updated[:3] -= 0.1
+    updated[4:7] = -updated[:3][::-1]
+    validator = GeneralizedGradedUnfolding._validate_threshold_matrix
+
+    with patch.object(
+        GeneralizedGradedUnfolding,
+        "_validate_threshold_matrix",
+        autospec=True,
+        side_effect=validator,
+    ) as checked:
+        model.set_item_parameter(2, "thresholds", updated)
+
+    # A per-item M-step update must not rescan every item's row.
+    assert checked.call_count == 1
+    assert checked.call_args.args[1].shape == (1, model.thresholds.shape[1])
+    assert_array_equal(model.thresholds[2], updated)
+    model.set_parameters(thresholds=model.thresholds)  # Stored form is valid.
 
 
 def test_hcm_gauge_spans_exact_two_dimensional_curve_family():

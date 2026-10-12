@@ -11,6 +11,7 @@ from mirt.estimation.mcem import (
     MCEMEstimator,
     QMCEMEstimator,
     StochasticEMEstimator,
+    _batch_means_errors,
     _log_likelihood_change,
 )
 from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -39,12 +40,11 @@ def test_mcem_converges_near_the_em_estimate(responses, importance_sampling):
 
     assert result.converged
     assert result.n_iterations < 100
-    # Short Metropolis chains do not reach the posteriors, so the posterior-draw
-    # variant has a fixed point of its own; only importance sampling targets
-    # the maximum likelihood estimate.
-    if importance_sampling:
-        for name, values in reference.model.parameters.items():
-            np.testing.assert_allclose(result.model.parameters[name], values, atol=0.1)
+    # Posterior chains continue across iterations, so short Metropolis runs
+    # track the posteriors and both variants target the maximum likelihood
+    # estimate; restarted chains used to leave slopes about 0.18 off.
+    for name, values in reference.model.parameters.items():
+        np.testing.assert_allclose(result.model.parameters[name], values, atol=0.1)
     sizes = estimator.sample_size_history
     assert len(sizes) == result.n_iterations
     assert sizes[0] == 100 and np.all(np.diff(sizes) >= 0)
@@ -72,8 +72,119 @@ def test_deterministic_and_stochastic_variants_keep_the_plain_rule(responses):
     assert set(qmcem.sample_size_history) == {64}
 
     sem = StochasticEMEstimator(max_iter=5, seed=3)
-    sem.fit(TwoParameterLogistic(8), responses)
+    with pytest.warns(RuntimeWarning, match="within the burn-in"):
+        sem.fit(TwoParameterLogistic(8), responses)
     assert set(sem.sample_size_history) == {5}
+
+
+def test_qmcem_without_seed_scrambles_one_grid_per_fit(responses):
+    # A fresh scramble in every E-step kept the log-likelihood estimate moving
+    # by more than tol, so unseeded fits never converged.
+    estimator = QMCEMEstimator(n_samples=64, max_iter=100)
+    grids = []
+    original = QMCEMEstimator._e_step_mc_state
+
+    def recorded(self, *args):
+        state = original(self, *args)
+        grids.append(np.array(state[0][0]))
+        return state
+
+    estimator._e_step_mc_state = recorded.__get__(estimator)
+    result = estimator.fit(TwoParameterLogistic(8), responses)
+    assert result.converged
+    assert result.n_iterations < 100
+    for grid in grids[1:]:
+        np.testing.assert_array_equal(grid, grids[0])
+
+    first = grids[0]
+    grids.clear()
+    estimator.fit(TwoParameterLogistic(8), responses)
+    assert not np.array_equal(grids[0], first)
+
+
+def _em_reference(responses):
+    return EMEstimator(tol=1e-8, compute_standard_errors=False).fit(
+        TwoParameterLogistic(8), responses
+    )
+
+
+def test_stochastic_em_returns_the_average_of_post_burn_in_iterates(responses):
+    estimator = StochasticEMEstimator(seed=2, tol=0.03, burnin=20)
+    free = None
+    iterates = []
+    m_step = estimator._m_step_mc
+
+    def recorded(model, *args):
+        nonlocal free
+        m_step(model, *args)
+        free = free or FreeItemParameters(model)
+        iterates.append(free.get(model))
+
+    estimator._m_step_mc = recorded
+    result = estimator.fit(TwoParameterLogistic(8), responses)
+
+    assert result.converged
+    assert result.n_iterations == len(iterates) < estimator.max_iter
+    np.testing.assert_allclose(
+        free.get(result.model), np.mean(iterates[20:], axis=0), rtol=1e-12
+    )
+    # The last iterate of the noisy chain used to be returned instead, about
+    # 0.25 from the EM slopes after 1000 iterations.
+    reference = _em_reference(responses)
+    for name, values in reference.model.parameters.items():
+        np.testing.assert_allclose(result.model.parameters[name], values, atol=0.1)
+
+
+def test_stochastic_em_warns_when_the_average_is_not_precise(responses):
+    estimator = StochasticEMEstimator(seed=2, max_iter=60, tol=1e-6, burnin=5)
+    with pytest.warns(RuntimeWarning, match="Monte Carlo standard error"):
+        result = estimator.fit(TwoParameterLogistic(8), responses)
+    assert not result.converged
+    assert result.n_iterations == 60
+
+    estimator = StochasticEMEstimator(seed=2, max_iter=30, burnin=5)
+    with pytest.warns(RuntimeWarning, match="fewer than 50 iterates"):
+        assert not estimator.fit(TwoParameterLogistic(8), responses).converged
+
+
+def test_batch_means_errors_match_the_error_of_an_autoregressive_mean():
+    rng = np.random.default_rng(6)
+    rho, n_iterates, n_chains = 0.6, 400, 300
+    chains = np.empty((n_iterates, n_chains))
+    chains[0] = rng.standard_normal(n_chains) / np.sqrt(1 - rho**2)
+    for index in range(1, n_iterates):
+        chains[index] = rho * chains[index - 1] + rng.standard_normal(n_chains)
+    errors = _batch_means_errors(chains)
+    # Var(mean) of a stationary AR(1) chain with unit innovations.
+    expected = np.sqrt((1 + rho) / (1 - rho) / (1 - rho**2) / n_iterates)
+    assert np.median(errors) == pytest.approx(expected, rel=0.15)
+    assert chains.mean(axis=0).std() == pytest.approx(expected, rel=0.15)
+
+
+def test_posterior_chains_continue_from_the_previous_draws():
+    model = TwoParameterLogistic(4)
+    data = mirt.simdata("2PL", n_persons=30, n_items=4, seed=8)
+    estimator = MCEMEstimator(n_samples=50, seed=9, importance_sampling=False)
+    estimator._rng = np.random.default_rng(9)
+    prior = (np.zeros(1), np.eye(1), 1)
+
+    first, _ = estimator._e_step_mc(model, data, *prior)
+    start = first.copy()
+    second, _ = estimator._e_step_mc(model, data, *prior)
+    # The chains move on in place from the previous draw.
+    assert second is first
+    assert not np.array_equal(second, start)
+
+    # Sample-size growth adds chains that start at copies of existing ones.
+    estimator.n_samples = 75
+    grown, _ = estimator._e_step_mc(model, data, *prior)
+    assert grown.shape == (30, 75, 1)
+    assert estimator._chain_state is grown
+
+    # A new fit restarts the chains at the prior.
+    estimator._start_draws()
+    fresh, _ = estimator._e_step_mc(model, data, *prior)
+    assert fresh is not grown
 
 
 def test_iterate_change_restores_the_current_parameters():

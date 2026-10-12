@@ -6,12 +6,13 @@ data for observed vs expected plots.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt._smoothing import smooth_response_curves
 
@@ -26,22 +27,49 @@ _EMPIRICAL_MAX_PROBABILITY_VALUES = 262_144
 
 @dataclass
 class DIFEffectSize:
-    """Container for DIF effect size statistics.
+    """Container for the DIF effect sizes of Meade (2010).
+
+    Differences are focal minus reference expected item scores, so negative
+    values favour the reference group. The sample statistics average over
+    the focal group's ability estimates and are ``NaN`` when none are given.
 
     Attributes
     ----------
     item_idx : int
         Item index.
     signed_es : float
-        Signed effect size (positive = favors focal group).
+        ``sids`` when focal abilities are given, otherwise ``sidn``.
     unsigned_es : float
-        Unsigned (absolute) effect size.
+        ``uids`` when focal abilities are given, otherwise ``uidn``.
     sids : float
-        Signed Item Difference in the Sample.
+        Signed Item Difference in the Sample: mean expected-score difference
+        over the focal abilities.
     uids : float
-        Unsigned Item Difference in the Sample.
-    classification : str
-        ETS classification ("A", "B", or "C").
+        Unsigned Item Difference in the Sample: mean absolute difference over
+        the focal abilities.
+    classification : str or None
+        Cohen's (1988) benchmark for ``abs(essd)``: ``"negligible"`` below
+        0.2, ``"small"`` below 0.5, ``"medium"`` below 0.8 and ``"large"``
+        otherwise. ``None`` when ``essd`` is ``NaN``. These are generic
+        conventions for a standardized mean difference; Meade (2010)
+        proposes no cut-offs.
+    sidn : float
+        Signed Item Difference in a Normal distribution: the difference
+        weighted by a normal density with the focal abilities' mean (zero
+        without them) and unit variance.
+    uidn : float
+        Unsigned Item Difference in a Normal distribution.
+    essd : float
+        Expected Score Standardized Difference: Cohen's d between the focal
+        and reference expected scores of the focal sample.
+    theta_max_d : float
+        Focal ability at which the absolute difference is largest.
+    max_d : float
+        Signed difference at ``theta_max_d``.
+    mean_es_focal : float
+        Mean focal-model expected score of the focal sample.
+    mean_es_ref : float
+        Mean reference-model expected score of the focal sample.
     """
 
     item_idx: int
@@ -49,7 +77,14 @@ class DIFEffectSize:
     unsigned_es: float
     sids: float
     uids: float
-    classification: str
+    classification: str | None
+    sidn: float = np.nan
+    uidn: float = np.nan
+    essd: float = np.nan
+    theta_max_d: float = np.nan
+    max_d: float = np.nan
+    mean_es_focal: float = np.nan
+    mean_es_ref: float = np.nan
 
 
 @dataclass
@@ -345,18 +380,81 @@ def _validate_integration_grid(
     return ref_idx, theta
 
 
+def _validate_focal_theta(theta_focal: ArrayLike) -> NDArray[np.float64]:
+    """Return focal-group ability estimates as a column of finite values."""
+    try:
+        values = np.asarray(theta_focal, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("theta_focal must contain numeric values") from exc
+    if values.ndim == 2 and values.shape[1] == 1:
+        values = values[:, 0]
+    if values.ndim != 1:
+        raise ValueError("theta_focal must have shape (n_focal,) or (n_focal, 1)")
+    if values.size == 0:
+        raise ValueError("theta_focal must contain at least one value")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("theta_focal must contain only finite values")
+    return values.reshape(-1, 1)
+
+
+def _group_expected_scores(
+    model_ref: BaseItemModel,
+    model_focal: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_idx: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return reference and focal expected item scores at ``theta``."""
+    score_ref, ref_max_score = _expected_item_score(model_ref, theta, item_idx)
+    score_focal, focal_max_score = _expected_item_score(model_focal, theta, item_idx)
+    if ref_max_score != focal_max_score:
+        raise ValueError("reference and focal items must use the same score range")
+    return score_ref, score_focal
+
+
+def _cohen_d(focal: NDArray[np.float64], reference: NDArray[np.float64]) -> float:
+    """Return Cohen's d with the pooled sample standard deviation."""
+    if focal.size < 2:
+        return np.nan
+    pooled = np.sqrt(0.5 * (np.var(focal, ddof=1) + np.var(reference, ddof=1)))
+    if not pooled > 0.0:
+        return np.nan
+    return float((np.mean(focal) - np.mean(reference)) / pooled)
+
+
+def _cohen_benchmark(d: float) -> str | None:
+    """Label ``abs(d)`` by Cohen's (1988) small, medium and large benchmarks."""
+    if not np.isfinite(d):
+        return None
+    size = abs(d)
+    if size < 0.2:
+        return "negligible"
+    if size < 0.5:
+        return "small"
+    return "medium" if size < 0.8 else "large"
+
+
+def _normal_weights(theta: NDArray[np.float64], mean: float) -> NDArray[np.float64]:
+    """Return unit-variance normal weights at ``theta``, normalized to one."""
+    weights = np.exp(-0.5 * (theta - mean) ** 2)
+    return weights / np.sum(weights)
+
+
 def empirical_ES(
     model_ref: BaseItemModel,
     model_focal: BaseItemModel,
     item_idx: int,
-    theta_range: tuple[float, float] = (-4.0, 4.0),
-    n_points: int = 101,
-    focal_weight: float = 0.5,
+    theta_range: tuple[float, float] = (-6.0, 6.0),
+    n_points: int = 61,
+    focal_weight: float | None = None,
+    *,
+    theta_focal: ArrayLike | None = None,
 ) -> DIFEffectSize:
-    """Compute empirical effect size for DIF.
+    """Compute the empirical DIF effect sizes of Meade (2010).
 
-    Computes effect sizes comparing item response functions between
-    reference and focal groups.
+    Compares the expected item scores of the reference and focal item
+    response functions over the focal group's ability distribution, as R
+    mirt's ``empirical_ES``. Both models must be on a common (linked) scale,
+    for example the group models of a multiple-group fit.
 
     Parameters
     ----------
@@ -367,68 +465,100 @@ def empirical_ES(
     item_idx : int
         Index of item to evaluate.
     theta_range : tuple
-        Range for integration. Default (-4, 4).
+        Range of the grid for ``sidn`` and ``uidn``. Default (-6, 6), as R.
     n_points : int
-        Number of integration points. Default 101.
-    focal_weight : float
-        Relative focal-group weight, retained for API compatibility. Because
-        this function integrates over one shared standard-normal density, the
-        result is invariant to this mixture weight. Must be between 0 and 1.
+        Number of grid points for ``sidn`` and ``uidn``. Default 61, as R.
+    focal_weight : float, optional
+        Deprecated and ignored. Passing it emits a ``DeprecationWarning``; it
+        must still lie between 0 and 1.
+    theta_focal : array-like of shape (n_focal,) or (n_focal, 1), optional
+        Ability estimates of the focal group on the common scale, such as
+        ``fscores`` of the focal examinees. The sample statistics average
+        over them, and ``sidn`` and ``uidn`` centre their normal density at
+        their mean. Without them the sample statistics are ``NaN`` and the
+        normal density is standard.
 
     Returns
     -------
     DIFEffectSize
-        Container with effect size statistics.
+        SIDS, UIDS, SIDN, UIDN, ESSD, the largest difference and the mean
+        expected scores of the focal sample.
+
+    References
+    ----------
+    Cohen, J. (1988). *Statistical power analysis for the behavioral
+    sciences* (2nd ed.). Lawrence Erlbaum.
+
+    Meade, A. W. (2010). A taxonomy of effect size measures for the
+    differential functioning of items and scales. *Journal of Applied
+    Psychology*, 95(4), 728-743.
 
     Examples
     --------
     >>> model_ref = fit_mirt(responses_ref, model="2PL").model
     >>> model_focal = fit_mirt(responses_focal, model="2PL").model
-    >>> es = empirical_ES(model_ref, model_focal, item_idx=0)
-    >>> print(f"Signed ES: {es.signed_es:.3f}")
-    >>> print(f"ETS Classification: {es.classification}")
+    >>> theta_focal = fscores(model_focal, responses_focal).theta
+    >>> es = empirical_ES(model_ref, model_focal, item_idx=0, theta_focal=theta_focal)
+    >>> print(f"SIDS: {es.sids:.3f}, ESSD: {es.essd:.3f}")
     """
-    item_idx, theta_2d = _validate_integration_grid(
+    item_idx, theta_grid = _validate_integration_grid(
         model_ref, model_focal, item_idx, theta_range, n_points
     )
-    if not np.isscalar(focal_weight) or not np.isfinite(focal_weight):
-        raise ValueError("focal_weight must be a finite value between 0 and 1")
-    if focal_weight < 0 or focal_weight > 1:
-        raise ValueError("focal_weight must be between 0 and 1")
+    if focal_weight is not None:
+        if not np.isscalar(focal_weight) or not np.isfinite(focal_weight):
+            raise ValueError("focal_weight must be a finite value between 0 and 1")
+        if focal_weight < 0 or focal_weight > 1:
+            raise ValueError("focal_weight must be between 0 and 1")
+        warnings.warn(
+            "focal_weight is deprecated and ignored: empirical_ES weights by "
+            "the focal group's abilities, given by theta_focal",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
-    from scipy import stats
+    sample = None if theta_focal is None else _validate_focal_theta(theta_focal)
+    focal_mean = 0.0 if sample is None else float(np.mean(sample))
+    weights = _normal_weights(theta_grid[:, 0], focal_mean)
+    grid_ref, grid_focal = _group_expected_scores(
+        model_ref, model_focal, theta_grid, item_idx
+    )
+    grid_diff = grid_focal - grid_ref
+    sidn = float(np.sum(weights * grid_diff))
+    uidn = float(np.sum(weights * np.abs(grid_diff)))
+    if sample is None:
+        return DIFEffectSize(
+            item_idx=item_idx,
+            signed_es=sidn,
+            unsigned_es=uidn,
+            sids=np.nan,
+            uids=np.nan,
+            classification=None,
+            sidn=sidn,
+            uidn=uidn,
+        )
 
-    theta = theta_2d[:, 0]
-    weights = stats.norm.pdf(theta)
-    weights = weights / np.sum(weights)
-
-    score_ref, ref_max_score = _expected_item_score(model_ref, theta_2d, item_idx)
-    score_focal, focal_max_score = _expected_item_score(model_focal, theta_2d, item_idx)
-    if ref_max_score != focal_max_score:
-        raise ValueError("reference and focal items must use the same score range")
-
+    score_ref, score_focal = _group_expected_scores(
+        model_ref, model_focal, sample, item_idx
+    )
     diff = score_focal - score_ref
-
-    sids = np.sum(weights * diff)
-    uids = np.sum(weights * np.abs(diff))
-
-    signed_es = sids
-    unsigned_es = uids
-
-    if unsigned_es < 0.05:
-        classification = "A"
-    elif unsigned_es < 0.10:
-        classification = "B"
-    else:
-        classification = "C"
-
+    sids = float(np.mean(diff))
+    uids = float(np.mean(np.abs(diff)))
+    essd = _cohen_d(score_focal, score_ref)
+    largest = int(np.argmax(np.abs(diff)))
     return DIFEffectSize(
         item_idx=item_idx,
-        signed_es=float(signed_es),
-        unsigned_es=float(unsigned_es),
-        sids=float(sids),
-        uids=float(uids),
-        classification=classification,
+        signed_es=sids,
+        unsigned_es=uids,
+        sids=sids,
+        uids=uids,
+        classification=_cohen_benchmark(essd),
+        sidn=sidn,
+        uidn=uidn,
+        essd=essd,
+        theta_max_d=float(sample[largest, 0]),
+        max_d=float(diff[largest]),
+        mean_es_focal=float(np.mean(score_focal)),
+        mean_es_ref=float(np.mean(score_ref)),
     )
 
 
@@ -821,11 +951,13 @@ def RMSD_DIF(
     item_idx: int,
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_points: int = 101,
+    *,
+    theta_focal: ArrayLike | None = None,
 ) -> float:
-    """Compute RMSD-based DIF statistic.
+    """Compute the root mean squared difference between two item curves.
 
-    The Root Mean Square Difference compares item response functions
-    between reference and focal groups.
+    Compares the expected item scores of separately calibrated reference
+    and focal models, which must be on a common (linked) scale.
 
     Parameters
     ----------
@@ -836,14 +968,26 @@ def RMSD_DIF(
     item_idx : int
         Index of item to evaluate.
     theta_range : tuple
-        Range for integration. Default (-4, 4).
+        Range of the evaluation grid. Default (-4, 4).
     n_points : int
-        Number of integration points. Default 101.
+        Number of grid points. Default 101.
+    theta_focal : array-like of shape (n_focal,) or (n_focal, 1), optional
+        Ability estimates of the focal group on the common scale. The squared
+        differences are then averaged over them, so each ability level
+        counts as often as it occurs in the focal sample. By default they are
+        averaged with equal weight over the grid on ``theta_range``.
 
     Returns
     -------
     float
         RMSD value. Larger values indicate more DIF.
+
+    Notes
+    -----
+    This is not R mirt's ``RMSD_DIF``, which compares a pooled model's
+    category curves with the posterior-implied curves of each group's
+    responses, weighted by the group's latent density.
+    :func:`weighted_RMSD_DIF` weights the grid by a normal density.
 
     Examples
     --------
@@ -851,26 +995,16 @@ def RMSD_DIF(
     >>> model_focal = fit_mirt(responses_focal, model="2PL").model
     >>> rmsd = RMSD_DIF(model_ref, model_focal, item_idx=0)
     >>> print(f"RMSD DIF: {rmsd:.4f}")
-
-    Notes
-    -----
-    Guidelines for interpretation (Meade, 2010):
-    - RMSD < 0.05: Negligible DIF
-    - 0.05 <= RMSD < 0.10: Slight DIF
-    - RMSD >= 0.10: Notable DIF
     """
     item_idx, theta = _validate_integration_grid(
         model_ref, model_focal, item_idx, theta_range, n_points
     )
-    score_ref, ref_max_score = _expected_item_score(model_ref, theta, item_idx)
-    score_focal, focal_max_score = _expected_item_score(model_focal, theta, item_idx)
-    if ref_max_score != focal_max_score:
-        raise ValueError("reference and focal items must use the same score range")
-
-    squared_diff = (score_ref - score_focal) ** 2
-    rmsd = np.sqrt(np.mean(squared_diff))
-
-    return float(rmsd)
+    if theta_focal is not None:
+        theta = _validate_focal_theta(theta_focal)
+    score_ref, score_focal = _group_expected_scores(
+        model_ref, model_focal, theta, item_idx
+    )
+    return float(np.sqrt(np.mean((score_ref - score_focal) ** 2)))
 
 
 def weighted_RMSD_DIF(
@@ -879,11 +1013,14 @@ def weighted_RMSD_DIF(
     item_idx: int,
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_points: int = 101,
+    *,
+    theta_focal: ArrayLike | None = None,
 ) -> float:
-    """Compute weighted RMSD-based DIF statistic.
+    """Compute a normal-density weighted RMSD between two item curves.
 
-    Weights the squared differences by the standard normal density,
-    giving more weight to typical ability levels.
+    Weights the squared expected-score differences on the grid by a normal
+    density with unit variance, giving more weight to typical ability
+    levels. The models must be on a common (linked) scale.
 
     Parameters
     ----------
@@ -897,31 +1034,29 @@ def weighted_RMSD_DIF(
         Range for integration. Default (-4, 4).
     n_points : int
         Number of integration points. Default 101.
+    theta_focal : array-like of shape (n_focal,) or (n_focal, 1), optional
+        Ability estimates of the focal group on the common scale. The density
+        is centred at their mean, as for the SIDN of :func:`empirical_ES`.
+        By default it is the standard normal.
 
     Returns
     -------
     float
         Weighted RMSD value.
     """
-    from scipy import stats
-
     item_idx, theta_2d = _validate_integration_grid(
         model_ref, model_focal, item_idx, theta_range, n_points
     )
-
-    theta = theta_2d[:, 0]
-    weights = stats.norm.pdf(theta)
-    weights = weights / np.sum(weights)
-
-    score_ref, ref_max_score = _expected_item_score(model_ref, theta_2d, item_idx)
-    score_focal, focal_max_score = _expected_item_score(model_focal, theta_2d, item_idx)
-    if ref_max_score != focal_max_score:
-        raise ValueError("reference and focal items must use the same score range")
-
-    squared_diff = (score_ref - score_focal) ** 2
-    weighted_rmsd = np.sqrt(np.sum(weights * squared_diff))
-
-    return float(weighted_rmsd)
+    focal_mean = (
+        0.0
+        if theta_focal is None
+        else float(np.mean(_validate_focal_theta(theta_focal)))
+    )
+    weights = _normal_weights(theta_2d[:, 0], focal_mean)
+    score_ref, score_focal = _group_expected_scores(
+        model_ref, model_focal, theta_2d, item_idx
+    )
+    return float(np.sqrt(np.sum(weights * (score_ref - score_focal) ** 2)))
 
 
 @dataclass

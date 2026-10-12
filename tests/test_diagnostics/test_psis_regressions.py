@@ -8,7 +8,7 @@ import pytest
 from numpy.testing import assert_allclose
 
 from mirt.diagnostics.bayesian import (
-    _pareto_smooth_weights,
+    _pareto_smooth_log_weights,
     psis_loo,
     waic,
 )
@@ -64,7 +64,10 @@ def test_pareto_tail_is_smoothed_and_shape_is_recovered() -> None:
     log_ratios = np.log(raw_ratios)
     raw_weights = raw_ratios / np.sum(raw_ratios)
 
-    smoothed_weights, estimated_shape = _pareto_smooth_weights(log_ratios)
+    smoothed_log_weights, estimated_shape = _pareto_smooth_log_weights(
+        log_ratios, relative_eff=1.0
+    )
+    smoothed_weights = np.exp(smoothed_log_weights)
 
     assert np.max(np.abs(smoothed_weights - raw_weights)) > 1e-3
     assert estimated_shape == pytest.approx(target_shape, abs=0.1)

@@ -5,7 +5,7 @@ to different formats.
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -186,20 +186,10 @@ def extract_item(
     >>> print(f"Item 0 discrimination: {item.discrimination}")
     >>> print(f"Item 0 difficulty: {item.difficulty:.2f}")
     """
-    values = mod2values(model)
+    from mirt.models.base import validate_item_index
 
-    if (
-        not isinstance(item_idx, (int, np.integer))
-        or isinstance(item_idx, (bool, np.bool_))
-        or item_idx < 0
-        or item_idx >= values.n_items
-    ):
-        raise MirtValidationError(
-            f"item_idx {item_idx} out of range [0, {values.n_items})",
-            parameter="item_idx",
-            value=item_idx,
-            expected=f"0 <= item_idx < {values.n_items}",
-        )
+    values = mod2values(model)
+    item_idx = validate_item_index(item_idx, values.n_items)
 
     discrimination = values.discrimination[item_idx]
 
@@ -216,11 +206,15 @@ def extract_item(
     if values.slipping is not None:
         slipping = float(values.slipping[item_idx])
 
-    shared: frozenset[str] = getattr(model, "_shared_parameters", frozenset())
+    # Shared and model-level parameters are never per-item, even when their
+    # length happens to equal the number of items.
+    not_per_item: frozenset[str] = getattr(
+        model, "_shared_parameters", frozenset()
+    ) | getattr(model, "_global_parameters", frozenset())
     item_parameters: dict[str, float | NDArray[np.float64]] = {}
     for name, parameter in values.parameters.items():
         if (
-            name not in shared
+            name not in not_per_item
             and parameter.ndim > 0
             and parameter.shape[0] == values.n_items
         ):
@@ -244,24 +238,58 @@ def extract_item(
 
 
 def coef(
-    model: "BaseItemModel",
+    model: Any,
     irt_pars: bool = True,
-) -> dict[str, NDArray[np.float64]]:
+) -> dict[str, Any]:
     """Extract model coefficients in dictionary format.
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel, FitResult or MultigroupFitResult
+        A fitted IRT model, or a fit result whose model is used. For a
+        multigroup result, as R's ``coef`` on a ``multipleGroup`` fit, the
+        result maps each group label to that group's coefficients.
     irt_pars : bool
-        If True, return copies of the model's native parameter arrays.
-        If False, convert compatible logistic models to slope-intercept form.
+        Parameterization of the result, as ``IRTpars`` in R's ``coef``.
         Default True.
+
+        If True, return the traditional IRT parameterization, which is the
+        native form of the logistic families: copies of the model's
+        parameter arrays under their native names, such as
+        ``discrimination`` and ``difficulty`` (1PL-4PL, with ``guessing``
+        and ``upper``), GRM ``thresholds`` ``b_k`` and GPCM/PCM ``steps``.
+        Models stored in slope-intercept form, such as confirmatory
+        multidimensional (``slopes``, ``intercepts``), nominal and bifactor
+        models, are returned in that form without conversion.
+
+        If False, return the slope-intercept form of R's
+        ``coef(IRTpars = FALSE)``: ``slope`` of shape ``(n_items,
+        n_factors)`` and ``intercept``, with ``a`` the item's slope vector
+        and ``sum(a)`` its sum:
+
+        - dichotomous items: ``d = -sum(a) * b``, shape ``(n_items,)``;
+        - GRM: ``d_k = -sum(a) * b_k`` for each threshold;
+        - GPCM and PCM: ``d_k = -sum(a) * (b_1 + ... + b_k)`` for the
+          categories ``k = 1, ..., K - 1`` (R's ``d1, ..., d(K-1)``, with
+          ``d0 = 0``).
+
+        Polytomous intercepts have shape ``(n_items, max_categories - 1)``;
+        cells beyond an item's own categories are zero, as in the native
+        arrays. Other parameters, such as ``guessing`` and ``upper``, are
+        copied unchanged. Models already stored in slope-intercept form are
+        returned unchanged, and mixed-format models are converted per
+        component under their qualified names (``"GRM.slope"``).
 
     Returns
     -------
     dict
         Dictionary with parameter arrays.
+
+    Raises
+    ------
+    MirtModelError
+        If ``irt_pars`` is False and the model family has no slope-intercept
+        form.
 
     Examples
     --------
@@ -269,30 +297,78 @@ def coef(
     >>> params = coef(result.model)
     >>> print(params["discrimination"])
     >>> print(params["difficulty"])
+    >>> slope_intercept = coef(result.model, irt_pars=False)
+    >>> print(slope_intercept["intercept"])
     """
-    parameters = {
+    from mirt.models.mixed_format import _SEPARATOR, MixedItemModel
+    from mirt.multigroup.results import MultigroupFitResult
+    from mirt.results._common import resolve_item_model
+
+    if isinstance(model, MultigroupFitResult):
+        groups = model.model
+        return {
+            label: coef(groups.get_group_model(index), irt_pars=irt_pars)
+            for index, label in enumerate(groups.group_labels)
+        }
+    model = resolve_item_model(model)
+    if isinstance(model, MixedItemModel):
+        if irt_pars:
+            return _parameter_copies(model)
+        return {
+            f"{prefix}{_SEPARATOR}{name}": values
+            for prefix, component in zip(
+                model.component_names, model.component_models, strict=True
+            )
+            for name, values in coef(component, irt_pars=False).items()
+        }
+
+    parameters = _parameter_copies(model)
+    if irt_pars:
+        return parameters
+    return _slope_intercept_coefficients(model, parameters)
+
+
+def _parameter_copies(model: "BaseItemModel") -> dict[str, NDArray[np.float64]]:
+    """Copy every native parameter array as float64."""
+    return {
         name: np.asarray(values, dtype=np.float64).copy()
         for name, values in model.parameters.items()
     }
 
-    if irt_pars:
-        return parameters
 
-    if "discrimination" not in parameters or "difficulty" not in parameters:
+def _slope_intercept_coefficients(
+    model: "BaseItemModel",
+    parameters: dict[str, NDArray[np.float64]],
+) -> dict[str, NDArray[np.float64]]:
+    """Convert discrimination/location parameters to slope-intercept form."""
+    from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
+
+    location_name: str
+    if isinstance(model, GradedResponseModel) and "thresholds" in parameters:
+        location_name = "thresholds"
+    elif isinstance(model, GeneralizedPartialCredit) and "steps" in parameters:
+        location_name = "steps"
+    elif "discrimination" in parameters and "difficulty" in parameters:
+        location_name = "difficulty"
+    elif ("intercepts" in parameters or "intercept" in parameters) and not (
+        {"difficulty", "thresholds", "steps"} & set(parameters)
+    ):
+        # Already slope-intercept, as in R, which converts none of these.
+        return parameters
+    else:
         raise MirtModelError(
-            "Slope-intercept conversion requires discrimination and difficulty parameters",
+            "Slope-intercept conversion requires discrimination and difficulty, "
+            "GRM threshold or GPCM step parameters, or a model stored in "
+            "slope-intercept form",
+            model_type=model.model_name,
+        )
+    if "discrimination" not in parameters:
+        raise MirtModelError(
+            "Slope-intercept conversion requires discrimination parameters",
             model_type=model.model_name,
         )
 
     discrimination = parameters["discrimination"]
-    difficulty = parameters["difficulty"]
-    if difficulty.shape != (model.n_items,):
-        raise MirtModelError(
-            "Slope-intercept conversion requires one difficulty per item",
-            model_type=model.model_name,
-            value=difficulty.shape,
-            expected=f"({model.n_items},)",
-        )
     if discrimination.ndim == 1:
         slopes = discrimination.reshape(-1, 1)
     elif discrimination.ndim == 2:
@@ -310,14 +386,31 @@ def coef(
             value=slopes.shape,
             expected=f"({model.n_items}, n_factors)",
         )
+    slope_sums = slopes.sum(axis=1)
 
-    result = {
-        "slope": slopes.copy(),
-        "intercept": -slopes.sum(axis=1) * difficulty,
-    }
+    locations = parameters[location_name]
+    if location_name == "difficulty":
+        if locations.shape != (model.n_items,):
+            raise MirtModelError(
+                "Slope-intercept conversion requires one difficulty per item",
+                model_type=model.model_name,
+                value=locations.shape,
+                expected=f"({model.n_items},)",
+            )
+        intercepts = -slope_sums * locations
+    else:
+        n_steps = np.asarray(model.n_categories, dtype=np.intp) - 1
+        active = np.arange(locations.shape[1])[None, :] < n_steps[:, None]
+        active_locations = np.where(active, locations, 0.0)
+        if location_name == "steps":
+            # Category k accumulates the first k steps (R's gpcm d_k).
+            active_locations = np.cumsum(active_locations, axis=1)
+        intercepts = np.where(active, -slope_sums[:, None] * active_locations, 0.0)
+
+    result = {"slope": slopes.copy(), "intercept": intercepts}
     for name, values in parameters.items():
-        if name not in {"discrimination", "difficulty"}:
-            result[name] = values.copy()
+        if name not in {"discrimination", location_name}:
+            result[name] = values
     return result
 
 
@@ -449,8 +542,11 @@ def estfun(
     -------
     NDArray[np.float64]
         Estimating functions (scores) for each person-parameter combination.
-        Shape: (n_persons, n_parameters). Columns follow ``model.parameters``
-        insertion order and include each array's free entries in row-major order.
+        Shape: (n_persons, n_free), with one column per free coordinate of
+        ``model.free_parameter_masks``; ``model.n_parameters`` is smaller for
+        an exploratory multidimensional model. Columns follow
+        ``model.parameters`` insertion order and include each array's free
+        entries in row-major order.
 
     Examples
     --------
@@ -619,13 +715,15 @@ def _numerical_estfun(
 ) -> NDArray[np.float64]:
     """Compute conditional scores for arbitrary models with central differences."""
     n_persons = responses.shape[0]
-    n_parameters = model.n_parameters
-    scores = np.empty((n_persons, n_parameters), dtype=np.float64)
+    free_masks = model.free_parameter_masks
+    # One column per free coordinate. ``n_parameters`` can be smaller, as it
+    # leaves out an exploratory model's rotational indeterminacy.
+    n_coordinates = sum(int(np.count_nonzero(mask)) for mask in free_masks.values())
+    scores = np.empty((n_persons, n_coordinates), dtype=np.float64)
     work_model = model.copy()
     for name, values in parameters.items():
         work_model._parameters[name] = model._canonical_parameter_values(name, values)
 
-    free_masks = model.free_parameter_masks
     relative_step = np.cbrt(np.finfo(np.float64).eps)
 
     column = 0

@@ -25,7 +25,8 @@ def test_statistic_comes_from_refits_under_replicate_settings(nested_fits):
     result = bootstrap_lr(reduced, full, responses, n_bootstrap=3, seed=1)
 
     assert isinstance(result, BootstrapLRResult)
-    assert result.df == full.model.n_parameters - reduced.model.n_parameters == 5
+    # The 1PL estimates one common slope, so it has n_items + 1 parameters.
+    assert result.df == full.model.n_parameters - reduced.model.n_parameters == 4
     assert result.statistic == pytest.approx(
         max(0.0, 2 * (result.full_log_likelihood - result.reduced_log_likelihood))
     )

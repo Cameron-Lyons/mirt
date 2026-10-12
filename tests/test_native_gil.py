@@ -59,7 +59,7 @@ def _spinner_rate_ratio(call: Callable[[], object]) -> float:
         sys.setswitchinterval(previous_interval)
 
 
-@pytest.mark.parametrize("kernel", ["gibbs", "mhrm", "bootstrap", "fixed_calib"])
+@pytest.mark.parametrize("kernel", ["mhrm", "bootstrap"])
 def test_native_estimation_kernels_release_the_gil(kernel: str) -> None:
     from mirt import mirt_rs
 
@@ -68,21 +68,11 @@ def test_native_estimation_kernels_release_the_gil(kernel: str) -> None:
     weights = np.exp(-0.5 * grid**2)
     weights /= weights.sum()
     calls = {
-        "gibbs": lambda: mirt_rs.gibbs_sample_2pl(responses, 200, 20, 1, 3),
-        "mhrm": lambda: mirt_rs.mhrm_fit_2pl(responses, 400, 40, 0.5, 3),
-        "bootstrap": lambda: mirt_rs.bootstrap_fit_2pl(
-            responses, 16, 21, 60, 1e-6, 3, None, None
+        "mhrm": lambda: mirt_rs.mhrm_fit_2pl(
+            responses, 400, 40, 0.5, 3, (0.1, 20.0), (-30.0, 30.0)
         ),
-        "fixed_calib": lambda: mirt_rs.fixed_calib_em(
-            responses,
-            list(range(6)),
-            list(range(6, 12)),
-            np.ones(6),
-            np.linspace(-1.5, 1.5, 12)[:6],
-            grid,
-            weights,
-            100,
-            1e-300,
+        "bootstrap": lambda: mirt_rs.bootstrap_fit_2pl(
+            responses, 16, grid, weights, 60, 1e-6, 3, (0.1, 20.0), (-30.0, 30.0)
         ),
     }
 
@@ -116,6 +106,29 @@ def test_multigroup_e_step_releases_the_gil() -> None:
             [categories, categories],
             np.zeros(2),
             np.ones(2),
+        )
+
+    assert _spinner_rate_ratio(call) > 0.1
+
+
+@pytest.mark.parametrize("kernel", ["batch", "mse"])
+def test_native_cat_kernels_release_the_gil(kernel: str) -> None:
+    from mirt import mirt_rs
+
+    rng = np.random.default_rng(5)
+    discrimination = rng.uniform(0.8, 2.0, 300)
+    difficulty = rng.normal(0.0, 1.0, 300)
+    grid = np.linspace(-4.0, 4.0, 61)
+    weights = np.exp(-0.5 * grid**2)
+    weights /= weights.sum()
+    thetas = np.linspace(-2.0, 2.0, 11)
+    function = (
+        mirt_rs.cat_simulate_batch if kernel == "batch" else mirt_rs.cat_conditional_mse
+    )
+
+    def call() -> object:
+        return function(
+            thetas, discrimination, difficulty, grid, weights, 0.2, 60, 5, 600, 3
         )
 
     assert _spinner_rate_ratio(call) > 0.1

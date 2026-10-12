@@ -41,11 +41,11 @@ def test_shared_mastery_has_covariance_after_conditioning_on_higher_order_trait(
         np.where(patterns == 1, expected_scores, 1 - expected_scores), axis=1
     )
     assert_allclose(marginal_product, [0.36, 0.24, 0.24, 0.16])
-    # The model's existing likelihood evaluates a product approximation. Exact
-    # limited-information and score-distribution diagnostics cannot inherit it
-    # as the shared-attribute model's true conditional response distribution.
+    # The model's likelihood sums over the shared state. Diagnostics built from
+    # products of the marginal curves would instead use the product
+    # approximation, which is not the true conditional response distribution.
     assert_allclose(
-        np.exp(model.log_likelihood(patterns, np.zeros((4, 1)))), marginal_product
+        np.exp(model.log_likelihood(patterns, np.zeros((4, 1)))), shared_mass
     )
     assert not np.allclose(shared_mass, marginal_product)
 

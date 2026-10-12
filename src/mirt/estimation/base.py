@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import numpy as np
@@ -27,6 +28,49 @@ _ITEM_PARAMETER_BOUNDS: dict[str, tuple[float, float]] = {
     "upper": (0.5, 1.0),
     "asymmetry": (0.1, 5.0),
 }
+# Boxes of the logistic families (1PL-4PL and slope-intercept MIRT items),
+# whose slopes and intercepts R mirt leaves unbounded. Slopes reach 20 and
+# locations ``|b| = 30``, which covers intercepts ``|a b|`` up to 30 for
+# slopes of one. Multidimensional slopes may be negative, as unrotated
+# exploratory loadings are; their M-steps work on the intercept scale, so a
+# loading can change sign. Unidimensional slopes keep the positive lower
+# bound that linking, DIF and the other consumers of fitted models assume;
+# a reverse-keyed item ends on it and needs recoding.
+_LOGISTIC_SLOPE_LIMIT = 20.0
+_LOGISTIC_LOCATION_LIMIT = 30.0
+
+
+def _logistic_bounds(model: BaseItemModel, name: str) -> tuple[float, float] | None:
+    """Return the box of a logistic-family parameter, or None for others."""
+    from mirt.models.dichotomous import (
+        FourParameterLogistic,
+        OneParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+    )
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    slope, location = _LOGISTIC_SLOPE_LIMIT, _LOGISTIC_LOCATION_LIMIT
+    low = _ITEM_PARAMETER_BOUNDS["discrimination"][0]
+    if isinstance(model, MultidimensionalModel):
+        if name == "slopes":
+            return (-slope, slope) if model.n_factors > 1 else (low, slope)
+        if name == "intercepts":
+            return (-location, location)
+        return None
+    if not isinstance(
+        model, (TwoParameterLogistic, ThreeParameterLogistic, FourParameterLogistic)
+    ):
+        return None
+    if name == "difficulty":
+        return (-location, location)
+    if name != "discrimination":
+        return None
+    if isinstance(model, OneParameterLogistic):
+        return (low, slope)
+    if isinstance(model, TwoParameterLogistic):
+        return (-slope, slope) if model.n_factors > 1 else (low, slope)
+    return _ITEM_PARAMETER_BOUNDS["discrimination"]
 
 
 def _parameter_bounds(model: BaseItemModel, name: str) -> tuple[float, float]:
@@ -35,7 +79,17 @@ def _parameter_bounds(model: BaseItemModel, name: str) -> tuple[float, float]:
     Parameters
     ----------
     model : BaseItemModel
-        Model owning the parameter. Nominal-response slopes may be negative.
+        Model owning the parameter. Nominal-response slopes may be negative,
+        as may the slopes of 2PL and slope-intercept MIRT items with several
+        factors, which have boxes of ``(-20, 20)``; one-factor 1PL, 2PL and
+        MIRT slopes have ``(0.1, 20)``. Logistic locations and MIRT
+        intercepts have ``(-30, 30)``. A
+        :class:`~mirt.models.custom.CustomItemModel` uses the ``par_bounds``
+        of its item type. Families whose parameters have their own valid
+        ranges declare them in a ``_parameter_boxes`` class mapping, such as
+        the peak heights of ideal-point items in ``(0, 1]``, the asymptotes
+        and scales of monotone spline and polynomial items, and testlet
+        variances.
     name : str
         Stored parameter name.
 
@@ -45,16 +99,80 @@ def _parameter_bounds(model: BaseItemModel, name: str) -> tuple[float, float]:
         Lower and upper bound shared by every free coordinate of ``name``.
         Qualified parameters of a mixed-format model use their component's.
     """
+    from mirt.models.custom import CustomItemModel
     from mirt.models.mixed_format import MixedItemModel
 
     if isinstance(model, MixedItemModel):
         component, local = model.parameter_component(name)
         return _parameter_bounds(model.component_models[component], local)
+    if isinstance(model, CustomItemModel):
+        # Unbounded coordinates are (-inf, inf), which L-BFGS-B accepts.
+        low, high = model.item_type.par_bounds.get(name, (-np.inf, np.inf))
+        return (float(low), float(high))
+    # The generic boxes below would let optimizers propose values that a
+    # family's setters reject, such as a negative lower asymptote.
+    declared = getattr(type(model), "_parameter_boxes", None) or {}
+    if name in declared:
+        low, high = declared[name]
+        return (float(low), float(high))
     if name == "slopes" and model.model_name == "NRM":
         return (-5.0, 5.0)
+    logistic = _logistic_bounds(model, name)
+    if logistic is not None:
+        return logistic
     if "discrimination" in name or "slope" in name:
         return _ITEM_PARAMETER_BOUNDS["discrimination"]
     return _ITEM_PARAMETER_BOUNDS.get(name, (-6.0, 6.0))
+
+
+def _family_tied_parameters(model: BaseItemModel) -> tuple[str, ...]:
+    """Return the free per-item parameters a family keeps equal across items.
+
+    A family lists them in ``_tied_parameters``; the common discrimination of
+    a 1PL or PCM with ``estimate_discrimination=True`` is one. Parameters
+    whose every coordinate is fixed are left out.
+    """
+    names = getattr(model, "_tied_parameters", ())
+    if not names:
+        return ()
+    masks = model.free_parameter_masks
+    return tuple(name for name in names if np.any(masks[name]))
+
+
+def _family_redundancy(model: BaseItemModel) -> int:
+    """Return the stored free coordinates that duplicate a family-tied value."""
+    masks = model.free_parameter_masks
+    return sum(
+        int(np.count_nonzero(masks[name])) - 1
+        for name in _family_tied_parameters(model)
+    )
+
+
+def _with_family_ties(constraints: Any, model: BaseItemModel) -> tuple[Any, ...]:
+    """Add the family's own equality groups to validated user constraints.
+
+    Each parameter of :func:`_family_tied_parameters` becomes one group over
+    every item. User groups on such a parameter are implied by it and
+    dropped.
+
+    Returns
+    -------
+    tuple of EqualityGroup
+        The groups, empty when there are none.
+    """
+    from mirt.estimation._shared_step import (
+        EqualityGroup,
+        validate_equality_constraints,
+    )
+
+    groups = validate_equality_constraints(constraints)
+    tied = _family_tied_parameters(model)
+    if not tied:
+        return groups
+    return (
+        *(group for group in groups if group.parameter not in tied),
+        *(EqualityGroup(name) for name in tied),
+    )
 
 
 def _stagger_factor_slopes(
@@ -263,6 +381,102 @@ def _free_shared_parameters(model: BaseItemModel) -> tuple[str, ...]:
     )
 
 
+def _free_global_parameters(model: BaseItemModel) -> tuple[str, ...]:
+    """Return the model-level parameters, owned by no item, with a free coordinate.
+
+    Those the family also lists in ``_shared_parameters``, such as testlet
+    variances, are left out: EM's shared-parameter step estimates them, and
+    estimators without one refuse them as shared parameters.
+    """
+    names = frozenset(getattr(model, "_global_parameters", frozenset())) - frozenset(
+        getattr(model, "_shared_parameters", frozenset())
+    )
+    if not names:
+        return ()
+    masks = model.free_parameter_masks
+    return tuple(
+        name for name in model._parameters if name in names and np.any(masks[name])
+    )
+
+
+def _validate_convergence_controls(max_iter: Any, tol: Any) -> tuple[int, float]:
+    """Return ``max_iter`` as an ``int`` of at least 1 and ``tol`` as a float.
+
+    Raises
+    ------
+    MirtValidationError
+        If ``max_iter`` is not a positive integer, or ``tol`` is not a
+        finite positive number.
+    """
+    if (
+        isinstance(max_iter, (bool, np.bool_))
+        or not isinstance(max_iter, Integral)
+        or max_iter < 1
+    ):
+        raise MirtValidationError(
+            "max_iter must be an integer of at least 1",
+            parameter="max_iter",
+            value=max_iter,
+            expected="integer >= 1",
+        )
+    if (
+        isinstance(tol, (bool, np.bool_))
+        or not isinstance(tol, Real)
+        or not np.isfinite(float(tol))
+        or tol <= 0
+    ):
+        raise MirtValidationError(
+            "tol must be a finite positive number",
+            parameter="tol",
+            value=tol,
+            expected="finite number > 0",
+        )
+    return int(max_iter), float(tol)
+
+
+def _validate_response_categories(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+) -> None:
+    """Reject observed response codes outside the model's categories.
+
+    ``responses`` are validated codes with missing entries negative. The
+    likelihood of a dichotomous family scores a code ``y`` as
+    ``y log p + (1 - y) log(1 - p)``, which for ``y = 2`` is unbounded in
+    the slope, and the native kernels read such codes differently, so every
+    estimator rejects them as :func:`~mirt.fit_mirt` does. Models that are
+    neither dichotomous nor polytomous item families, such as custom item
+    models, define their own codes and are not checked.
+
+    Raises
+    ------
+    MirtDataError
+        If a :class:`~mirt.models.base.DichotomousItemModel` receives a code
+        other than 0 or 1, or a polytomous model a code at or above an
+        item's category count.
+    """
+    from mirt.exceptions import MirtDataError
+    from mirt.models.base import DichotomousItemModel
+
+    if model.is_polytomous:
+        counts = np.asarray(model.n_categories)
+        invalid = counts.shape == (responses.shape[1],) and bool(
+            np.any(responses >= counts)
+        )
+        message = "polytomous response codes must be below n_categories for each item"
+    else:
+        invalid = isinstance(model, DichotomousItemModel) and bool(
+            np.any(responses > 1)
+        )
+        message = "dichotomous responses must be coded as 0 or 1"
+    if invalid:
+        raise MirtDataError(
+            message,
+            n_persons=responses.shape[0],
+            n_items=responses.shape[1],
+        )
+
+
 def _reject_parameter_restrictions(model: BaseItemModel, estimator: str) -> None:
     """Raise when user masks fix parameters that ``estimator`` would move."""
     if getattr(model, "_free_parameter_restrictions", None):
@@ -280,6 +494,10 @@ class BaseEstimator(ABC):
     # rating-scale thresholds. Itemwise estimators without that step refuse
     # models whose shared parameters are free rather than leave them unchanged.
     _estimates_shared_parameters: bool = False
+    # Whether the estimator also updates model-level parameters that no item
+    # owns, such as mixing proportions. Itemwise estimators refuse models
+    # whose model-level parameters are free.
+    _estimates_global_parameters: bool = False
     # Whether the estimator honors coordinates fixed by set_free_parameter_masks.
     _holds_fixed_parameters: bool = True
 
@@ -289,23 +507,7 @@ class BaseEstimator(ABC):
         tol: float = 1e-4,
         verbose: bool = False,
     ) -> None:
-        if max_iter < 1:
-            raise MirtValidationError(
-                "max_iter must be at least 1",
-                parameter="max_iter",
-                value=max_iter,
-                expected=">= 1",
-            )
-        if tol <= 0:
-            raise MirtValidationError(
-                "tol must be positive",
-                parameter="tol",
-                value=tol,
-                expected="> 0",
-            )
-
-        self.max_iter = max_iter
-        self.tol = tol
+        self.max_iter, self.tol = _validate_convergence_controls(max_iter, tol)
         self.verbose = verbose
         self._convergence_history: list[float] = []
 
@@ -332,8 +534,17 @@ class BaseEstimator(ABC):
         self,
         responses: NDArray[np.int_],
         n_items: int,
+        model: BaseItemModel | None = None,
     ) -> NDArray[np.int_]:
-        return validate_responses(responses, n_items=n_items)
+        """Return validated integer responses, missing coded as -1.
+
+        With ``model``, observed codes must also be categories of the
+        model's items (see :func:`_validate_response_categories`).
+        """
+        validated = validate_responses(responses, n_items=n_items)
+        if model is not None:
+            _validate_response_categories(model, validated)
+        return validated
 
     def _log_iteration(
         self,
@@ -366,24 +577,82 @@ class BaseEstimator(ABC):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(max_iter={self.max_iter}, tol={self.tol})"
 
+    def _reject_unsupported_models(self, model: BaseItemModel) -> None:
+        """Refuse models whose likelihood or parameters the generic steps miss.
+
+        A family whose ``dedicated_estimator`` names its own fitting routine,
+        such as :class:`~mirt.models.mixture.MixtureIRT`, is not a product
+        of item curves given the latent trait. Free model-level parameters
+        (``_global_parameters``) would stay at their starting values in the
+        item M-steps unless the estimator declares that it updates them.
+
+        Raises
+        ------
+        MirtModelError
+            If ``model`` names a dedicated estimator, or has free model-level
+            parameters that this estimator does not update.
+        """
+        dedicated = getattr(model, "dedicated_estimator", None)
+        if dedicated:
+            raise MirtModelError(
+                f"{type(self).__name__} cannot fit {model.model_name}, whose "
+                "likelihood the generic item M-steps do not represent; fit it "
+                f"with {dedicated}",
+                model_type=model.model_name,
+            )
+        if self._estimates_global_parameters:
+            return
+        free = _free_global_parameters(model)
+        if free:
+            advice = "fit the model with its own estimator"
+            if self._holds_fixed_parameters:
+                advice += ", or hold them fixed with set_free_parameter_masks"
+            raise MirtModelError(
+                f"{type(self).__name__} cannot estimate {', '.join(free)}, "
+                f"which {model.model_name} keeps outside its items; its item "
+                f"M-steps would leave them at their starting values; {advice}",
+                model_type=model.model_name,
+            )
+
     def _check_shared_parameters(self, model: BaseItemModel) -> None:
         """Refuse free shared parameters that this estimator cannot update.
 
         Raises
         ------
         MirtModelError
-            If ``model`` is a mixed-format model, or has free parameters
-            shared by all items and the estimator's M-step updates item
-            parameters only.
+            If ``model`` is rejected by :meth:`_reject_unsupported_models`, is
+            a mixed-format model, has free parameters shared by all items and
+            the estimator's M-step updates item parameters only, or has a
+            free family-tied parameter, such as the common discrimination of
+            a 1PL with ``estimate_discrimination=True``, that the estimator
+            does not tie.
         """
         from mirt.models.mixed_format import MixedItemModel
 
+        self._reject_unsupported_models(model)
         if isinstance(model, MixedItemModel):
             # Its parameters are not item-indexed, so itemwise optimization
             # would silently leave them unchanged.
             raise MirtModelError(
                 f"{type(self).__name__} cannot optimize a MixedItemModel; fit "
                 "it with MixedFormatEMEstimator or fit_mirt(model=[...])",
+                model_type=model.model_name,
+            )
+        tied = _family_tied_parameters(model)
+        resolved = getattr(self, "_tied", None)
+        if tied and (
+            resolved is None or any(resolved.group_of(name, 0) is None for name in tied)
+        ):
+            # Itemwise steps would give every item its own value.
+            advice = (
+                "or hold it fixed with set_free_parameter_masks"
+                if self._holds_fixed_parameters
+                else "or build the model with estimate_discrimination=False"
+            )
+            raise MirtModelError(
+                f"{type(self).__name__} cannot estimate {', '.join(tied)}, "
+                f"which {model.model_name} keeps equal across items; use "
+                f"EMEstimator, {advice}",
                 model_type=model.model_name,
             )
         if self._estimates_shared_parameters:

@@ -733,3 +733,47 @@ def test_score_summary_handles_multiple_factors_and_empty_results() -> None:
 
     empty = ScoreResult(np.empty(0), np.empty(0), "EAP")
     assert "Persons: 0" in empty.summary()
+
+
+def test_score_json_is_standard_and_restores_non_finite_values() -> None:
+    original = ScoreResult(
+        theta=np.array([6.0, -np.inf, np.nan, 0.25]),
+        standard_error=np.array([np.inf, np.nan, np.inf, 0.4]),
+        method="ML",
+    )
+
+    def reject(token: str) -> None:
+        raise AssertionError(f"non-standard JSON token {token}")
+
+    text = original.to_json()
+    payload = json.loads(text, parse_constant=reject)
+    restored = ScoreResult.from_json(text)
+
+    assert payload["theta"] == [6.0, "-Inf", "NaN", 0.25]
+    assert payload["standard_error"] == ["Inf", "NaN", "Inf", 0.4]
+    np.testing.assert_array_equal(restored.theta, original.theta)
+    np.testing.assert_array_equal(restored.standard_error, original.standard_error)
+    # to_dict keeps Python floats; null is read as NaN.
+    assert np.isposinf(original.to_dict()["standard_error"][0])
+    payload["theta"][2] = None
+    assert np.isnan(ScoreResult.from_dict(payload).theta[2])
+
+
+def test_score_json_rejects_unknown_string_values() -> None:
+    payload = ScoreResult(np.zeros(2), np.ones(2), "EAP").to_dict()
+    payload["theta"] = [0.0, "Infinity"]
+
+    with pytest.raises(MirtValidationError, match="non-finite number token"):
+        ScoreResult.from_dict(payload)
+
+
+def test_empty_multifactor_scores_round_trip() -> None:
+    empty = ScoreResult(np.empty((0, 2)), np.empty((0, 2)), "EAP")
+
+    for restored in (
+        ScoreResult.from_json(empty.to_json()),
+        ScoreResult.from_dict(empty.to_dict()),
+    ):
+        assert restored.theta.shape == (0, 2)
+        assert restored.standard_error.shape == (0, 2)
+        assert restored.n_factors == 2

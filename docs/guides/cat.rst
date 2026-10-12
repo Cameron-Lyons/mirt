@@ -15,7 +15,7 @@ Quick start
    fit = mirt.fit_mirt(data, model="2PL")
 
    engine = CATEngine(
-       fit.model,
+       fit,
        item_selection="MFI",
        stopping_rule="SE",
        se_threshold=0.3,
@@ -23,6 +23,15 @@ Quick start
    )
    result = engine.run_simulation(true_theta=0.5)
    print(result.theta, result.standard_error, result.n_items_administered)
+
+Pass the ``FitResult`` or its item model. A ``FitResult`` also supplies the
+estimated latent population as the scoring prior (see `Ability updates`_).
+``CATEngine`` needs a unidimensional model; use ``MCATEngine`` for
+multidimensional ones. Engines validate their settings when they are
+constructed: an unknown scoring method, an ``n_quadpts`` below 5 for EAP
+scoring, invalid ``theta_bounds``, a negative ``min_items``, or a
+``min_items`` above ``max_items`` (or above a maximum-length stopping rule)
+raises ``ValueError``.
 
 Interactive responses
 ---------------------
@@ -56,9 +65,14 @@ replications:
 
 The native parallel path is selected automatically for unidimensional 1PL/2PL
 models using EAP scoring, MFI selection, SE stopping with an optional maximum
-length, and no content or exposure constraints. Native results include the exact
+length, no content or exposure constraints, and a start at ``initial_theta=0``.
+Native results include the exact
 administered item and response sequences, making them fully compatible with
-``CATResult`` serialization and downstream audits.
+``CATResult`` serialization and downstream audits. Each native call takes its
+seed from the engine's generator and gives every session its own random
+stream, so a seeded engine is reproducible, engines with neighbouring seeds do
+not replay each other's sessions, and successive calls continue the engine's
+stream as the Python paths do.
 
 Otherwise, unmodified engines with MFI selection, EAP scoring, SE and/or
 maximum-length stopping, no content or exposure constraints, and a built-in
@@ -116,12 +130,34 @@ without histories, and ``to_dict()`` exports JSON-compatible values.
 Ability updates
 ---------------
 
+``scoring_method`` is ``"EAP"`` (the default), ``"MAP"``, ``"ML"``, or
+``"WLE"`` for ``CATEngine`` and ``"EAP"`` or ``"MAP"`` for ``MCATEngine``;
+names ignore case. EAP and MAP use a normal scoring prior in every update.
+``CATEngine`` takes ``prior_mean`` and ``prior_sd`` and ``MCATEngine`` takes
+``prior_mean`` and ``prior_cov``. They default to the ``latent_mean`` and
+``latent_covariance`` of a ``FitResult`` passed as the model, as in
+:func:`~mirt.fscores`, and otherwise to the standard normal. ``MCATEngine``'s
+``initial_covariance`` is the covariance before any response, so it is also
+the default ``prior_cov``; correlated traits are therefore scored with their
+correlation from the first response on. ``initial_theta`` defaults to the
+prior mean and only selects the first item.
+
+ML has no finite estimate while every response is in the lowest category, or
+every response in the highest. As in :func:`~mirt.fscores`, the estimate is
+then the corresponding ``theta_bounds`` limit with an infinite standard error,
+so SE-based stopping waits for a mixed response pattern.
+
 For independent built-in binary models, EAP updates reuse the Gauss-Hermite grid
 and evaluate only administered item curves in bounded blocks. The posterior is
 recomputed against current item parameters after every response, so parameter
 changes and resets do not reuse old likelihood evidence. Customized model
 probability or likelihood hooks retain the general scoring path. MCAT continues
 to retain the full posterior covariance.
+
+An update that fails numerically, for example because the posterior has no
+finite mass, emits a ``RuntimeWarning``. ``CATEngine`` then reports a logit of
+the proportion of the maximum score and ``MCATEngine`` keeps its previous
+estimate. Other errors propagate.
 
 Portable results
 ----------------
@@ -143,6 +179,9 @@ information histories:
 
 The reconstruction methods validate required and unknown fields, administered
 item and response counts, history lengths, and multidimensional array shapes.
+Engine results record whether the items are ``polytomous``; ``summary()``
+counts correct answers for dichotomous items and reports the mean response and
+category counts for polytomous ones.
 Result objects also copy caller-owned arrays when they are created, so later
 changes to the original arrays do not alter the stored administration.
 
@@ -153,16 +192,45 @@ Common strategies (pass a string or strategy object):
 
 * ``"MFI"`` — maximum Fisher information
 * ``"MEI"`` — maximum expected information under the bounded posterior
-* ``"KL"`` — Kullback–Leibler
-* ``"random"`` / ``"a_stratified"`` / ``"urry"``
+* ``"MPWI"`` / ``"MLWI"`` — maximum posterior- or likelihood-weighted
+  information, Fisher information averaged over the posterior (or the
+  likelihood) of the responses so far
+* ``"KL"`` — Kullback–Leibler over an interval around the estimate
+* ``"KLP"`` — posterior-weighted Kullback–Leibler
+* ``"MEPV"`` — minimum expected posterior variance
+* ``"Urry"`` — the item whose location is closest to the estimate
+* ``"random"`` / ``"a-stratified"``
 
-Names ignore case and surrounding whitespace, and ``_`` may replace ``-``.
+MEI, MPWI, MLWI, KLP, and MEPV integrate over the posterior on the engine's
+``n_quadpts`` Gauss-Legendre nodes within ``theta_bounds``, with a standard
+normal prior (a flat one for MLWI). ``KullbackLeibler`` with its default
+``delta=0.1`` is close to a rescaled Fisher information and selects the MFI
+items; ``KullbackLeibler(delta=3.0, delta_scaling="sqrt_n")`` shrinks a wide
+interval as ``delta / sqrt(n)`` after ``n`` items, as Chang and Ying (1996)
+propose.
+
+Every CAT and MCAT factory, and every string option of the engines, resolves
+names the same way: case and surrounding whitespace are ignored, and ``-`` and
+``_`` are interchangeable. ``"a_stratified"``, ``"se"``, ``"Max-Items"``,
+``"sympson_hetter"``, and ``"Trace"`` therefore all work.
+
+Urry's rule and a-stratified ``within="b-matching"`` ranking use each item's
+location: the difficulty of a dichotomous item, the location of an unfolding
+item (GGUM, ideal point), the mean threshold of a graded item, or the mean step
+of a (generalized) partial credit item, over the item's own categories. Models
+without item locations, such as nominal response models, raise ``ValueError``.
+
+MFI selection, exposure control, the information-based stopping rules, and form
+assembly evaluate polytomous items with the models' all-item information
+kernels.
 
 a-stratified selection (:class:`~mirt.cat.selection.AStratified`) spends an
 equal share of the test in each discrimination stratum, from the least to the
-most discriminating. The engine schedules the strata over ``max_items`` (or the
-pool size) unless the strategy sets its own ``test_length``. Items are ranked
-within the current stratum by Fisher information, or by difficulty matching with
+most discriminating. The engine schedules the strata over the test length its
+stopping rules enforce (``max_items``, a ``MaxItemsStop`` in ``stopping_rule``,
+or else the pool size; a ``CombinedStop`` whose own ``min_items`` is larger
+raises it to that minimum) unless the strategy sets its own ``test_length``. Items are ranked within the current
+stratum by Fisher information, or by difficulty matching with
 ``within="b-matching"``.
 
 MEI uses the complete response history to evaluate the posterior ability after
@@ -203,10 +271,15 @@ a cost budget exactly, which greedy content balancing cannot guarantee:
    )
    engine = CATEngine(fit.model, item_selection=selection, max_items=20, min_items=20)
 
-The shadow test spans the engine's ``max_items`` (or the pool size) unless
+The shadow test spans the length the engine's stopping rules enforce
+(``max_items`` or a ``MaxItemsStop`` rule, otherwise the pool size) unless
 ``test_length`` is given, and the engine must stop by that length. Tests that
 stop earlier still respect maxima, enemy pairs, and the budget. Without
-constraints, selection equals MFI. Randomesque exposure control draws among the
+constraints, selection equals MFI. When only a content blueprint constrains the
+shadow test (or nothing does), the optimum is separable and is built exactly by
+a greedy allocation: each area's most informative items up to its minimum, then
+the most informative remaining items within the maxima. Only enemy pairs,
+bundles, and cost budgets need the mixed-integer solver. Randomesque exposure control draws among the
 shadow test's free items. Items that Sympson-Hetter control makes ineligible are
 left out of the shadow test unless that leaves it infeasible; the exclusions are
 then relaxed, so constraints take precedence over exposure control. Progressive
@@ -220,8 +293,12 @@ simulation runs their sessions independently. ``solver_options`` such as
 Stopping rules
 --------------
 
+``CATEngine(stopping_rule=...)`` accepts the names ``"SE"``, ``"max_items"``,
+``"theta_change"``, and ``"se_change"``, or any rule object:
+
 * ``"SE"`` — stop when standard error falls below ``se_threshold``
-* ``"max_items"`` / ``MaxItemsStop`` — fixed test length
+* ``"max_items"`` / ``MaxItemsStop`` — fixed test length; the name uses the
+  engine's ``max_items``, which it requires
 * ``"theta_change"`` / ``ThetaChangeStop`` — the estimate changes by at most a
   threshold for ``n_stable`` consecutive items
 * ``"se_change"`` / ``SEChangeStop`` — the standard error changes by at most a
@@ -232,6 +309,9 @@ Stopping rules
 * ``PredictedSEReductionStop(model, min_reduction)`` — the most informative
   remaining item would reduce the SE by less than ``min_reduction``, using the
   predicted SE ``1 / sqrt(SE**-2 + I(theta))`` (Choi, Grady, & Dodd, 2011)
+* ``ClassificationStop(cut_score, confidence)`` — mastery classification once
+  the estimate is on one side of the cut score with one-sided ``confidence``,
+  strictly between 0.5 and 1; it has no name because it needs a cut score
 * Combined rules via ``max_items`` plus an SE rule on ``CATEngine``, or
   ``CombinedStop`` for any combination
 
@@ -255,9 +335,12 @@ of exposure or content control.
 
 CAT and MCAT rules share validation and composition. Thresholds must be finite
 and positive and counts must be integers, so a NaN threshold that could never
-stop a test is rejected. ``CombinedStop`` and ``CombinedMCATStop`` with
-``operator="or"`` stop at the first rule that stops without evaluating later
-rules, and with ``"and"`` evaluate every rule so stateful rules see each state.
+stop a test is rejected. Classification confidence must lie strictly between
+0.5 and 1 for both ``ClassificationStop`` and ``CompositeClassificationStop``;
+at or below 0.5 any first item would end the test. ``CombinedStop`` and
+``CombinedMCATStop`` with ``operator="or"`` stop at the first rule that stops
+without evaluating later rules, and with ``"and"`` evaluate every rule so
+stateful rules see each state.
 ``get_reason()`` reports the rule that stopped the most recent state.
 
 For multidimensional classification, project the ability vector and its full
@@ -309,12 +392,47 @@ controllers (Sympson–Hetter, randomesque, progressive) for operational CAT.
 ``CATEngine`` and ``MCATEngine`` apply them identically. Randomesque control
 draws among the ``k`` items ranked highest by the selection strategy's
 criterion, breaking ties by item index; random selection ranks by seeded uniform
-scores. Progressive control randomizes early selections within an information
-window and increasingly favors item information as the configured test limit
-nears; ordinal models are evaluated item by item.
+scores.
 The first interactive session is included in exposure reports automatically.
 Resetting before any item selection reuses the unused session; resetting after
 selection starts a new examinee.
+
+:class:`~mirt.cat.exposure.ProgressiveRestricted` implements the
+progressive-restricted method of Revuelta and Ponsoda (1998). Items whose
+exposure rate (the share of examinees so far, the current one included, who
+were given the item) has reached ``max_exposure`` (default 0.25) are
+ineligible, unless that would leave no candidate. Among the eligible items the
+engine administers the item maximizing ``(1 - w) * R + w * I``, where ``I`` is
+the item's information at the current estimate, ``R`` is uniform on ``[0,
+max I]``, and ``w = (s / L) ** acceleration`` after ``s`` of ``L`` items
+(``L`` is the length the stopping rules enforce, or the pool size). The first
+item is random and information dominates by the end of the test. Pass
+``max_exposure=None`` for the progressive method alone. An optional
+``window_size`` limits the random stage to items within that many information
+units of the best one; narrow windows weaken exposure control.
+
+Sympson–Hetter parameters are calibrated by iterative simulation. Each
+:meth:`~mirt.cat.exposure.SympsonHetter.calibrate` call adjusts the parameters
+from the sessions recorded since the previous call and then clears the counts
+(``reset_counts=True``), so every round measures the current parameters:
+
+.. code-block:: python
+
+   import numpy as np
+   from mirt.cat import CATEngine, SympsonHetter
+
+   control = SympsonHetter(target_rate=0.2, seed=1)
+   engine = CATEngine(fit.model, exposure_control=control, max_items=20, seed=2)
+   simulated = np.random.default_rng(3).normal(size=1000)
+   for _ in range(20):
+       engine.run_batch_simulation(simulated)
+       control.calibrate(fit.model.n_items)
+   parameters = control.exposure_parameters
+
+Use the calibrated ``exposure_parameters`` in
+``SympsonHetter(exposure_params=...)`` for operational testing.
+:meth:`~mirt.cat.exposure.SympsonHetter.reset_counts` clears the counts without
+calibrating.
 
 Fixed-form assembly
 -------------------

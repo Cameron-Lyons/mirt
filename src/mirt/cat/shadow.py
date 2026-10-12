@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import ArrayLike
 
-from mirt.cat.assembly import FormAssemblyResult, assemble_form
+from mirt.cat.assembly import (
+    FormAssemblyResult,
+    _information_matrix,
+    _validate_blueprint,
+    _validate_costs,
+    assemble_form,
+)
 from mirt.cat.content import ContentBlueprint
 from mirt.cat.selection import ItemSelectionStrategy, MaxFisherInformation
 
@@ -48,11 +54,20 @@ class ShadowTestSelection(ItemSelectionStrategy):
     shadow-test sessions independently, never on the native or lock-step
     paths.
 
+    Shadow tests that only content minima and maxima constrain (or nothing
+    at all) are separable: the optimum takes each content area's most
+    informative items up to its minimum, then the most informative
+    remaining items within the maxima. Those shadow tests are built with
+    this exact greedy allocation instead of the mixed-integer solver, which
+    handles enemy pairs, bundles, and cost budgets. Ties between equally
+    informative items may then resolve differently.
+
     Parameters
     ----------
     test_length : int, optional
-        Number of items in every shadow test. By default the engine's
-        maximum test length (``max_items``, or the pool size) is used. The
+        Number of items in every shadow test. By default the engine uses
+        the length its stopping rules enforce (``max_items``, a
+        ``MaxItemsStop`` in ``stopping_rule``, or else the pool size). The
         engine must stop by this length.
     blueprint : ContentBlueprint, optional
         Content-area minimum and maximum item counts.
@@ -205,6 +220,90 @@ class ShadowTestSelection(ItemSelectionStrategy):
             model, theta, free & eligible or free
         )
 
+    def _is_separable(self) -> bool:
+        """Whether only disjoint content-area counts constrain the shadow test."""
+        if self.enemy_pairs or self.item_bundles or self.max_cost is not None:
+            return False
+        if self.blueprint is None:
+            return True
+        areas = [area.items for area in self.blueprint.areas]
+        return sum(map(len, areas)) == len(set().union(*areas))
+
+    def _assemble_greedy(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        length: int,
+        candidates: set[int],
+        required: set[int],
+    ) -> FormAssemblyResult:
+        """Build the optimal separable shadow test by greedy allocation.
+
+        The required items are kept; each content area then receives its most
+        informative candidates up to its minimum, and the remaining places go
+        to the most informative candidates whose area is below its maximum.
+        Information is the separable objective, and each area's best items
+        dominate its other items, so the allocation is optimal.
+        """
+        pool_size = model.n_items
+        blueprint = _validate_blueprint(self.blueprint, pool_size)
+        costs, _ = _validate_costs(self.item_costs, pool_size, None)
+        if len(candidates) < length:
+            raise RuntimeError(
+                f"only {len(candidates)} candidate items for a {length}-item test"
+            )
+        indices = np.asarray(sorted(candidates), dtype=np.intp)
+        theta_values = np.array([float(theta)])
+        information = _information_matrix(model, theta_values, pool_size, indices)[0]
+        utility = dict(zip(indices.tolist(), information.tolist(), strict=True))
+        # Most informative first; ties go to the lowest index.
+        ranked = sorted(set(candidates) - required, key=lambda j: (-utility[j], j))
+
+        areas = blueprint.areas if blueprint is not None else []
+        area_of = {item: area for area in areas for item in area.items}
+        counts = {area.name: len(area.items & required) for area in areas}
+        selected = set(required)
+        for area in areas:
+            if counts[area.name] > area.max_items:
+                raise RuntimeError(
+                    f"required items exceed the maximum of {area.name!r}"
+                )
+            needed = area.min_items - counts[area.name]
+            if needed > 0:
+                members = [item for item in ranked if area_of.get(item) is area]
+                if len(members) < needed:
+                    raise RuntimeError(f"too few candidate items for {area.name!r}")
+                selected.update(members[:needed])
+                counts[area.name] += needed
+        if len(selected) > length:
+            raise RuntimeError("content minima exceed the test length")
+        for item in ranked:
+            if len(selected) == length:
+                break
+            if item in selected:
+                continue
+            area = area_of.get(item)
+            if area is not None:
+                if counts[area.name] >= area.max_items:
+                    continue
+                counts[area.name] += 1
+            selected.add(item)
+        if len(selected) < length:
+            raise RuntimeError("content maxima leave too few items for the test")
+
+        items = np.asarray(sorted(selected), dtype=np.intp)
+        total = float(sum(utility[int(item)] for item in items))
+        return FormAssemblyResult(
+            selected_items=items,
+            theta=theta_values,
+            information=np.array([total]),
+            objective_value=total,
+            method="maximize_information",
+            content_counts={area.name: counts[area.name] for area in areas},
+            total_cost=None if costs is None else float(np.sum(costs[items])),
+            solver_message="optimal greedy allocation (separable constraints)",
+        )
+
     def _assemble(
         self,
         model: BaseItemModel,
@@ -215,6 +314,8 @@ class ShadowTestSelection(ItemSelectionStrategy):
     ) -> FormAssemblyResult:
         """Assemble one shadow test, naming the step when it is infeasible."""
         try:
+            if self._is_separable():
+                return self._assemble_greedy(model, theta, length, candidates, required)
             return assemble_form(
                 model,
                 length,

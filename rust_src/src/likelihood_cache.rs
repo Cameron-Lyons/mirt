@@ -1,6 +1,9 @@
 //! Bounded probability tables shared by respondents at a common theta grid.
 
 use numpy::ndarray::{Array2, ArrayView2};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray2};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use rayon::prelude::*;
 
 use crate::utils::logsumexp;
@@ -116,9 +119,171 @@ pub(crate) fn normalize_log_posterior_rows(
     marginal
 }
 
+/// Rows of joint mass, scaled by the largest prior mass, below this are
+/// normalized again from their own maximum (`_posterior._MIN_SCALED_TOTAL`).
+const MIN_SCALED_TOTAL: f64 = 1e-100;
+
+/// Maximum of a row with NumPy's semantics: NaN when any entry is NaN.
+fn row_maximum(row: &[f64]) -> f64 {
+    let mut maximum = f64::NEG_INFINITY;
+    for &value in row {
+        if value.is_nan() {
+            return f64::NAN;
+        }
+        maximum = maximum.max(value);
+    }
+    maximum
+}
+
+/// Normalize log-joint values in place from their maximum; return the log
+/// total, as `_posterior._normalize_rows` does for one row.
+fn normalize_from_maximum(row: &mut [f64]) -> f64 {
+    let offset = row_maximum(row);
+    let mut total = 0.0;
+    for value in row.iter_mut() {
+        *value = (*value - offset).exp();
+        total += *value;
+    }
+    for value in row.iter_mut() {
+        *value /= total;
+    }
+    if offset.is_infinite() {
+        offset
+    } else {
+        offset + total.ln()
+    }
+}
+
+/// Prior of [`normalize_posterior_row`]: shifted by its finite peak, or raw
+/// when the peak is not finite.
+enum RowPrior<'a> {
+    None,
+    Shifted { values: &'a [f64], peak: f64 },
+    Raw(&'a [f64]),
+}
+
+/// One row of `mirt.estimation._posterior.normalize_log_posterior`, with the
+/// same operations and therefore the same underflow and non-finite semantics:
+/// the likelihood is centered at its maximum, the prior added after shifting
+/// it by its largest mass, and rows whose mass underflows renormalized from
+/// their own maximum. `scratch` holds a copy of the row of that length.
+fn normalize_posterior_row(row: &mut [f64], prior: &RowPrior<'_>, scratch: &mut [f64]) -> f64 {
+    let offset = row_maximum(row);
+    let shift = if offset.is_finite() { offset } else { 0.0 };
+    for value in row.iter_mut() {
+        *value -= shift;
+    }
+    match *prior {
+        RowPrior::None => {
+            let mut total = 0.0;
+            for value in row.iter_mut() {
+                *value = value.exp();
+                total += *value;
+            }
+            for value in row.iter_mut() {
+                *value /= total;
+            }
+            shift + total.ln()
+        }
+        RowPrior::Raw(values) => {
+            for (value, &mass) in row.iter_mut().zip(values) {
+                *value += mass;
+            }
+            shift + normalize_from_maximum(row)
+        }
+        RowPrior::Shifted { values, peak } => {
+            for (value, &mass) in row.iter_mut().zip(values) {
+                *value += mass;
+            }
+            scratch.copy_from_slice(row);
+            let mut total = 0.0;
+            for value in row.iter_mut() {
+                *value = value.exp();
+                total += *value;
+            }
+            if total.is_finite() && total >= MIN_SCALED_TOTAL {
+                let scale = 1.0 / total;
+                for value in row.iter_mut() {
+                    *value *= scale;
+                }
+                shift + (peak + total.ln())
+            } else {
+                row.copy_from_slice(scratch);
+                shift + (peak + normalize_from_maximum(row))
+            }
+        }
+    }
+}
+
+/// Normalize an owned person-by-grid log-likelihood buffer to posterior
+/// weights in place and return each row's log marginal likelihood.
+///
+/// `log_joint` must be a writeable C-contiguous float64 matrix and
+/// `log_prior` the log prior mass of each grid point, if any. The rows are
+/// normalized as `mirt.estimation._posterior.normalize_log_posterior`
+/// normalizes them, in parallel with the global GIL released.
+#[pyfunction]
+#[pyo3(signature = (log_joint, log_prior=None))]
+pub fn normalize_log_posterior_inplace<'py>(
+    py: Python<'py>,
+    mut log_joint: PyReadwriteArray2<'py, f64>,
+    log_prior: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let n_points = log_joint.as_array().ncols();
+    let prior = log_prior.map(|values| values.as_array().to_vec());
+    if prior
+        .as_ref()
+        .is_some_and(|values| values.len() != n_points)
+    {
+        return Err(PyValueError::new_err(
+            "log_prior must have one entry per grid point",
+        ));
+    }
+    if n_points == 0 {
+        return Err(PyValueError::new_err("log_joint must have grid points"));
+    }
+    let data = log_joint
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("log_joint must be C-contiguous"))?;
+    let marginal = py.detach(|| {
+        let peak = prior.as_deref().map_or(0.0, row_maximum);
+        let shifted: Option<Vec<f64>> = prior
+            .as_deref()
+            .filter(|_| peak.is_finite())
+            .map(|values| values.iter().map(|mass| mass - peak).collect());
+        let row_prior = match (&prior, &shifted) {
+            (None, _) => RowPrior::None,
+            (Some(_), Some(values)) => RowPrior::Shifted { values, peak },
+            (Some(values), None) => RowPrior::Raw(values),
+        };
+        let mut marginal = vec![0.0; data.len() / n_points];
+        let normalize = |scratch: &mut Vec<f64>, (row, marginal): (&mut [f64], &mut f64)| {
+            *marginal = normalize_posterior_row(row, &row_prior, scratch);
+        };
+        if data.len() < 32_768 {
+            let mut scratch = vec![0.0; n_points];
+            data.chunks_mut(n_points)
+                .zip(marginal.iter_mut())
+                .for_each(|pair| normalize(&mut scratch, pair));
+        } else {
+            data.par_chunks_mut(n_points)
+                .zip(marginal.par_iter_mut())
+                .for_each_init(|| vec![0.0; n_points], normalize);
+        }
+        marginal
+    });
+    Ok(marginal.into_pyarray(py))
+}
+
+/// Register the posterior normalization kernel with the Python module.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(normalize_log_posterior_inplace, m)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TABLE_ENTRIES, cached_likelihoods};
+    use super::{RowPrior, TABLE_ENTRIES, cached_likelihoods, normalize_posterior_row};
     use numpy::ndarray::{Array2, array};
 
     #[test]
@@ -188,5 +353,40 @@ mod tests {
             assert_eq!(output[[1, q]], 0.0 + lo(0));
             assert_eq!(output[[2, q]], 0.0 + hi(0) + lo(1));
         }
+    }
+
+    #[test]
+    fn posterior_rows_match_the_reference_normalization() {
+        let prior = [0.0, -300.0, -900.0, -906.0, f64::NEG_INFINITY];
+        let row_prior = RowPrior::Shifted {
+            values: &prior,
+            peak: 0.0,
+        };
+        // Peaks where the prior mass is e^-900 times smaller underflow after
+        // the shift by the largest prior mass, so the row is renormalized.
+        let mut scratch = [0.0; 5];
+        let mut row = [-2000.0, -2000.0, 0.0, -1.0, 0.0];
+        let marginal = normalize_posterior_row(&mut row, &row_prior, &mut scratch);
+        let joint: Vec<f64> = [-2000.0, -2000.0, 0.0, -1.0, 0.0]
+            .iter()
+            .zip(&prior)
+            .map(|(l, p)| l + p)
+            .collect();
+        let peak = joint.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = joint.iter().map(|value| (value - peak).exp()).sum();
+        assert!((marginal - (peak + total.ln())).abs() < 1e-12);
+        for (value, joint) in row.iter().zip(&joint) {
+            assert!((value - (joint - peak).exp() / total).abs() < 1e-15);
+        }
+        assert!(row[3] > 0.0);
+
+        let mut empty = [f64::NEG_INFINITY; 2];
+        let raw = RowPrior::Raw(&[0.0, 0.0]);
+        let marginal = normalize_posterior_row(&mut empty, &raw, &mut scratch[..2]);
+        assert_eq!(marginal, f64::NEG_INFINITY);
+        assert!(empty.iter().all(|value| value.is_nan()));
+        let mut undefined = [f64::NAN, 0.0];
+        let marginal = normalize_posterior_row(&mut undefined, &RowPrior::None, &mut scratch[..2]);
+        assert!(marginal.is_nan());
     }
 }

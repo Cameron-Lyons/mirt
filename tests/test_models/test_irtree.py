@@ -64,7 +64,7 @@ def test_bockenholt_expansion_uses_stable_node_columns() -> None:
     pseudo, traits, valid = model.expand_to_pseudo_items(responses)
 
     assert model.node_names == (
-        "acquiescence",
+        "midpoint",
         "direction",
         "intensity_disagree",
         "intensity_agree",
@@ -523,6 +523,23 @@ def test_shared_custom_node_is_rejected() -> None:
 
     with pytest.raises(MirtValidationError, match="shared"):
         IRTreeModel(n_items=1, tree_spec=spec, n_categories=2)
+
+
+def test_bockenholt_tree_names_its_neutral_decision_midpoint() -> None:
+    spec = IRTreeSpec.bockenholt_mdi()
+    model = IRTreeModel(n_items=2, tree_spec="bockenholt")
+
+    neutral_path = spec.get_path_to_category(2)
+
+    assert [(node.name, decision) for node, decision in neutral_path] == [
+        ("midpoint", 1)
+    ]
+    assert spec.trait_names[neutral_path[0][0].latent_trait] == "Midpoint"
+    assert model.trait_names == ["Midpoint", "Direction", "Intensity"]
+    assert model.tree_spec.name == "Bockenholt MDI"
+    legacy = IRTreeSpec.bockenholt_adi()
+    assert legacy.trait_names == spec.trait_names
+    assert legacy.root.name == "midpoint"
 
 
 def test_category_paths_validate_bounds_and_match_terminals() -> None:

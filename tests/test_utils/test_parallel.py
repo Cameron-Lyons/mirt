@@ -95,6 +95,25 @@ def test_resolve_n_jobs_rejects_invalid_counts(n_jobs):
         resolve_n_jobs(n_jobs)
 
 
+def test_scoring_shares_the_worker_resolver():
+    import mirt.scoring._common as scoring_common
+    import mirt.scoring.map as map_scoring
+    import mirt.scoring.ml as ml_scoring
+    import mirt.scoring.wle as wle_scoring
+
+    assert not hasattr(scoring_common, "resolve_n_jobs")
+    for module in (map_scoring, ml_scoring, wle_scoring):
+        assert module.resolve_n_jobs is resolve_n_jobs
+
+
+@pytest.mark.parametrize("scorer", ["MLScorer", "MAPScorer", "WLEScorer"])
+def test_scorers_reject_invalid_worker_counts_as_validation_errors(scorer):
+    import mirt.scoring as scoring
+
+    with pytest.raises(MirtValidationError, match="n_jobs"):
+        getattr(scoring, scorer)(n_jobs=0)
+
+
 def test_ensure_picklable_explains_local_callables():
     ensure_picklable(_worker_state, [1, 2], n_jobs=2)
     with pytest.raises(MirtValidationError, match="picklable"):

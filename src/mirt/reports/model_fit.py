@@ -19,17 +19,23 @@ class ModelFitReport(ReportBuilder):
 
     This report includes:
     - Model summary (type, parameters, log-likelihood, AIC/BIC)
-    - Global fit indices table (M2, RMSEA, CFI, TLI, SRMSR)
+    - Global fit indices table (M2, M2* or C2, RMSEA, CFI, TLI, SRMSR)
     - Fit interpretation guidelines
     - Test Information Function plot
     - Standard Error of Measurement plot
+
+    The limited-information statistic is M2 for binary items and M2* for
+    ordinal items, or C2 when M2* has no degrees of freedom (Cai & Monroe,
+    2014), and the table names the one reported.
 
     Parameters
     ----------
     fit_result : FitResult
         Fitted model result.
-    responses : ndarray
-        Response matrix (n_persons x n_items).
+    responses : array-like or DataFrame
+        Response matrix (n_persons x n_items). DataFrame columns are matched
+        to the model's item names, and ``NaN``, nullable-column nulls
+        (``pd.NA``) and negative codes are missing responses.
     title : str, optional
         Report title.
     include_plots : bool
@@ -55,20 +61,23 @@ class ModelFitReport(ReportBuilder):
         include_plots: bool = True,
     ) -> None:
         super().__init__(fit_result, title)
-        self.responses = np.asarray(responses)
+        self.responses = self._response_matrix(responses)
         self.include_plots = include_plots
 
     def _build_content(self) -> str:
-        from mirt.diagnostics.modelfit import compute_fit_indices
         from mirt.reports._templates import section
 
         sections = []
 
         sections.append(self._model_summary_section())
 
-        fit_indices = compute_fit_indices(self.fit_result, self.responses)
+        fit_indices, statistic = self._limited_information_fit(self.responses)
         sections.append(
-            section("Fit Indices", self._build_fit_indices_table(fit_indices))
+            section(
+                "Fit Indices",
+                self._build_fit_indices_table(fit_indices, statistic)
+                + self._statistic_note(statistic),
+            )
         )
 
         sections.append(
@@ -100,7 +109,9 @@ class ModelFitReport(ReportBuilder):
 
         return "\n".join(sections)
 
-    def _build_fit_indices_table(self, fit_indices: dict[str, float]) -> str:
+    def _build_fit_indices_table(
+        self, fit_indices: dict[str, float], statistic: str = "M2"
+    ) -> str:
         from mirt.reports._templates import format_value, table_from_data
 
         def quality_for_rmsea(val: float) -> str:
@@ -127,7 +138,7 @@ class ModelFitReport(ReportBuilder):
         headers = ["Index", "Value", "Interpretation"]
         rows = [
             [
-                "M2",
+                statistic,
                 format_value(fit_indices["M2"], ".2f"),
                 f"df = {fit_indices['M2_df']:.0f}, p = {fit_indices['M2_p']:.4f}",
             ],
@@ -174,7 +185,7 @@ class ModelFitReport(ReportBuilder):
             <li><strong>RMSEA:</strong> &lt; 0.05 good, &lt; 0.08 acceptable, &gt; 0.10 poor</li>
             <li><strong>CFI/TLI:</strong> &gt; 0.95 good, &gt; 0.90 acceptable</li>
             <li><strong>SRMSR:</strong> &lt; 0.05 good, &lt; 0.08 acceptable</li>
-            <li><strong>M2 p-value:</strong> Non-significant (p &gt; 0.05) indicates adequate fit, but sensitive to sample size</li>
+            <li><strong>M2 (M2*, C2) p-value:</strong> Non-significant (p &gt; 0.05) indicates adequate fit, but sensitive to sample size</li>
         </ul>
         <p><em>Note:</em> Multiple indices should be considered together. Model fit evaluation
         should also consider substantive interpretability and parameter reasonableness.</p>

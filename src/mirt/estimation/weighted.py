@@ -29,7 +29,9 @@ from mirt.estimation.base import (
     _validate_start,
 )
 from mirt.estimation.em import EMEstimator
+from mirt.estimation.latent_density import GaussianDensity
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.standard_errors import StandardErrorMethod
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -99,6 +101,24 @@ class WeightedEMEstimator(EMEstimator):
     prob_epsilon, item_optim_maxiter, item_optim_ftol, se_step_size
         Item-optimizer and standard-error controls, as for
         :class:`~mirt.estimation.em.EMEstimator`.
+    se_method : {"auto", "sandwich", "oakes", "crossprod", "complete_data"}, \
+default="auto"
+        Standard-error estimator. ``"sandwich"`` is the design-based
+        (linearization) covariance of a weighted pseudo-likelihood estimate
+        (Binder, 1983): the weighted observed information ``sum_i w_i I_i``
+        around the cross-product ``sum_i w_i**2 s_i s_i'`` of the exact
+        marginal person scores. It does not depend on how the weights are
+        normalized. ``"oakes"`` and ``"crossprod"`` treat the weights as
+        frequency weights, each person standing for ``w_i`` independent
+        respondents; with ``normalize_weights=False`` and integer weights they
+        reproduce the errors of the expanded data. ``"complete_data"`` is
+        itemwise curvature of the weighted expected complete-data
+        likelihood, which understates uncertainty about twofold under
+        unequal weights. ``"auto"`` uses ``"sandwich"`` for the models whose
+        exact information ``"auto"`` gives
+        :class:`~mirt.estimation.em.EMEstimator` and ``"complete_data"``
+        otherwise. The matrix methods store the covariance in
+        ``FitResult.vcov``.
 
     Notes
     -----
@@ -107,13 +127,17 @@ class WeightedEMEstimator(EMEstimator):
 
     where w_i is the weight for person i and L_i is their marginal likelihood.
 
-    Standard errors use itemwise complete-data curvature with survey-weighted
-    posterior counts (``FitResult.se_method="complete_data"``, without a
-    parameter covariance). They do not account for clustering or
-    stratification. The other options of
-    :class:`~mirt.estimation.em.EMEstimator` (item priors, equality
-    constraints, latent densities, acceleration, ``n_jobs`` and
+    Standard errors do not account for clustering or stratification: the
+    sandwich treats every respondent as an independently sampled unit. The
+    other options of :class:`~mirt.estimation.em.EMEstimator` (item priors,
+    equality constraints, latent densities, acceleration, ``n_jobs`` and
     ``use_rust``) are not available for weighted fits.
+
+    References
+    ----------
+    Binder, D. A. (1983). On the variances of asymptotically normal
+    estimators from complex surveys. *International Statistical Review*,
+    51(3), 279-292.
     """
 
     def __init__(
@@ -129,6 +153,7 @@ class WeightedEMEstimator(EMEstimator):
         item_optim_maxiter: int = 50,
         item_optim_ftol: float = 1e-6,
         se_step_size: float = 1e-5,
+        se_method: StandardErrorMethod = "auto",
     ) -> None:
         super().__init__(
             n_quadpts,
@@ -140,6 +165,7 @@ class WeightedEMEstimator(EMEstimator):
             item_optim_ftol=item_optim_ftol,
             se_step_size=se_step_size,
             compute_standard_errors=compute_standard_errors,
+            se_method=se_method,
         )
         if not isinstance(normalize_weights, (bool, np.bool_)):
             raise ValueError("normalize_weights must be a boolean")
@@ -179,10 +205,12 @@ class WeightedEMEstimator(EMEstimator):
             Fitted model with estimates and diagnostics
         """
         start = _validate_start(start)
-        responses = self._validate_responses(responses, model.n_items)
+        responses = self._validate_responses(responses, model.n_items, model)
         previous_context = self._fit_context
         with EMFitContext(responses) as context:
             self._fit_context = context
+            # Rows are persons: weighted fits do not compress patterns.
+            self._pattern_frequencies = None
             try:
                 return self._fit_weighted_prepared(
                     model, responses, weights, prior_mean, prior_cov, start
@@ -222,6 +250,11 @@ class WeightedEMEstimator(EMEstimator):
             prior_mean = np.zeros(model.n_factors)
         if prior_cov is None:
             prior_cov = np.eye(model.n_factors)
+        # The fixed latent density of the E-step, which the observed
+        # information and the sandwich recompute posteriors from.
+        self._latent_density = GaussianDensity(
+            mean=prior_mean, cov=prior_cov, n_dimensions=model.n_factors
+        )
 
         _apply_starting_values(model, start)
 
@@ -390,7 +423,7 @@ class WeightedEMEstimator(EMEstimator):
         posterior_weights: NDArray[np.float64],
         survey_weights: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
-        """Compute itemwise curvature standard errors using survey weights."""
+        """Compute standard errors under survey weights by ``se_method``."""
 
         return self._compute_standard_errors(
             model, responses, posterior_weights, person_weights=survey_weights

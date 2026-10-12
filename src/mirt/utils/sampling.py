@@ -5,7 +5,7 @@ posterior distribution for uncertainty quantification.
 """
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -26,18 +26,28 @@ _PARAMETER_LIMITS = {
     "upper": (0.5, 1.0),
     "asymmetry": (PROB_EPSILON, np.inf),
 }
+# Rounds in which inadmissible draws of stored parameters are redrawn before
+# the remainder is projected onto the admissible set.
+_MAX_REDRAWS = 20
 
 
 @dataclass
 class ParameterSamples:
     """Container for parameter samples.
 
+    The named fields are the dichotomous view used by
+    :func:`sample_expected_scores`; ``parameters`` holds the draws of every
+    model family.
+
     Attributes
     ----------
-    discrimination : NDArray[np.float64]
+    discrimination : NDArray[np.float64] | None
         Discrimination samples. Shape: (n_samples, n_items) or (n_samples, n_items, n_dims).
-    difficulty : NDArray[np.float64]
-        Difficulty samples. Shape: (n_samples, n_items).
+        ``None`` for models that store no per-item discrimination.
+    difficulty : NDArray[np.float64] | None
+        Difficulty samples. Shape: (n_samples, n_items). ``None`` for models
+        without a per-item difficulty, such as graded, partial-credit and
+        nominal models, whose draws are in ``parameters``.
     guessing : NDArray[np.float64] | None
         Guessing parameter samples if applicable.
     slipping : NDArray[np.float64] | None
@@ -46,14 +56,21 @@ class ParameterSamples:
         Upper-asymptote samples if applicable.
     asymmetry : NDArray[np.float64] | None
         Logistic asymmetry samples if applicable.
+    parameters : dict[str, NDArray[np.float64]]
+        Draws keyed by parameter name, each of shape
+        ``(n_samples, *parameter.shape)``. For dichotomous logistic models it
+        holds the named fields above; otherwise every stored parameter of the
+        model, such as ``discrimination`` and ``thresholds`` of a graded
+        response model.
     """
 
-    discrimination: NDArray[np.float64]
-    difficulty: NDArray[np.float64]
+    discrimination: NDArray[np.float64] | None
+    difficulty: NDArray[np.float64] | None
     guessing: NDArray[np.float64] | None = None
     slipping: NDArray[np.float64] | None = None
     upper: NDArray[np.float64] | None = None
     asymmetry: NDArray[np.float64] | None = None
+    parameters: dict[str, NDArray[np.float64]] = field(default_factory=dict)
 
 
 def _optional_model_parameter(
@@ -166,6 +183,170 @@ def _result_draws(
     return _normal_draws(rng, mean, covariance, random, n_samples)
 
 
+def _stored_layout_covariance(
+    model: "BaseItemModel",
+    names: list[str],
+    vcov: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """Place a free-parameter covariance in the layout of stored parameters.
+
+    ``vcov`` lists the free coordinates of ``model.parameters`` in order, each
+    array raveled row-major, as ``FitResult.vcov`` does. Returns the
+    covariance of every stored coordinate (zero for fixed ones) and the mask
+    of coordinates to draw.
+    """
+    stored = model.parameters
+    masks = model.free_parameter_masks
+    positions: list[NDArray[np.intp]] = []
+    offset = 0
+    for name in names:
+        positions.append(offset + np.flatnonzero(np.asarray(masks[name]).ravel()))
+        offset += stored[name].size
+    free = np.concatenate(positions).astype(np.intp, copy=False)
+    if vcov.shape != (free.size, free.size):
+        raise ValueError(
+            f"vcov must have shape {(free.size, free.size)}, one row per free "
+            f"parameter of the {model.model_name} model"
+        )
+    matrix, held = _held_coordinates(vcov)
+    covariance = np.zeros((offset, offset), dtype=np.float64)
+    covariance[np.ix_(free, free)] = matrix
+    random = np.zeros(offset, dtype=np.bool_)
+    random[free] = ~held & (np.diag(matrix) > 0.0)
+    return covariance, random
+
+
+def _ordered_groups(
+    model: "BaseItemModel",
+    offsets: dict[str, int],
+) -> list[NDArray[np.intp]]:
+    """Return the draw columns of each run of thresholds that must increase.
+
+    Graded response items need increasing active thresholds, and a graded
+    rating scale needs increasing shared thresholds, for the category
+    probabilities to be nonnegative.
+    """
+    from mirt.models.polytomous import GradedRatingScaleModel, GradedResponseModel
+
+    if "thresholds" not in offsets:
+        return []
+    start = offsets["thresholds"]
+    thresholds = model.parameters["thresholds"]
+    if isinstance(model, GradedRatingScaleModel):
+        return [start + np.arange(thresholds.size, dtype=np.intp)]
+    if not isinstance(model, GradedResponseModel):
+        return []
+    width = thresholds.shape[1]
+    return [
+        start + item * width + np.arange(n_categories - 1, dtype=np.intp)
+        for item, n_categories in enumerate(model.n_categories)
+        if n_categories > 2
+    ]
+
+
+def _draw_stored_parameters(
+    rng: np.random.Generator,
+    model: "BaseItemModel",
+    result: "FitResult | None",
+    vcov: NDArray[np.float64] | None,
+    n_samples: int,
+) -> dict[str, NDArray[np.float64]]:
+    """Draw every stored parameter of ``model`` from its asymptotic normal.
+
+    Draws that leave a free coordinate's estimation box, or disorder graded
+    thresholds, are redrawn, which samples the normal truncated to the
+    admissible set. Draws still inadmissible after ``_MAX_REDRAWS`` rounds
+    are projected onto it with a warning. Constraints that the estimates
+    themselves violate are not imposed.
+    """
+    from mirt.estimation.base import _parameter_bounds
+
+    stored = model.parameters
+    names = list(stored)
+    offsets: dict[str, int] = {}
+    size = 0
+    for name in names:
+        offsets[name] = size
+        size += stored[name].size
+    mean = np.concatenate(
+        [np.asarray(stored[name], dtype=np.float64).ravel() for name in names]
+    )
+    if not np.all(np.isfinite(mean)):
+        raise ValueError("model parameters must be finite")
+
+    if vcov is not None:
+        covariance, random = _stored_layout_covariance(model, names, vcov)
+    elif result is not None:
+        covariance, random, joint = result._parameter_covariance(names)
+        if not joint:
+            warnings.warn(
+                "the fit result has no parameter covariance (vcov); parameters "
+                "are drawn independently from their standard errors, ignoring "
+                "cross-parameter covariance",
+                UserWarning,
+                stacklevel=3,
+            )
+    else:
+        raise MirtValidationError(
+            f"draw_parameters() of a {model.model_name} model requires a "
+            "FitResult or a vcov of its free parameters",
+            parameter="vcov",
+        )
+
+    lower = np.full(size, -np.inf)
+    upper = np.full(size, np.inf)
+    for name in names:
+        low, high = _parameter_bounds(model, name)
+        columns = slice(offsets[name], offsets[name] + stored[name].size)
+        lower[columns], upper[columns] = low, high
+    # Only drawn coordinates are bounded; fixed values may lie outside a box.
+    lower[~random] = -np.inf
+    upper[~random] = np.inf
+    groups = [
+        group
+        for group in _ordered_groups(model, offsets)
+        if np.all(np.diff(mean[group]) > 0.0)
+    ]
+
+    def admissible(values: NDArray[np.float64]) -> NDArray[np.bool_]:
+        valid = np.all((values >= lower) & (values <= upper), axis=1)
+        for group in groups:
+            valid &= np.all(np.diff(values[:, group], axis=1) > 0.0, axis=1)
+        return valid
+
+    draws = _normal_draws(rng, mean, covariance, random, n_samples)
+    valid = admissible(draws)
+    for _ in range(_MAX_REDRAWS):
+        if valid.all():
+            break
+        redrawn = ~valid
+        draws[redrawn] = _normal_draws(
+            rng, mean, covariance, random, int(np.count_nonzero(redrawn))
+        )
+        valid = admissible(draws)
+    if not valid.all():
+        warnings.warn(
+            f"{int(np.count_nonzero(~valid))} of {n_samples} parameter draws "
+            f"remained outside the parameter bounds or threshold order after "
+            f"{_MAX_REDRAWS} redraws and were projected onto them",
+            UserWarning,
+            stacklevel=3,
+        )
+        rows = np.flatnonzero(~valid)
+        projected = np.clip(draws[rows], lower, upper)
+        for group in groups:
+            if np.all(random[group]):
+                projected[:, group] = np.sort(projected[:, group], axis=1)
+        draws[rows] = projected
+
+    return {
+        name: draws[:, offsets[name] : offsets[name] + stored[name].size]
+        .reshape((n_samples, *stored[name].shape))
+        .copy()
+        for name in names
+    }
+
+
 def draw_parameters(
     model: "BaseItemModel | FitResult",
     n_samples: int = 1000,
@@ -181,14 +362,18 @@ def draw_parameters(
     Parameters
     ----------
     model : FitResult or BaseItemModel
-        A fit result, or a fitted model exposing discrimination and one
-        difficulty per item. Without ``vcov``, a fit result supplies its
-        free-parameter covariance (``result.vcov``); its model must store
-        ``discrimination`` and ``difficulty`` rather than derive them, as an
-        LLTM derives difficulty from feature weights. When the result has
-        only standard errors, parameters are drawn independently with a
-        ``UserWarning``. Fixed parameters, and parameters on an optimizer
-        bound or without a standard error, are held at their estimates.
+        A fit result, or a fitted model. Without ``vcov``, a fit result
+        supplies its free-parameter covariance (``result.vcov``). When the
+        result has only standard errors, parameters are drawn independently
+        with a ``UserWarning``. Fixed parameters, and parameters on an
+        optimizer bound or without a standard error, are held at their
+        estimates. Dichotomous models exposing discrimination and one
+        difficulty per item use the sampling layout below; a fit result's
+        model must then store ``discrimination`` and ``difficulty`` rather
+        than derive them, as an LLTM derives difficulty from feature
+        weights. Other models, such as graded response, partial-credit,
+        nominal and slope-intercept multidimensional models, draw every
+        stored parameter jointly; see Returns.
     n_samples : int
         Number of samples to draw. Default 1000.
     vcov : NDArray[np.float64], optional
@@ -199,9 +384,12 @@ def draw_parameters(
         their estimates, as do rows and columns that are entirely ``NaN``,
         which ``FitResult.vcov`` uses for parameters on an optimizer bound.
         When nothing is fixed, the ``result.vcov`` of a unidimensional 2PL,
-        3PL or 4PL fit is in this layout. A bare model without ``vcov`` or
-        ``model.vcov`` falls back, with a ``FutureWarning``, to fixed sampling
-        scales that do not reflect estimation uncertainty and will be removed.
+        3PL or 4PL fit is in this layout. A bare dichotomous model without
+        ``vcov`` or ``model.vcov`` falls back, with a ``FutureWarning``, to
+        fixed sampling scales that do not reflect estimation uncertainty and
+        will be removed. For the other models, ``vcov`` is in the layout of
+        ``FitResult.vcov``: the free coordinates of ``model.parameters`` in
+        order, each array raveled row-major; a bare model requires it.
     method : str
         Sampling method. Currently only "mvn" (asymptotic multivariate
         normal sampling) is supported.
@@ -211,8 +399,15 @@ def draw_parameters(
     Returns
     -------
     ParameterSamples
-        Container with parameter samples. Draws are clipped to each
-        parameter's admissible range.
+        Container with parameter samples. Dichotomous draws are clipped to
+        each parameter's admissible range. For the other models,
+        ``samples.parameters`` maps each stored parameter name to draws of
+        shape ``(n_samples, *parameter.shape)``, and ``discrimination`` is
+        set when the model stores one. Their draws are redrawn, as in R's
+        ``draw_parameters``, until every drawn coordinate lies within the
+        bounds that estimation uses (for example, discriminations of at least
+        0.1) and graded thresholds increase; draws still outside after 20
+        redraws are projected onto these constraints with a warning.
 
     Examples
     --------
@@ -236,13 +431,26 @@ def draw_parameters(
         item_model = model
     rng = np.random.default_rng(seed)
 
-    try:
-        disc = np.asarray(item_model.discrimination, dtype=np.float64)
-        diff = np.asarray(item_model.difficulty, dtype=np.float64)
-    except AttributeError as exc:
-        raise ValueError(
-            "model must expose discrimination and difficulty parameters"
-        ) from exc
+    if (
+        getattr(item_model, "is_polytomous", False)
+        or not hasattr(item_model, "discrimination")
+        or not hasattr(item_model, "difficulty")
+    ):
+        draws_by_name = _draw_stored_parameters(
+            rng,
+            item_model,
+            result,
+            None if vcov is None else np.asarray(vcov, dtype=np.float64),
+            n_samples,
+        )
+        return ParameterSamples(
+            discrimination=draws_by_name.get("discrimination"),
+            difficulty=None,
+            parameters=draws_by_name,
+        )
+
+    disc = np.asarray(item_model.discrimination, dtype=np.float64)
+    diff = np.asarray(item_model.difficulty, dtype=np.float64)
 
     if disc.ndim == 1:
         disc = disc.reshape(-1, 1)
@@ -325,13 +533,19 @@ def draw_parameters(
             samples["upper"], samples["guessing"] + PROB_EPSILON
         )
 
+    difficulty_samples = draws[:, n_disc:n_core].copy()
     return ParameterSamples(
         discrimination=disc_samples,
-        difficulty=draws[:, n_disc:n_core].copy(),
+        difficulty=difficulty_samples,
         guessing=samples.get("guessing"),
         slipping=samples.get("slipping"),
         upper=samples.get("upper"),
         asymmetry=samples.get("asymmetry"),
+        parameters={
+            "discrimination": disc_samples,
+            "difficulty": difficulty_samples,
+            **samples,
+        },
     )
 
 
@@ -362,6 +576,13 @@ def _validated_parameter_samples(
     NDArray[np.float64] | None,
 ]:
     """Return consistently shaped, finite arrays from a sample container."""
+    if (
+        getattr(samples, "discrimination", None) is None
+        or getattr(samples, "difficulty", None) is None
+    ):
+        raise ValueError(
+            "samples must expose numeric discrimination and difficulty arrays"
+        )
     try:
         discrimination = np.asarray(samples.discrimination, dtype=np.float64)
         difficulty = np.asarray(samples.difficulty, dtype=np.float64)
@@ -394,6 +615,35 @@ def _validated_parameter_samples(
         _optional_sample_array(samples.upper, "upper", expected_shape),
         _optional_sample_array(samples.asymmetry, "asymmetry", expected_shape),
     )
+
+
+def _validated_parameter_draws(
+    draws: dict[str, NDArray[np.float64]],
+) -> dict[str, NDArray[np.float64]]:
+    """Return finite draw arrays that share a leading sample axis."""
+    validated: dict[str, NDArray[np.float64]] = {}
+    n_samples = None
+    for name, values in draws.items():
+        try:
+            array = np.asarray(values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"samples.parameters[{name!r}] must be numeric") from exc
+        if array.ndim < 1 or array.shape[0] == 0:
+            raise ValueError(
+                f"samples.parameters[{name!r}] must contain at least one draw"
+            )
+        if n_samples is None:
+            n_samples = array.shape[0]
+        elif array.shape[0] != n_samples:
+            raise ValueError(
+                "every entry of samples.parameters must have the same number of draws"
+            )
+        if not np.all(np.isfinite(array)):
+            raise ValueError(
+                f"samples.parameters[{name!r}] must contain only finite values"
+            )
+        validated[name] = array
+    return validated
 
 
 def _equal_tailed_sample_summary(
@@ -456,7 +706,9 @@ def posterior_summary(
     Parameters
     ----------
     samples : ParameterSamples
-        Parameter samples from draw_parameters().
+        Parameter samples from draw_parameters(). Samples without
+        ``difficulty``, such as those of graded or nominal models, are
+        summarized per entry of ``samples.parameters``.
     credible_level : float
         Level for credible intervals. Default 0.95.
     interval_method : {"equal_tailed", "highest_density"}
@@ -467,7 +719,8 @@ def posterior_summary(
     Returns
     -------
     dict
-        Nested dictionary with summary statistics for each parameter type.
+        Nested dictionary with summary statistics for each parameter type,
+        each of the parameter's shape.
 
     Examples
     --------
@@ -488,21 +741,27 @@ def posterior_summary(
     lower_q = alpha / 2 * 100
     upper_q = (1 - alpha / 2) * 100
 
-    validated = _validated_parameter_samples(samples)
-    parameter_arrays = dict(
-        zip(
-            (
-                "discrimination",
-                "difficulty",
-                "guessing",
-                "slipping",
-                "upper",
-                "asymmetry",
-            ),
-            validated,
-            strict=True,
+    parameter_arrays: dict[str, NDArray[np.float64] | None]
+    if getattr(samples, "difficulty", None) is None and getattr(
+        samples, "parameters", None
+    ):
+        parameter_arrays = dict(_validated_parameter_draws(samples.parameters))
+    else:
+        validated = _validated_parameter_samples(samples)
+        parameter_arrays = dict(
+            zip(
+                (
+                    "discrimination",
+                    "difficulty",
+                    "guessing",
+                    "slipping",
+                    "upper",
+                    "asymmetry",
+                ),
+                validated,
+                strict=True,
+            )
         )
-    )
 
     summaries: dict[str, dict[str, NDArray[np.float64]]] = {}
     for name, values in parameter_arrays.items():

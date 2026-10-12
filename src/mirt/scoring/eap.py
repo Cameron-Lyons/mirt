@@ -94,7 +94,8 @@ class EAPScorer:
     Notes
     -----
     EAP integrates over a tensor-product grid of ``n_quadpts ** n_factors``
-    nodes. For a :class:`~mirt.models.BifactorModel` whose prior makes the
+    nodes. For a :class:`~mirt.models.BifactorModel` or
+    :class:`~mirt.models.GradedBifactorModel` whose prior makes the
     specific factors conditionally independent given the general factor (any
     diagonal covariance, for example), :meth:`score` instead integrates each
     specific factor jointly with the general factor on its own
@@ -148,7 +149,7 @@ class EAPScorer:
         model: BaseItemModel,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Build the product grid, resolving the automatic grid size."""
-        from mirt.models.bifactor import BifactorModel
+        from mirt.models.bifactor import BifactorModel, GradedBifactorModel
 
         n_factors = model.n_factors
         default = _default_n_quadpts(n_factors)
@@ -170,7 +171,7 @@ class EAPScorer:
         if (
             self.n_quadpts is None
             and n_quadpts < _MIN_ACCURATE_BIFACTOR_QUADPTS
-            and isinstance(model, BifactorModel)
+            and isinstance(model, (BifactorModel, GradedBifactorModel))
         ):
             advice = (
                 "; fscores(method='EAP') integrates this model by dimension "
@@ -194,9 +195,9 @@ class EAPScorer:
 
     def _bifactor_grid(self, model: BaseItemModel) -> ReducedBifactorGrid | None:
         """Return the dimension-reduced bifactor grid when it applies."""
-        from mirt.models.bifactor import BifactorModel
+        from mirt.models.bifactor import BifactorModel, GradedBifactorModel
 
-        if not isinstance(model, BifactorModel):
+        if not isinstance(model, (BifactorModel, GradedBifactorModel)):
             return None
         from mirt.scoring._bifactor import reduced_bifactor_grid
 
@@ -438,11 +439,13 @@ def ability_posterior(
 
     ``responses`` may be an array or a pandas or polars DataFrame; negative
     codes, ``NaN`` and the nulls of nullable DataFrame columns denote missing
-    responses, as in :func:`mirt.fit_mirt`. The posterior always lives on the
-    full product grid. Coarse grids bias posterior summaries, so for a
-    bifactor model an automatic grid coarser than 11 points per dimension
-    warns; :func:`mirt.fscores` scores bifactor models by dimension reduction
-    on a fine grid instead.
+    responses, as in :func:`mirt.fit_mirt`. DataFrame columns are matched to
+    the model's named items, in any order and ignoring other columns, as in
+    :func:`mirt.fscores`; array columns are matched by position. The
+    posterior always lives on the full product grid. Coarse grids bias
+    posterior summaries, so for a bifactor model an automatic grid coarser
+    than 11 points per dimension warns; :func:`mirt.fscores` scores bifactor
+    models by dimension reduction on a fine grid instead.
 
     ``model_or_result`` may be either a fitted item model or the ``FitResult``
     returned by :func:`mirt.fit_mirt`. ``n_quadpts`` is the number of grid

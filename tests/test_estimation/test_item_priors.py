@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 import mirt
-import mirt.backends.rust.estimation as rust_estimation
 import mirt.backends.rust.polytomous_mstep as polytomous_mstep
 import mirt.estimation.em as em_module
 from mirt.estimation._item_priors import ItemPriorPenalty, resolve_item_priors
@@ -147,23 +146,205 @@ def test_beta_prior_keeps_guessing_off_the_bounds():
     )
 
 
-def test_priors_bypass_native_and_batched_m_steps(responses_2pl, monkeypatch):
+def test_priors_take_batched_m_steps_instead_of_native_kernels(
+    responses_2pl, monkeypatch
+):
+    # Regression: any item prior sent every item to its own scipy optimizer,
+    # 4-8 times slower per EM cycle than the batched and native M-steps.
     def forbidden(*args, **kwargs):
-        raise AssertionError("fast path cannot apply item priors")
+        raise AssertionError("native kernels cannot apply item priors")
 
     monkeypatch.setattr(em_module, "em_iteration_3pl", forbidden)
     monkeypatch.setattr(polytomous_mstep, "try_polytomous_m_step", forbidden)
-    monkeypatch.setattr(EMEstimator, "_newton_logistic_m_step", forbidden)
-    monkeypatch.setattr(rust_estimation, "_em_fit_2pl_prepared", forbidden)
+    batched = []
+    for name in (
+        "_newton_logistic_m_step",
+        "_newton_guessing_m_step",
+        "_newton_polytomous_m_step",
+    ):
+        step = getattr(EMEstimator, name)
+
+        def record(self, model, *args, _step=step, **kwargs):
+            batched.append(model.model_name)
+            return _step(self, model, *args, **kwargs)
+
+        monkeypatch.setattr(EMEstimator, name, record)
     prior = {"discrimination": LogNormalPrior(0.0, 0.5)}
 
     mirt.fit_mirt(responses_2pl, priors=prior, max_iter=3)
     data_3pl = mirt.simdata("3PL", n_persons=200, n_items=5, seed=8)
-    EMEstimator(max_iter=3, item_priors=prior).fit(ThreeParameterLogistic(5), data_3pl)
+    # The native 3PL iteration applies these priors; without it the batched
+    # step does.
+    EMEstimator(max_iter=3, item_priors=prior, use_rust=False).fit(
+        ThreeParameterLogistic(5), data_3pl
+    )
     data_grm = mirt.simdata("GRM", n_persons=200, n_items=4, n_categories=4, seed=9)
     EMEstimator(max_iter=3, item_priors=prior).fit(
         GradedResponseModel(4, n_categories=4), data_grm
     )
+    assert batched == ["2PL"] * 3 + ["3PL"] * 3 + ["GRM"] * 3
+
+
+class _ItemwiseEM(EMEstimator):
+    """Reference estimator: overriding an item hook keeps the itemwise scipy path."""
+
+    def _optimize_item_params(self, *args, **kwargs):
+        return super()._optimize_item_params(*args, **kwargs)
+
+
+def _graded_responses(n_categories, seed, n_persons=600):
+    rng = np.random.default_rng(seed)
+    theta = rng.standard_normal(n_persons)
+    columns = []
+    for k in n_categories:
+        cuts = np.sort(rng.normal(0.0, 1.0, k - 1))
+        latent = rng.uniform(0.8, 1.8) * theta + rng.logistic(size=n_persons)
+        columns.append(np.searchsorted(cuts, latent))
+    responses = np.column_stack(columns)
+    responses[rng.random(responses.shape) < 0.05] = -1
+    return responses
+
+
+def _prior_m_step_case(kind):
+    from mirt.models.dichotomous import OneParameterLogistic
+    from mirt.models.multidimensional import MultidimensionalModel
+    from mirt.models.polytomous import GeneralizedPartialCredit, PartialCreditModel
+
+    slope, location = LogNormalPrior(0.0, 0.5), NormalPrior(0.0, 1.0)
+    if kind in ("1PL", "2PL", "2PL-2", "MIRT"):
+        responses = mirt.simdata("2PL", n_persons=600, n_items=6, seed=14)
+        if kind == "1PL":
+            model = OneParameterLogistic(6)
+            return model, responses, {"difficulty": location}
+        if kind == "MIRT":
+            model = MultidimensionalModel(6, 2)
+            model.set_parameters(slopes=np.full((6, 2), 0.7))
+            return model, responses, {"slopes": slope, "intercepts": location}
+        model = TwoParameterLogistic(6, n_factors=2 if kind == "2PL-2" else 1)
+        model.set_parameters(
+            discrimination=np.full(model.parameters["discrimination"].shape, 0.9)
+        )
+        return model, responses, {"discrimination": slope, "difficulty": location}
+    if kind == "3PL":
+        responses = mirt.simdata("3PL", n_persons=600, n_items=6, seed=15)
+        priors = {"discrimination": slope, "guessing": BetaPrior(5.0, 17.0)}
+        return ThreeParameterLogistic(6), responses, priors
+    n_categories = [3, 4, 4]
+    responses = _graded_responses(n_categories, seed=16)
+    if kind == "GRM":
+        model = GradedResponseModel(3, n_categories=n_categories)
+        return model, responses, {"discrimination": slope, "thresholds": location}
+    if kind == "GPCM":
+        model = GeneralizedPartialCredit(3, n_categories=n_categories)
+        return model, responses, {"discrimination": slope, "steps": location}
+    if kind == "PCM":
+        return (
+            PartialCreditModel(3, n_categories=n_categories),
+            responses,
+            {"steps": location},
+        )
+    model = NominalResponseModel(3, n_categories=n_categories)
+    return model, responses, {"slopes": NormalPrior(0.5, 1.0), "intercepts": location}
+
+
+@pytest.mark.parametrize(
+    "kind", ["1PL", "2PL", "2PL-2", "MIRT", "3PL", "GRM", "GPCM", "PCM", "NRM"]
+)
+def test_batched_prior_m_steps_reach_the_itemwise_posterior_mode(kind, monkeypatch):
+    from copy import deepcopy
+
+    from mirt.estimation.latent_density import GaussianDensity
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+    model, responses, priors = _prior_m_step_case(kind)
+    penalty = ItemPriorPenalty(resolve_item_priors(priors, model))
+    batched = EMEstimator(use_gpu=False)
+    reference = _ItemwiseEM(item_optim_ftol=1e-15, item_optim_maxiter=2000)
+    quadrature = GaussHermiteQuadrature(
+        9 if model.n_factors > 1 else 21, model.n_factors
+    )
+    for estimator in (batched, reference):
+        estimator._quadrature = quadrature
+        estimator._latent_density = GaussianDensity(n_dimensions=model.n_factors)
+        estimator._prior_penalty = penalty
+    posterior, _ = batched._e_step(model, responses)
+    expected = deepcopy(model)
+    reference._m_step(expected, responses, posterior)
+
+    itemwise = []
+    optimize = EMEstimator._optimize_item
+
+    def record(self, model, item_idx, *args, **kwargs):
+        itemwise.append(item_idx)
+        return optimize(self, model, item_idx, *args, **kwargs)
+
+    monkeypatch.setattr(EMEstimator, "_optimize_item", record)
+    batched._m_step(model, responses, posterior)
+
+    # Every item is solved by the batched step, at the itemwise optimum.
+    assert itemwise == []
+    for name, values in expected.parameters.items():
+        np.testing.assert_allclose(model.parameters[name], values, atol=2e-5)
+
+    def objective(fitted):
+        total = 0.0
+        for item in range(fitted.n_items):
+            start, _, item_objective, _ = reference._item_objective(
+                fitted, item, responses, posterior, quadrature.nodes
+            )
+            value = item_objective(start)
+            total += float(value[0] if isinstance(value, tuple) else value)
+        return total
+
+    assert objective(model) <= objective(expected) + 1e-7 * abs(objective(expected))
+
+
+@pytest.mark.parametrize("kind", ["1PL", "PCM"])
+def test_common_slope_step_applies_priors(kind, monkeypatch):
+    # Regression: priors made the 1PL and PCM skip the conditional common-slope
+    # step for one joint scipy optimization over every item.
+    from mirt.models.dichotomous import OneParameterLogistic
+    from mirt.models.polytomous import PartialCreditModel
+
+    if kind == "1PL":
+        responses = mirt.simdata("2PL", n_persons=500, n_items=6, seed=17)
+        location = "difficulty"
+
+        def factory():
+            return OneParameterLogistic(6, estimate_discrimination=True)
+
+    else:
+        responses = _graded_responses([3, 4, 4], seed=18, n_persons=500)
+        location = "steps"
+
+        def factory():
+            return PartialCreditModel(
+                3, n_categories=[3, 4, 4], estimate_discrimination=True
+            )
+
+    priors = {"discrimination": LogNormalPrior(0.0, 0.5), location: NormalPrior()}
+    options = dict(
+        tol=1e-10, max_iter=3000, compute_standard_errors=False, item_priors=priors
+    )
+    # The itemwise reference optimizes the tied items jointly.
+    joint = _ItemwiseEM(item_optim_ftol=1e-15, item_optim_maxiter=2000, **options).fit(
+        factory(), responses
+    )
+    common = []
+    step = EMEstimator._m_step_common_slope
+
+    def record(self, *args, **kwargs):
+        common.append(step(self, *args, **kwargs))
+        return common[-1]
+
+    monkeypatch.setattr(EMEstimator, "_m_step_common_slope", record)
+    fit = EMEstimator(**options).fit(factory(), responses)
+
+    assert common and all(common)
+    assert fit.converged and joint.converged
+    assert fit.log_posterior == pytest.approx(joint.log_posterior, abs=1e-6)
+    for name, values in joint.model.parameters.items():
+        np.testing.assert_allclose(fit.model.parameters[name], values, atol=1e-4)
 
 
 def test_threaded_and_constrained_m_steps_apply_priors():
@@ -313,10 +494,34 @@ def test_unknown_or_unsupported_prior_parameters_are_rejected(responses_2pl):
     estimator = EMEstimator(max_iter=2, item_priors={"guessing": BetaPrior()})
     with pytest.raises(MirtValidationError, match="not an item parameter"):
         estimator.fit(TwoParameterLogistic(8), responses_2pl)
-    narrow = EMEstimator(max_iter=2, item_priors={"guessing": UniformPrior(0.0, 0.3)})
     data = mirt.simdata("3PL", n_persons=100, n_items=4, seed=1)
+    nowhere = EMEstimator(max_iter=2, item_priors={"guessing": UniformPrior(0.6, 0.9)})
     with pytest.raises(MirtValidationError, match="positive density"):
-        narrow.fit(ThreeParameterLogistic(4), data)
+        nowhere.fit(ThreeParameterLogistic(4), data)
+
+
+def test_optimizer_boxes_are_intersected_with_the_prior_support():
+    data = mirt.simdata("3PL", n_persons=300, n_items=4, seed=1)
+    narrow = EMEstimator(
+        max_iter=20,
+        item_priors={"guessing": UniformPrior(0.0, 0.1)},
+        compute_standard_errors=False,
+    )
+    fit = narrow.fit(ThreeParameterLogistic(4), data)
+    guessing = fit.model.guessing
+    # The support caps the guessing box [0, 0.5] at 0.1. Its lower end 0 has
+    # positive density, and an estimate may rest there under a flat prior.
+    assert np.all((guessing >= 0.0) & (guessing < 0.1))
+    assert np.isfinite(fit.log_posterior)
+    # A log-normal slope prior removes the negative loadings of a
+    # multidimensional box.
+    responses = mirt.simdata("2PL", n_persons=300, n_items=6, n_factors=2, seed=3)
+    fitted = EMEstimator(
+        max_iter=5,
+        item_priors={"discrimination": LogNormalPrior(0.0, 0.5)},
+        compute_standard_errors=False,
+    ).fit(TwoParameterLogistic(6, n_factors=2), responses)
+    assert np.all(fitted.model.discrimination > 0.0)
 
 
 def test_empty_prior_mapping_is_plain_maximum_likelihood(responses_2pl):
@@ -397,6 +602,7 @@ _SE_PRIORS = {
 def _map_fit(responses, se_method):
     estimator = EMEstimator(
         n_quadpts=15,
+        quadrature="gauss-hermite",
         tol=1e-10,
         item_optim_ftol=1e-13,
         item_priors=_SE_PRIORS,
@@ -482,3 +688,56 @@ def test_prior_curvature_enters_crossprod_and_complete_data_errors():
             1.0 / np.sqrt(errors**-2.0 + curvature[name]),
             rtol=1e-6,
         )
+
+
+@pytest.mark.skipif(not mirt.is_rust_available(), reason="native backend unavailable")
+@pytest.mark.parametrize(
+    "priors",
+    [
+        {"guessing": BetaPrior(5.0, 17.0)},
+        {
+            "discrimination": LogNormalPrior(0.0, 0.5),
+            "difficulty": NormalPrior(0.0, 2.0),
+            "guessing": BetaPrior(2.0, 8.0),
+        },
+    ],
+)
+def test_native_3pl_iteration_reaches_the_numpy_posterior_mode(monkeypatch, priors):
+    # The fused native 3PL iteration used to refuse item priors, so these
+    # fits ran the slower batched NumPy step.
+    calls = []
+    native = em_module.em_iteration_3pl
+
+    def record(*args, **kwargs):
+        calls.append(kwargs["priors"])
+        return native(*args, **kwargs)
+
+    data = mirt.simdata("3PL", n_persons=1500, n_items=8, seed=12)
+    options = {"item_priors": priors, "tol": 1e-9, "max_iter": 2000}
+    expected = EMEstimator(use_rust=False, **options).fit(
+        ThreeParameterLogistic(8), data
+    )
+    monkeypatch.setattr(em_module, "em_iteration_3pl", record)
+    actual = EMEstimator(**options).fit(ThreeParameterLogistic(8), data)
+
+    assert calls and all(call is not None for call in calls)
+    assert actual.log_posterior == pytest.approx(expected.log_posterior, abs=1e-6)
+    assert actual.log_likelihood == pytest.approx(expected.log_likelihood, abs=1e-3)
+    for name, values in expected.model.parameters.items():
+        np.testing.assert_allclose(actual.model.parameters[name], values, atol=2e-3)
+    for name in expected.standard_errors:
+        np.testing.assert_allclose(
+            actual.standard_errors[name], expected.standard_errors[name], rtol=2e-2
+        )
+
+
+def test_unsupported_priors_keep_the_numpy_3pl_step(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the native iteration cannot apply a gamma prior")
+
+    monkeypatch.setattr(em_module, "em_iteration_3pl", forbidden)
+    data = mirt.simdata("3PL", n_persons=200, n_items=5, seed=8)
+    result = EMEstimator(
+        max_iter=3, item_priors={"discrimination": GammaPrior(2.0, 2.0)}
+    ).fit(ThreeParameterLogistic(5), data)
+    assert np.isfinite(result.log_posterior)

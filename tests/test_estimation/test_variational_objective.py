@@ -278,3 +278,98 @@ def test_complete_fits_agree_with_scalar_objective(
             rtol=tolerance,
             atol=tolerance,
         )
+
+
+def _posterior_proposals(responses, loadings, intercepts, prior_mean, prior_cov):
+    from mirt.estimation._variational import variational_e_step
+
+    mu, sigma, _ = variational_e_step(
+        responses,
+        loadings,
+        intercepts,
+        prior_mean,
+        np.linalg.inv(prior_cov),
+        np.ones(responses.shape),
+        20,
+    )
+    return mu, sigma
+
+
+def _brute_force_marginal(responses, loadings, intercepts, prior_mean, prior_cov):
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.utils.numeric import logsumexp
+
+    quadrature = GaussHermiteQuadrature(
+        n_points=41, n_dimensions=loadings.shape[1], mean=prior_mean, cov=prior_cov
+    )
+    logits = quadrature.nodes @ loadings.T + intercepts
+    joint = (responses == 1) @ -np.logaddexp(0.0, -logits).T + (
+        responses == 0
+    ) @ -np.logaddexp(0.0, logits).T
+    return float(np.sum(logsumexp(joint + np.log(quadrature.weights), axis=1)))
+
+
+@pytest.mark.parametrize("n_factors", [1, 2])
+def test_marginal_log_likelihood_rules_match_brute_force_quadrature(n_factors):
+    responses, loadings, intercepts, _, _, _, prior_mean, prior_cov = _state(
+        300, 7, n_factors
+    )
+    responses[::5, 2] = -1
+    mu, sigma = _posterior_proposals(
+        responses, loadings, intercepts, prior_mean, prior_cov
+    )
+    expected = _brute_force_marginal(
+        responses, loadings, intercepts, prior_mean, prior_cov
+    )
+
+    quadrature, rule = objective.affine_marginal_log_likelihood(
+        responses, loadings, intercepts, prior_mean, prior_cov
+    )
+    sampled, sampled_rule = objective.affine_marginal_log_likelihood(
+        responses,
+        loadings,
+        intercepts,
+        prior_mean,
+        prior_cov,
+        mu=mu,
+        sigma=sigma,
+        method="importance",
+    )
+    repeated, _ = objective.affine_marginal_log_likelihood(
+        responses,
+        loadings,
+        intercepts,
+        prior_mean,
+        prior_cov,
+        mu=mu,
+        sigma=sigma,
+        method="importance",
+    )
+
+    assert (rule, sampled_rule) == ("quadrature", "importance")
+    assert quadrature == pytest.approx(expected, abs=1e-3)
+    assert sampled == pytest.approx(expected, abs=1.0)
+    assert repeated == sampled
+
+
+def test_marginal_log_likelihood_samples_beyond_three_factors():
+    responses, loadings, intercepts, _, _, _, prior_mean, prior_cov = _state(40, 6, 4)
+    mu, sigma = _posterior_proposals(
+        responses, loadings, intercepts, prior_mean, prior_cov
+    )
+
+    value, rule = objective.affine_marginal_log_likelihood(
+        responses, loadings, intercepts, prior_mean, prior_cov, mu=mu, sigma=sigma
+    )
+    prior_only, _ = objective.affine_marginal_log_likelihood(
+        responses,
+        loadings,
+        intercepts,
+        prior_mean,
+        prior_cov,
+        method="importance",
+        n_draws=20_000,
+    )
+
+    assert rule == "importance"
+    assert value == pytest.approx(prior_only, abs=0.5)

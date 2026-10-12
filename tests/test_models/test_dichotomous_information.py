@@ -130,22 +130,86 @@ def test_five_parameter_information_is_four_parameter_limit() -> None:
     assert_allclose(five.information(theta), four.information(theta))
 
 
-def test_unipolar_information_is_zero_at_curve_peak() -> None:
+def test_unipolar_information_peaks_at_the_item_location() -> None:
     model = UnipolarLogLogistic(2).set_parameters(
         discrimination=np.array([0.8, 1.5]),
         difficulty=np.array([-0.5, 1.0]),
     )
+    theta = np.linspace(-4.0, 4.0, 801)
 
-    probability = model.probability(model.difficulty)
-    information = np.array(
+    information = model.information(theta)
+    at_location = np.array(
         [
             model.information(np.array([difficulty]), item_idx=item_idx)[0]
             for item_idx, difficulty in enumerate(model.difficulty)
         ]
     )
 
-    assert_allclose(np.diag(probability), np.full(2, 0.25))
-    assert_allclose(information, np.zeros(2), atol=1e-15)
+    assert_allclose(np.diag(model.probability(model.difficulty)), np.full(2, 0.5))
+    assert_allclose(at_location, model.discrimination**2 / 4.0, rtol=1e-15)
+    assert np.all(information <= at_location + 1e-15)
+
+
+class _TwoFactorThreePL(ThreeParameterLogistic):
+    supports_multidimensional = True
+
+    def _initialize_parameters(self) -> None:
+        super()._initialize_parameters()
+        self._parameters["discrimination"] = np.ones((self.n_items, self.n_factors))
+
+
+class _TwoFactorFourPL(FourParameterLogistic):
+    supports_multidimensional = True
+
+    def _initialize_parameters(self) -> None:
+        super()._initialize_parameters()
+        self._parameters["discrimination"] = np.ones((self.n_items, self.n_factors))
+
+
+@pytest.mark.parametrize("model_class", [_TwoFactorThreePL, _TwoFactorFourPL])
+def test_multifactor_asymptote_information_keeps_the_slope_norm(
+    model_class: type,
+) -> None:
+    """The shared kernel scaled by the largest slope only, halving [2, 2]."""
+    model = model_class(3, n_factors=2).set_parameters(
+        discrimination=np.array([[1.2, 0.5], [0.3, 1.8], [2.0, 2.0]]),
+        difficulty=np.array([-0.5, 0.2, 1.0]),
+        guessing=np.array([0.2, 0.15, 0.25]),
+    )
+    if model_class is _TwoFactorFourPL:
+        model.set_parameters(upper=np.array([0.9, 0.95, 0.85]))
+    theta = np.array([[0.3, -0.2], [1.5, 1.0], [-1.0, 2.0], [2.0, -1.5]])
+    step = 1e-6
+
+    probability = model.probability(theta)
+    gradient = np.stack(
+        [
+            (model.probability(theta + offset) - model.probability(theta - offset))
+            / (2.0 * step)
+            for offset in np.eye(2) * step
+        ],
+        axis=-1,
+    )
+    numerical = np.sum(gradient**2, axis=-1) / (probability * (1.0 - probability))
+
+    assert_allclose(model.information(theta), numerical, rtol=1e-6)
+    for item_idx in range(3):
+        assert_allclose(
+            model.information(theta, item_idx), model.information(theta)[:, item_idx]
+        )
+
+
+def test_multifactor_guessing_information_tail_keeps_the_slope_norm() -> None:
+    model = _TwoFactorThreePL(1, n_factors=2).set_parameters(
+        discrimination=np.array([[2.0, 2.0]]),
+        difficulty=np.array([1.0]),
+        guessing=np.array([0.25]),
+    )
+    # The logit is 700, where the squared derivative underflows and the
+    # log-space branch takes over: I = |a|^2 (1 - c) exp(-700).
+    information = model.information(np.array([[176.0, 176.0]]), 0)
+
+    assert_allclose(information, 8.0 * 0.75 * np.exp(-700.0), rtol=1e-12)
 
 
 @pytest.mark.parametrize("model", [ComplementaryLogLog(2), NegativeLogLog(2)])

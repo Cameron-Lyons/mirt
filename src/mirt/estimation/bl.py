@@ -22,11 +22,27 @@ from scipy.optimize import minimize
 
 from mirt.estimation._bl_objective import prepare_bl_objective
 from mirt.estimation._em_context import EMFitContext
-from mirt.estimation.base import BaseEstimator, _initialize_free_parameters
-from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.base import (
+    BaseEstimator,
+    _family_tied_parameters,
+    _initialize_free_parameters,
+    _logistic_bounds,
+)
+from mirt.estimation.quadrature import (
+    GaussHermiteQuadrature,
+    QuadratureRule,
+    RectangularQuadrature,
+    build_quadrature,
+    resolve_quadpts,
+    validate_quadpts,
+    validate_quadrature_rule,
+)
+from mirt.exceptions import MirtModelError, MirtValidationError
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
+    from mirt.estimation._bl_objective import PreparedBLObjective
+    from mirt.estimation._louis_information import LouisInformation
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
@@ -34,6 +50,22 @@ if TYPE_CHECKING:
 # tolerates a smaller step than second differences of the likelihood.
 _GRADIENT_STEP = 1e-5
 _LIKELIHOOD_STEP = 1e-4
+# scipy.optimize.minimize methods that cannot enforce the parameter boxes,
+# and those that BL gives analytic marginal gradients.
+_UNBOUNDED_METHODS = (
+    "bfgs",
+    "cg",
+    "newton-cg",
+    "dogleg",
+    "trust-ncg",
+    "trust-krylov",
+    "trust-exact",
+)
+_GRADIENT_METHODS = ("l-bfgs-b", "tnc", "slsqp")
+# Projected Newton steps on the exact information that may finish a
+# quasi-Newton solution, and the step halvings each may take.
+_NEWTON_STEPS = 20
+_NEWTON_HALVINGS = 20
 # Optimizer boxes by stored parameter name; other parameters get (-10, 10).
 _BL_BOUNDS = {
     "discrimination": (0.1, 5.0),
@@ -57,19 +89,36 @@ class BLEstimator(BaseEstimator):
 
     Parameters
     ----------
-    n_quadpts : int
-        Number of quadrature points for numerical integration.
+    n_quadpts : int, optional
+        Quadrature points per latent dimension, at least 5. The default
+        depends on the number of factors, as for
+        :class:`~mirt.estimation.em.EMEstimator`.
     max_iter : int
-        Maximum number of optimization iterations.
-    tol : float
-        Convergence tolerance for optimizer.
+        Maximum number of optimization iterations (function evaluations
+        for TNC).
+    tol : float, default=1e-6
+        Convergence tolerance in marginal log-likelihood units, as for
+        :class:`~mirt.estimation.em.EMEstimator`: the optimizer stops once
+        an iteration improves the log-likelihood by less than ``tol``.
+        L-BFGS-B and Powell compare relative changes, so their tolerance
+        is ``tol`` divided by the starting objective. With analytic
+        gradients and the exact information (see Notes), projected Newton
+        steps then finish the solution, and ``FitResult.converged`` reports
+        whether the log-likelihood gain predicted for a further Newton
+        step, ``g' H^-1 g / 2`` over the coordinates off their bounds, is
+        at most ``tol``. Otherwise it reports the optimizer's success.
     verbose : bool
         Print optimization progress.
-    method : str
-        Optimization method for scipy.optimize.minimize.
+    method : str, default="L-BFGS-B"
+        Bounded optimization method of :func:`scipy.optimize.minimize`.
         Built-in 1PL–4PL, GRM, GPCM, PCM, NRM, MIRT, and bifactor models
-        use analytic marginal gradients with L-BFGS-B, BFGS, CG, TNC, or
-        SLSQP. Custom models and likelihoods retain numerical optimization.
+        use analytic marginal gradients with L-BFGS-B, TNC, or SLSQP.
+        Custom models and likelihoods, and the derivative-free bounded
+        methods such as Powell, retain numerical optimization. Methods that
+        cannot enforce the parameter boxes, such as BFGS and CG, raise
+        ``MirtValidationError``.
+    quadrature : {"auto", "rectangular", "gauss-hermite"}, default="auto"
+        Quadrature rule, as for :class:`~mirt.estimation.em.EMEstimator`.
 
     Notes
     -----
@@ -77,10 +126,10 @@ class BLEstimator(BaseEstimator):
     Built-in item models whose likelihood is a product of item curves
     (1PL-4PL, GRM, GPCM, PCM, NRM, RSM, GRSM, multidimensional, bifactor and
     the other built-in families such as 5PL, log-log, nested-logit,
-    sequential, unfolding and zero-inflated models) compute it exactly by
-    Louis's identity, which differences at most each item's own curve.
-    Other models with analytic gradients difference the gradient, and the
-    remaining models, such as custom ones, difference the likelihood over
+    sequential, unfolding and zero-inflated models), and custom item models,
+    compute it exactly by Louis's identity, which differences at most each
+    item's own curve. Other models with analytic gradients difference the
+    gradient, and the remaining models difference the likelihood over
     every pair of parameters, which takes 2P^2 + 1 likelihood evaluations
     for P parameters. Coordinates on an optimizer bound are held fixed and
     receive ``NaN`` standard errors. The covariance is stored in
@@ -99,20 +148,32 @@ class BLEstimator(BaseEstimator):
 
     def __init__(
         self,
-        n_quadpts: int = 21,
+        n_quadpts: int | None = None,
         max_iter: int = 1000,
         tol: float = 1e-6,
         verbose: bool = False,
         method: str = "L-BFGS-B",
+        quadrature: QuadratureRule = "auto",
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
-        if n_quadpts < 5:
-            raise ValueError("n_quadpts must be at least 5")
-
-        self.n_quadpts = n_quadpts
+        self.n_quadpts = None if n_quadpts is None else validate_quadpts(n_quadpts)
+        self.quadrature = validate_quadrature_rule(quadrature)
+        if isinstance(method, str) and method.lower() in _UNBOUNDED_METHODS:
+            # Every coordinate has a box, which these methods would ignore.
+            raise MirtValidationError(
+                f"method={method!r} cannot enforce the parameter bounds of "
+                "BLEstimator; use 'L-BFGS-B', 'TNC' or 'SLSQP'",
+                parameter="method",
+                value=method,
+                expected="'L-BFGS-B', 'TNC', 'SLSQP' or another bounded method",
+            )
         self.method = method
-        self._quadrature: GaussHermiteQuadrature | None = None
+        self._quadrature: GaussHermiteQuadrature | RectangularQuadrature | None = None
+        # The exact information at the latest point that needed it.
+        self._information_cache: (
+            tuple[NDArray[np.int_], NDArray[np.float64], LouisInformation] | None
+        ) = None
 
     def fit(
         self,
@@ -133,7 +194,7 @@ class BLEstimator(BaseEstimator):
         FitResult
             Fitted model with parameter estimates and standard errors.
         """
-        responses = self._validate_responses(responses, model.n_items)
+        responses = self._validate_responses(responses, model.n_items, model)
         with EMFitContext(responses) as context:
             return self._fit_prepared(model, responses, context)
 
@@ -147,20 +208,31 @@ class BLEstimator(BaseEstimator):
 
         n_persons = responses.shape[0]
 
-        self._quadrature = GaussHermiteQuadrature(
-            n_points=self.n_quadpts,
-            n_dimensions=model.n_factors,
+        tied = _family_tied_parameters(model)
+        if tied:
+            # The joint vector would give every item its own value.
+            raise MirtModelError(
+                f"BLEstimator cannot estimate {', '.join(tied)}, which "
+                f"{model.model_name} keeps equal across items; use EMEstimator, "
+                "or hold it fixed with set_free_parameter_masks",
+                model_type=model.model_name,
+            )
+        self._quadrature = build_quadrature(
+            resolve_quadpts(self.n_quadpts, model.n_factors),
+            model.n_factors,
+            self.quadrature,
         )
 
         if not model._is_fitted:
             _initialize_free_parameters(model)
 
         initial_params, bounds, param_structure = self._flatten_parameters(model)
+        self._information_cache = None
         prepared = None
         if (
             type(self) is BLEstimator
             and isinstance(self.method, str)
-            and self.method.lower() in ("l-bfgs-b", "bfgs", "cg", "tnc", "slsqp")
+            and self.method.lower() in _GRADIENT_METHODS
             and not any(
                 name in vars(self)
                 for name in (
@@ -193,13 +265,18 @@ class BLEstimator(BaseEstimator):
 
         if initial_params.size:
             try:
+                start_value = (
+                    neg_log_likelihood(initial_params)
+                    if prepared is None
+                    else prepared.value(initial_params)
+                )
                 result = minimize(
                     neg_log_likelihood if prepared is None else prepared,
                     x0=initial_params,
                     jac=prepared is not None,
                     method=self.method,
                     bounds=bounds,
-                    options={"maxiter": self.max_iter, "ftol": self.tol},
+                    options=self._optimizer_options(start_value),
                     callback=callback,
                 )
             except BaseException:
@@ -213,12 +290,23 @@ class BLEstimator(BaseEstimator):
                 success=True,
             )
 
-        self._unflatten_parameters(model, result.x, param_structure)
+        params, value = np.asarray(result.x, dtype=np.float64), float(result.fun)
+        n_iterations = result.nit if hasattr(result, "nit") else 0
+        converged = bool(result.success)
+        # Newton steps finish a solution the optimizer accepted; they do not
+        # extend a run that ``max_iter`` cut short.
+        if converged and prepared is not None and params.size:
+            finished = self._finish_with_newton(
+                model, responses, prepared, params, bounds, param_structure
+            )
+            if finished is not None:
+                params, value, converged, n_steps = finished
+                n_iterations += n_steps
+
+        self._unflatten_parameters(model, params, param_structure)
         model._is_fitted = True
 
-        final_ll = -result.fun
-        n_iterations = result.nit if hasattr(result, "nit") else 0
-        converged = result.success
+        final_ll = -value
 
         covariance = None
         if (
@@ -227,13 +315,13 @@ class BLEstimator(BaseEstimator):
             is not BLEstimator._compute_standard_errors
         ):
             se = self._compute_standard_errors(
-                model, responses, result.x, param_structure
+                model, responses, params, param_structure
             )
         else:
             covariance = self._parameter_covariance(
                 model,
                 responses,
-                result.x,
+                params,
                 param_structure,
                 gradient=prepared,
                 bounds=bounds,
@@ -242,7 +330,10 @@ class BLEstimator(BaseEstimator):
             if not _uses_free_layout(model, param_structure):
                 covariance = None
 
-        n_params = len(result.x)
+        n_params = len(params)
+        if _uses_free_layout(model, param_structure):
+            # Leaves out the rotational indeterminacy of exploratory factors.
+            n_params = model.n_parameters
         aic = -2 * final_ll + 2 * n_params
         bic = -2 * final_ll + np.log(n_persons) * n_params
 
@@ -343,14 +434,104 @@ class BLEstimator(BaseEstimator):
                 name, values.reshape(info["shape"])
             )
 
-    def _exact_information(
+    def _optimizer_options(self, start_value: float) -> dict[str, float]:
+        """Return optimizer options whose tolerance is ``tol`` in LL units.
+
+        L-BFGS-B, the default with bounds, and Powell stop on the relative
+        change of the objective, so their tolerance is scaled by the
+        starting objective ``start_value``; TNC and SLSQP stop on its
+        absolute change, and Nelder-Mead on its absolute spread.
+        """
+        method = self.method.lower() if isinstance(self.method, str) else None
+        relative = self.tol / max(1.0, abs(float(start_value)))
+        if self.method is None or method in ("l-bfgs-b", "powell"):
+            return {"maxiter": self.max_iter, "ftol": relative}
+        if method == "tnc":
+            return {"maxfun": self.max_iter, "ftol": self.tol}
+        if method == "slsqp":
+            return {"maxiter": self.max_iter, "ftol": self.tol}
+        if method == "nelder-mead":
+            return {"maxiter": self.max_iter, "fatol": self.tol}
+        if method is None:
+            # A custom minimizer receives the historical options.
+            return {"maxiter": self.max_iter, "ftol": self.tol}
+        return {"maxiter": self.max_iter}
+
+    def _finish_with_newton(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        objective: PreparedBLObjective,
+        params: NDArray[np.float64],
+        bounds: list[tuple[float, float]],
+        structure: dict,
+    ) -> tuple[NDArray[np.float64], float, bool, int] | None:
+        """Finish an optimizer solution by projected Newton steps.
+
+        Quasi-Newton methods progress slowly along flat directions, such as
+        the guessing parameters of a 3PL, and can stop well short of the
+        optimum. The exact observed information ``H`` and the analytic
+        gradient ``g`` of the negative log-likelihood give Newton steps on
+        the coordinates off their bounds; a coordinate on a bound whose
+        gradient points out of the box is held. Steps are halved until the
+        objective decreases, and stop once the predicted gain
+        ``g' H^-1 g / 2`` is at most ``tol``.
+
+        Returns the point, its objective, whether the predicted gain fell
+        to ``tol``, and the number of steps taken, or None without the exact
+        information.
+        """
+        from scipy.linalg import LinAlgError, cho_factor, cho_solve
+
+        from mirt.estimation.standard_errors import _BOUND_TOLERANCE
+
+        limits = np.asarray(bounds, dtype=np.float64).reshape(-1, 2)
+        value, gradient = objective(params)
+        for n_steps in range(_NEWTON_STEPS + 1):
+            terms = self._exact_terms(model, responses, params, structure)
+            if terms is None:
+                return None
+            held = ((params <= limits[:, 0] + _BOUND_TOLERANCE) & (gradient > 0.0)) | (
+                (params >= limits[:, 1] - _BOUND_TOLERANCE) & (gradient < 0.0)
+            )
+            free = ~held
+            try:
+                factor = cho_factor(terms.information[np.ix_(free, free)])
+            except LinAlgError:
+                # Not a local maximum on the free coordinates.
+                return params, value, False, n_steps
+            step = cho_solve(factor, -gradient[free])
+            if -0.5 * float(gradient[free] @ step) <= self.tol:
+                return params, value, True, n_steps
+            if n_steps == _NEWTON_STEPS:
+                break
+            scale = 1.0
+            for _ in range(_NEWTON_HALVINGS):
+                trial = params.copy()
+                trial[free] += scale * step
+                trial = np.clip(trial, limits[:, 0], limits[:, 1])
+                trial_value, trial_gradient = objective(trial)
+                if trial_value < value:
+                    break
+                scale *= 0.5
+            else:
+                return params, value, False, n_steps
+            params, value, gradient = trial, trial_value, trial_gradient
+        return params, value, False, _NEWTON_STEPS
+
+    def _exact_terms(
         self,
         model: BaseItemModel,
         responses: NDArray[np.int_],
         params: NDArray[np.float64],
         structure: dict,
-    ) -> NDArray[np.float64] | None:
-        """Louis observed information, when it describes the BL objective."""
+    ) -> LouisInformation | None:
+        """Louis information and score, when they describe the BL objective.
+
+        The model is left at ``params``. The latest terms are cached, so the
+        standard errors at a point that :meth:`_finish_with_newton` checked
+        reuse its information.
+        """
         from mirt.estimation._louis_information import (
             louis_information,
             supports_louis_information,
@@ -373,11 +554,35 @@ class BLEstimator(BaseEstimator):
         ):
             return None
         self._unflatten_parameters(model, params, structure)
+        cached = self._information_cache
+        if (
+            cached is not None
+            and cached[0] is responses
+            and np.array_equal(cached[1], params)
+        ):
+            return cached[2]
         _, layouts = _flatten_parameters(model)
         weights = self._quadrature.weights
-        return louis_information(
+        terms = louis_information(
             model, responses, self._quadrature.nodes, weights / weights.sum(), layouts
-        ).information
+        )
+        self._information_cache = (
+            responses,
+            np.array(params, dtype=np.float64),
+            terms,
+        )
+        return terms
+
+    def _exact_information(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        params: NDArray[np.float64],
+        structure: dict,
+    ) -> NDArray[np.float64] | None:
+        """Louis observed information, when it describes the BL objective."""
+        terms = self._exact_terms(model, responses, params, structure)
+        return None if terms is None else terms.information
 
     def _marginal_hessian(
         self,
@@ -532,6 +737,10 @@ def _bl_parameter_bounds(model: BaseItemModel, name: str) -> tuple[float, float]
         return _bl_parameter_bounds(model.component_models[component], local)
     if name == "slopes" and model.model_name == "NRM":
         return (-5.0, 5.0)
+    # Logistic slopes and locations have EM's wide boxes.
+    logistic = _logistic_bounds(model, name)
+    if logistic is not None:
+        return logistic
     return _BL_BOUNDS.get(name, (-10.0, 10.0))
 
 

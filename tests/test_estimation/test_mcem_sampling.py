@@ -10,8 +10,9 @@ import pytest
 
 import mirt.estimation.mcem as mcem_module
 from mirt.estimation.mcem import MCEMEstimator, QMCEMEstimator, StochasticEMEstimator
+from mirt.exceptions import MirtModelError
 from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
-from mirt.models.polytomous import GradedResponseModel
+from mirt.models.polytomous import GradedResponseModel, PartialCreditModel
 from mirt.utils.numeric import logsumexp
 
 
@@ -43,7 +44,49 @@ def test_stochastic_em_documented_default_is_usable():
 
     assert estimator.n_chains == 5
     assert estimator.n_samples == 5
+    assert estimator.burnin == 100
+    assert estimator.tol == 0.01
     assert not estimator.importance_sampling
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5])
+def test_stochastic_em_rejects_invalid_burnin(value):
+    with pytest.raises(ValueError, match="burnin must be an integer"):
+        StochasticEMEstimator(burnin=value)
+
+
+_MC_FACTORIES = (
+    lambda: MCEMEstimator(n_samples=50, max_iter=2, seed=1),
+    lambda: QMCEMEstimator(n_samples=50, max_iter=2, seed=1),
+    lambda: StochasticEMEstimator(max_iter=2, seed=1),
+)
+_MC_IDS = ("mcem", "qmcem", "stochastic")
+
+
+@pytest.mark.parametrize("factory", _MC_FACTORIES, ids=_MC_IDS)
+@pytest.mark.parametrize(
+    "model",
+    [
+        lambda: OneParameterLogistic(4, estimate_discrimination=True),
+        lambda: PartialCreditModel(4, n_categories=2, estimate_discrimination=True),
+    ],
+    ids=["1pl", "pcm"],
+)
+def test_common_estimated_slope_is_rejected(factory, model):
+    # Itemwise M-steps would give every item its own slope.
+    responses = np.random.default_rng(16).integers(0, 2, (40, 4))
+    with pytest.raises(MirtModelError, match="keeps equal across items"):
+        factory().fit(model(), responses)
+
+
+@pytest.mark.parametrize("factory", _MC_FACTORIES, ids=_MC_IDS)
+def test_unit_slope_rasch_model_still_fits(factory):
+    responses = np.random.default_rng(16).integers(0, 2, (40, 4))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        result = factory().fit(OneParameterLogistic(4), responses)
+    np.testing.assert_array_equal(result.model.parameters["discrimination"], 1.0)
+    assert np.all(np.isfinite(result.model.parameters["difficulty"]))
 
 
 @pytest.mark.parametrize(
@@ -420,4 +463,6 @@ def test_monte_carlo_estimators_complete_small_fit(estimator):
     assert np.isfinite(result.log_likelihood)
     assert np.isfinite(result.aic)
     assert np.isfinite(result.bic)
-    assert len(estimator.convergence_history) == 2
+    # MCEM and QMCEM re-estimate the likelihood on the last draws at max_iter.
+    stochastic = isinstance(estimator, StochasticEMEstimator)
+    assert len(estimator.convergence_history) == (1 if stochastic else 2)

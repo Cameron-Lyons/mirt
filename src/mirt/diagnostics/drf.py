@@ -28,7 +28,8 @@ from mirt.diagnostics._utils import (
     summarize_bootstrap,
     validate_two_group_inputs,
 )
-from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
+from mirt.utils._parallel import resolve_n_jobs
+from mirt.utils.bootstrap import _run_bootstrap_tasks
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -75,6 +76,11 @@ def compute_drf(
     calibrated separately, then the focal calibration is linked onto the
     reference scale (Stocking-Lord) before the information curves are
     compared, so a difference in group ability does not shift the curves.
+
+    This is differential *information* functioning. R's ``mirt::DRF``
+    instead compares expected scores (sDRF, uDRF and dDRF); its test-level
+    statistics correspond to :func:`mirt.compute_dtf` and its item-level
+    ``DIF=TRUE`` statistics to that function's ``item_dif`` result.
 
     Parameters
     ----------
@@ -132,7 +138,7 @@ def compute_drf(
     linked_focal, A, B = link_focal_to_reference(
         ref_result.model, focal_result.model, anchors
     )
-    theta_grid, _ = create_theta_grid(theta_limits, n_points)
+    theta_grid = create_theta_grid(theta_limits, n_points)
 
     info_ref = _compute_test_information(ref_result.model, theta_grid)
     info_focal = _compute_test_information(linked_focal, theta_grid)
@@ -323,7 +329,10 @@ def compute_item_drf(
     """Compute DRF for each item individually.
 
     Item information curves are compared after linking the focal
-    calibration onto the reference scale, as in :func:`compute_drf`.
+    calibration onto the reference scale, as in :func:`compute_drf`. For
+    item-level expected-score differences (sDIF, uDIF and dDIF of R's
+    ``mirt::DRF(..., DIF=TRUE)``), use the ``item_dif`` result of
+    :func:`mirt.compute_dtf`.
 
     Parameters
     ----------
@@ -371,7 +380,7 @@ def compute_item_drf(
     linked_focal, A, B = link_focal_to_reference(
         ref_result.model, focal_result.model, anchors
     )
-    theta_grid, _ = create_theta_grid(theta_limits, n_points)
+    theta_grid = create_theta_grid(theta_limits, n_points)
 
     info_ref_all = _compute_item_information(ref_result.model, theta_grid)
     info_focal_all = _compute_item_information(linked_focal, theta_grid)
@@ -490,7 +499,7 @@ def _bootstrap_reliability_differences(
         return BootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
 
     rng = np.random.default_rng(seed)
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
     tasks = [
         _ReliabilityBootstrapTask(
             ref_data=ref_data,
@@ -627,7 +636,7 @@ def reliability_invariance(
         raise ValueError("n_bootstrap must be a nonnegative integer")
     if not np.isfinite(confidence_level) or not 0.0 < confidence_level < 1.0:
         raise ValueError("confidence_level must be finite and in (0, 1)")
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
 
     ref_data, focal_data, _, _, ref_group, selected_focal = split_groups(
         values, labels, focal_group=focal_group

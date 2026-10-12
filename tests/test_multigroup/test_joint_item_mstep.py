@@ -13,8 +13,12 @@ from mirt.models.dichotomous import (
     ThreeParameterLogistic,
     TwoParameterLogistic,
 )
-from mirt.models.polytomous import GradedResponseModel
-from mirt.multigroup import _prepare_multigroup
+from mirt.models.polytomous import (
+    GeneralizedPartialCredit,
+    GradedResponseModel,
+    NominalResponseModel,
+)
+from mirt.multigroup import InvarianceSpec, _prepare_multigroup
 from mirt.multigroup.estimator import MultigroupEMEstimator
 from mirt.multigroup.model import MultigroupModel
 
@@ -98,7 +102,7 @@ def _simulate(model: str, n_items: int, n_persons: int, seed: int):
 
 
 def _fit(estimator_class, model, invariance, data, groups, **kwargs):
-    mg_model, responses, reference = _prepare_multigroup(
+    mg_model, responses, reference, _ = _prepare_multigroup(
         data, groups, model, n_categories=None, reference_group=0, item_names=None
     )
     result = estimator_class(n_quadpts=15, **kwargs).fit(
@@ -358,7 +362,7 @@ def test_groups_with_custom_curves_are_not_pooled_into_the_builtin_kernel():
 @pytest.mark.parametrize("invariance", ["configural", "metric", "scalar"])
 def test_fixed_and_structural_coordinates_stay_bitwise_unchanged(invariance):
     data, groups = _simulate("3PL", n_items=4, n_persons=150, seed=7)
-    mg_model, responses, reference = _prepare_multigroup(
+    mg_model, responses, reference, _ = _prepare_multigroup(
         data, groups, "3PL", n_categories=None, reference_group=0, item_names=None
     )
     fixed = {
@@ -410,7 +414,7 @@ def test_unadministered_item_keeps_its_group_specific_parameters():
     )
 
 
-def test_custom_and_polytomous_items_use_the_per_parameter_path(monkeypatch):
+def test_custom_and_restricted_items_use_the_per_parameter_path(monkeypatch):
     calls = []
     original = MultigroupEMEstimator._optimize_parameter_block
 
@@ -439,4 +443,121 @@ def test_custom_and_polytomous_items_use_the_per_parameter_path(monkeypatch):
     MultigroupEMEstimator()._optimize_item(
         MultigroupModel(GradedResponseModel(1, 3), 2), 0, graded, posterior, NODES
     )
-    assert set(calls) == {"discrimination", "thresholds"}
+    assert calls == []
+
+    # Restricted coordinates are constants of the joint polytomous solve.
+    restricted_graded = GradedResponseModel(1, 3)
+    restricted_graded.set_free_parameter_masks({"discrimination": np.array([False])})
+    model = MultigroupModel(restricted_graded, 2)
+    MultigroupEMEstimator()._optimize_item(model, 0, graded, posterior, NODES)
+    assert calls == []
+    for group in model.group_models:
+        assert group.parameters["discrimination"][0] == 1.0
+        assert np.all(group.parameters["thresholds"][0] != [-2.0, 2.0])
+
+
+def _polytomous_item(rng, shift, n_categories=4, n_persons=400):
+    """Graded responses to one item and posteriors centred on the abilities."""
+    theta = rng.normal(shift, 1.0, n_persons)
+    cuts = np.linspace(-1.0, 1.0, n_categories - 1)
+    responses = 1.3 * (theta[:, None] - cuts) > rng.logistic(size=(n_persons, 1))
+    responses = responses.sum(axis=1)[:, None]
+    log_weights = -((NODES[:, 0] - theta[:, None]) ** 2)
+    posterior = np.exp(log_weights - log_weights.max(axis=1, keepdims=True))
+    return responses, posterior / posterior.sum(axis=1, keepdims=True)
+
+
+@pytest.mark.parametrize("invariance", ["configural", "metric", "scalar"])
+@pytest.mark.parametrize(
+    "model_class",
+    [GradedResponseModel, GeneralizedPartialCredit, NominalResponseModel],
+)
+def test_polytomous_item_update_is_the_joint_expected_likelihood_maximum(
+    model_class, invariance
+):
+    # One sweep over parameter names, the previous M-step, stops short of the
+    # joint optimum of an item's expected log-likelihood.
+    rng = np.random.default_rng(23)
+    data = [_polytomous_item(rng, shift) for shift in (-0.3, 0.5)]
+    responses = [block[0] for block in data]
+    posterior = [block[1] for block in data]
+    model = MultigroupModel(model_class(1, 4), 2)
+    InvarianceSpec(invariance).apply_to_model(model)
+    masks = model.get_group_model(0).free_parameter_masks
+    variables = [
+        (name, coordinate, None if model.is_parameter_shared(name) else g)
+        for name in model.parameter_names
+        for coordinate in np.flatnonzero(masks[name][0].ravel())
+        for g in ((None,) if model.is_parameter_shared(name) else (0, 1))
+    ]
+
+    def group_rows(params, g):
+        rows = {
+            name: np.ravel(model.get_group_model(g).parameters[name][0]).copy()
+            for name in model.parameter_names
+        }
+        for value, (name, coordinate, owner) in zip(params, variables, strict=True):
+            if owner in (None, g):
+                rows[name][coordinate] = value
+        return rows
+
+    def loss(params):
+        total = 0.0
+        for g in (0, 1):
+            single = model_class(1, 4)
+            rows = group_rows(params, g)
+            single.set_parameters(
+                **{
+                    name: row.reshape(single.parameters[name].shape)
+                    for name, row in rows.items()
+                }
+            )
+            probabilities = single.probability(NODES, 0)
+            counts = posterior[g].T @ (responses[g] == np.arange(4))
+            total -= float(np.sum(counts * np.log(probabilities)))
+        return total
+
+    def current():
+        return np.array(
+            [
+                np.ravel(model.get_group_model(owner or 0).parameters[name][0])[
+                    coordinate
+                ]
+                for name, coordinate, owner in variables
+            ]
+        )
+
+    oracle = minimize(
+        loss,
+        x0=current(),
+        method="L-BFGS-B",
+        options={"ftol": 1e-15, "gtol": 1e-8, "maxiter": 5000},
+    )
+    MultigroupEMEstimator(item_optim_ftol=1e-15, item_optim_maxiter=500)._optimize_item(
+        model, 0, responses, posterior, NODES
+    )
+    for name in model.parameter_names:
+        if model.is_parameter_shared(name):
+            first, second = (group.parameters[name][0] for group in model.group_models)
+            np.testing.assert_array_equal(first, second)
+    assert loss(current()) == pytest.approx(oracle.fun, abs=1e-6)
+    np.testing.assert_allclose(current(), oracle.x, atol=2e-3)
+
+
+def test_graded_thresholds_stay_ordered_when_the_free_optimum_crosses():
+    # Group 1 never uses the middle category, so its free optimum puts the
+    # two inner thresholds in reverse order.
+    rng = np.random.default_rng(5)
+    data = [_polytomous_item(rng, shift) for shift in (0.0, 0.2)]
+    responses = [block[0] for block in data]
+    posterior = [block[1] for block in data]
+    responses[1] = np.where(responses[1] == 2, 3, responses[1])
+    model = MultigroupModel(GradedResponseModel(1, 4), 2)
+    model.set_shared_parameter("discrimination")
+    MultigroupEMEstimator(item_optim_maxiter=500)._optimize_item(
+        model, 0, responses, posterior, NODES
+    )
+    for group in model.group_models:
+        assert np.all(np.diff(group.parameters["thresholds"][0]) > 0.0)
+    gap = np.diff(model.get_group_model(1).parameters["thresholds"][0])[1]
+    assert gap == pytest.approx(1e-6, abs=1e-7)

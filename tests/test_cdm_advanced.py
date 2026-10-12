@@ -1,14 +1,63 @@
 """Tests for Advanced Cognitive Diagnosis Models."""
 
+import time
+
 import numpy as np
 import pytest
 
+from mirt.exceptions import MirtDataError, MirtIndexError, MirtValidationError
 from mirt.models.cdm_advanced import (
     GDINA,
     AttributeHierarchy,
     HigherOrderCDM,
     fit_gdina,
+    fit_higher_order_cdm,
 )
+
+
+def _strong_higher_order_model() -> HigherOrderCDM:
+    """Six items on two attributes with success rates .1 and .9."""
+    q_matrix = np.array([[1, 0], [1, 0], [1, 0], [0, 1], [0, 1], [1, 1]])
+    model = HigherOrderCDM(6, 2, q_matrix)
+    model.set_parameters(loadings=np.array([1.5, 1.5]), thresholds=np.array([0, 0.5]))
+    for item_idx, row in enumerate(q_matrix):
+        n_required = int(row.sum())
+        groups = (np.arange(2**n_required)[:, None] >> np.arange(n_required)) & 1
+        model.set_delta_parameters(
+            item_idx, np.where(groups.sum(axis=1) == n_required, 0.9, 0.1)
+        )
+    return model
+
+
+def _brute_force_likelihood(
+    model: HigherOrderCDM, responses: np.ndarray, theta: np.ndarray
+) -> np.ndarray:
+    """Return sum_alpha P(alpha | theta) prod_j P(X_j | alpha) per person and theta.
+
+    The logistic attribute curves are written out instead of calling the model,
+    so the reference also checks the documented higher-order link.
+    """
+    patterns = model.valid_patterns
+    conditional = model.base_model.probability(patterns)
+    item_terms = np.where(
+        responses[:, None, :] == 1, conditional[None], 1.0 - conditional[None]
+    )
+    item_terms = np.where(responses[:, None, :] >= 0, item_terms, 1.0)
+    pattern_likelihood = item_terms.prod(axis=2)
+    return pattern_likelihood @ _brute_force_pattern_prior(model, theta).T
+
+
+def _brute_force_pattern_prior(model: HigherOrderCDM, theta: np.ndarray) -> np.ndarray:
+    """Return P(alpha | theta) for every valid pattern from the logistic link."""
+    patterns = model.valid_patterns
+    mastery = 1.0 / (
+        1.0 + np.exp(-model.loadings * (theta[:, None] - model.thresholds))
+    )
+    prior = np.prod(
+        np.where(patterns[None] == 1, mastery[:, None, :], 1.0 - mastery[:, None, :]),
+        axis=2,
+    )
+    return prior / prior.sum(axis=1, keepdims=True)
 
 
 class TestAttributeHierarchy:
@@ -277,6 +326,176 @@ class TestGDINA:
         assert model_copy is not model
         assert model_copy.reduced_models == model.reduced_models
         np.testing.assert_array_equal(model_copy.q_matrix, model.q_matrix)
+
+    def test_set_delta_parameters_validates_index_and_values(self):
+        """Reject aliasing negative indices and coefficients outside [0, 1]."""
+        q_matrix = np.array([[1, 0], [0, 1], [1, 1]])
+        model = GDINA(3, 2, q_matrix, reduced_models=["saturated", "DINA", "saturated"])
+        before = model.delta_parameters
+
+        with pytest.raises(MirtIndexError, match="item_idx"):
+            model.set_delta_parameters(-1, np.array([0.9, 0.8, 0.7, 0.1]))
+        with pytest.raises(MirtValidationError, match="finite"):
+            model.set_delta_parameters(0, np.array([0.3, np.nan]))
+        with pytest.raises(MirtValidationError, match="outside"):
+            model.set_delta_parameters(0, np.array([1.7, 0.5]))
+        with pytest.raises(MirtValidationError, match="outside"):
+            model.set_delta_parameters(1, np.array([-0.1, 0.9]))
+        with pytest.raises(MirtValidationError, match="delta length"):
+            model.set_delta_parameters(2, np.array([0.1, 0.9]))
+        for actual, expected in zip(model.delta_parameters, before, strict=True):
+            np.testing.assert_array_equal(actual, expected)
+
+    @pytest.mark.parametrize(
+        ("family", "delta", "message"),
+        [
+            ("ACDM", [0.5, 0.4, 0.3], "outside"),
+            ("ACDM", [0.2, -0.3, 0.1], "outside"),
+            ("RRUM", [0.9, -0.5, 0.5], "non-negative"),
+            ("RRUM", [1.2, 0.5, 0.5], "outside"),
+            ("LLM", [0.0, np.inf, 1.0], "finite"),
+        ],
+    )
+    def test_reduced_families_validate_implied_probabilities(
+        self, family, delta, message
+    ):
+        model = GDINA(1, 2, np.array([[1, 1]]), reduced_models=[family])
+        with pytest.raises(MirtValidationError, match=message):
+            model.set_delta_parameters(0, np.array(delta))
+
+    def test_default_coefficients_are_valid_probabilities(self):
+        """Every family starts from coefficients its own setter accepts."""
+        families = ["saturated", "DINA", "DINO", "ACDM", "LLM", "RRUM"]
+        model = GDINA(6, 3, np.ones((6, 3), dtype=int), reduced_models=families)
+        model.set_parameters(**model.parameters)
+        probabilities = model.probability(model.attribute_patterns)
+        assert np.all((probabilities >= 0.0) & (probabilities <= 1.0))
+        np.testing.assert_allclose(model.item_probabilities(3)[[0, -1]], [0.2, 0.8])
+
+    def test_set_parameters_validates_rows_atomically(self):
+        """Validate active coefficients before changing any item."""
+        model = GDINA(3, 2, np.array([[1, 0], [0, 1], [1, 1]]))
+        before = model.parameters
+        delta = model.parameters["delta"]
+        delta[0, :2] = [0.1, 0.9]
+        delta[2, :4] = [1.7, -0.3, np.nan, 2.0]
+
+        with pytest.raises(MirtValidationError, match="item 2"):
+            model.set_parameters(delta=delta)
+        with pytest.raises(MirtValidationError, match="delta parameters"):
+            model.set_parameters(reduced_model_code=np.array([0.0, 0.0, 2.0]))
+        for name, values in before.items():
+            np.testing.assert_array_equal(model.parameters[name], values)
+
+        delta[2, :4] = [0.1, 0.2, 0.3, 0.9]
+        model.set_parameters(delta=delta)
+        np.testing.assert_allclose(model.delta_parameters[0], [0.1, 0.9])
+
+    def test_log_likelihood_validates_responses_and_rows(self):
+        """Reject response codes other than 0, 1 and missing, as DINA does."""
+        model = GDINA(3, 2, np.array([[1, 0], [0, 1], [1, 1]]))
+        alpha = np.array([[1, 1], [0, 0]])
+
+        with pytest.raises(MirtDataError, match="only 0, 1"):
+            model.log_likelihood(np.array([[2, 0, 1], [1, 1, 5]]), alpha)
+        with pytest.raises(MirtValidationError, match="compatible row counts"):
+            model.log_likelihood(np.zeros((2, 3), dtype=int), np.zeros((3, 2), int))
+        values = model.log_likelihood(np.array([[1, -1, 0]]), alpha)
+        probabilities = model.probability(alpha)
+        np.testing.assert_allclose(
+            values, np.log(probabilities[:, 0]) + np.log1p(-probabilities[:, 2])
+        )
+
+    def test_scoring_api_matches_direct_evaluation(self):
+        """Score respondents against every pattern, as DINA and DINO do."""
+        model = GDINA(
+            4,
+            2,
+            np.array([[1, 0], [0, 1], [1, 1], [1, 1]]),
+            reduced_models=["saturated", "DINA", "ACDM", "LLM"],
+        )
+        model.set_delta_parameters(0, [0.1, 0.9])
+        model.set_delta_parameters(1, [0.2, 0.8])
+        model.set_delta_parameters(2, [0.1, 0.4, 0.4])
+        model.set_delta_parameters(3, [-2.0, 1.5, 2.5])
+        responses = np.array([[1, 0, 1, 0], [1, 1, 1, 1], [0, -1, 0, 0]])
+        prior = np.array([0.4, 0.1, 0.1, 0.4])
+
+        log_likelihoods = model.pattern_log_likelihoods(responses)
+        expected = np.column_stack(
+            [
+                model.log_likelihood(responses, pattern)
+                for pattern in model.attribute_patterns
+            ]
+        )
+        np.testing.assert_allclose(log_likelihoods, expected)
+        posterior = model.attribute_posteriors(responses, prior)
+        expected_posterior = np.exp(expected) * prior
+        expected_posterior /= expected_posterior.sum(axis=1, keepdims=True)
+        np.testing.assert_allclose(posterior, expected_posterior)
+        np.testing.assert_allclose(
+            model.attribute_marginals(responses, prior),
+            posterior @ model.attribute_patterns,
+        )
+        np.testing.assert_array_equal(
+            model.classify_respondents(responses, method="MAP", pattern_prior=prior),
+            model.attribute_patterns[np.argmax(expected_posterior, axis=1)],
+        )
+        np.testing.assert_array_equal(
+            model.classify_respondents(responses),
+            model.attribute_patterns[np.argmax(expected, axis=1)],
+        )
+        np.testing.assert_array_equal(
+            model.classify_respondents(responses, method="EAP", pattern_prior=prior),
+            (posterior @ model.attribute_patterns > 0.5).astype(int),
+        )
+
+    def test_gdina_deltas_follow_de_la_torre_parameterization(self):
+        """Convert stored coefficients into identity, logit or log-link deltas."""
+        q_matrix = np.array([[1, 1], [1, 1], [1, 1], [1, 1], [1, 0]])
+        model = GDINA(
+            5,
+            2,
+            q_matrix,
+            reduced_models=["saturated", "DINA", "DINO", "RRUM", "ACDM"],
+        )
+        # Identity-link deltas (0.1, 0.3, 0.3, 0.2) give P(00, 10, 01, 11).
+        model.set_delta_parameters(0, [0.1, 0.4, 0.4, 0.9])
+        model.set_delta_parameters(1, [0.2, 0.9])
+        model.set_delta_parameters(2, [0.2, 0.9])
+        model.set_delta_parameters(3, [0.9, 0.5, 0.25])
+        model.set_delta_parameters(4, [0.2, 0.6])
+
+        np.testing.assert_allclose(model.gdina_deltas(0), [0.1, 0.3, 0.3, 0.2])
+        np.testing.assert_allclose(model.gdina_deltas(1), [0.2, 0.7])
+        np.testing.assert_allclose(model.gdina_deltas(2), [0.2, 0.7])
+        np.testing.assert_allclose(model.gdina_deltas(4), [0.2, 0.6])
+        rrum = model.gdina_deltas(3)
+        groups = model.attribute_patterns
+        np.testing.assert_allclose(
+            np.exp(rrum[0] + groups @ rrum[1:]), model.item_probabilities(3)
+        )
+        np.testing.assert_allclose(model.item_probabilities(0), [0.1, 0.4, 0.4, 0.9])
+
+    def test_saturated_deltas_order_interactions_by_order(self):
+        """Order deltas as intercept, main effects, then two- and three-way terms."""
+        model = GDINA(1, 3, np.ones((1, 3), dtype=int))
+        effects = np.array([0.05, 0.1, 0.15, 0.2, 0.04, 0.06, 0.08, 0.12])
+        groups = model.attribute_patterns
+        subsets = [(), (0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)]
+        probabilities = np.array(
+            [
+                sum(
+                    effect
+                    for effect, subset in zip(effects, subsets, strict=True)
+                    if all(group[attribute] for attribute in subset)
+                )
+                for group in groups
+            ]
+        )
+        model.set_delta_parameters(0, probabilities)
+
+        np.testing.assert_allclose(model.gdina_deltas(0), effects)
 
 
 class TestHigherOrderCDM:
@@ -556,21 +775,22 @@ class TestHigherOrderCDM:
             model.estimate_theta(np.array([[1, 0]]), n_quad=n_quad)
 
     def test_estimate_theta_matches_grid_reference(self):
-        """Match the direct per-grid likelihood calculation for EAP and MLE."""
-        model = HigherOrderCDM(
-            n_items=3,
-            n_attributes=2,
-            q_matrix=np.array([[1, 0], [0, 1], [1, 1]]),
+        """Match brute-force EAP and MLE over the shared mastery patterns."""
+        model = _strong_higher_order_model()
+        responses = np.array(
+            [
+                [1, 1, 1, 0, 0, 1],
+                [1, 0, 1, 0, 1, 0],
+                [0, 0, 0, 0, 0, 0],
+                [1, 1, -1, 1, 1, 1],
+            ]
         )
-        responses = np.array([[1, 0, -1], [0, 1, 1], [1, 1, 0]])
         quad_points = np.linspace(-4, 4, 15)
-        log_likes = np.column_stack(
-            [model.log_likelihood(responses, np.array(point)) for point in quad_points]
-        )
-        log_posterior = log_likes - 0.5 * quad_points**2
-        log_posterior -= np.logaddexp.reduce(log_posterior, axis=1, keepdims=True)
-        expected_eap = np.exp(log_posterior) @ quad_points
-        expected_mle = quad_points[np.argmax(log_likes, axis=1)]
+        likelihood = _brute_force_likelihood(model, responses, quad_points)
+        posterior = likelihood * np.exp(-0.5 * quad_points**2)
+        posterior /= posterior.sum(axis=1, keepdims=True)
+        expected_eap = posterior @ quad_points
+        expected_mle = quad_points[np.argmax(likelihood, axis=1)]
 
         np.testing.assert_allclose(
             model.estimate_theta(responses, method="EAP", n_quad=15), expected_eap
@@ -578,6 +798,142 @@ class TestHigherOrderCDM:
         np.testing.assert_array_equal(
             model.estimate_theta(responses, method="MLE", n_quad=15), expected_mle
         )
+
+    @pytest.mark.parametrize("hierarchical", [False, True])
+    def test_log_likelihood_marginalizes_shared_mastery_patterns(self, hierarchical):
+        """Items share alpha, so P(X | theta) sums over patterns, not items."""
+        model = _strong_higher_order_model()
+        if hierarchical:
+            hierarchy = AttributeHierarchy(adjacency=np.array([[0, 1], [0, 0]]))
+            restricted = HigherOrderCDM(6, 2, model.q_matrix, hierarchy=hierarchy)
+            restricted.set_parameters(**model.parameters)
+            model = restricted
+        responses = np.array(
+            [
+                [1, 1, 1, 0, 0, 1],
+                [1, 0, 1, 0, 1, 0],
+                [0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 1],
+            ]
+        )
+        theta = np.full(4, 0.3)
+
+        expected = np.log(np.diag(_brute_force_likelihood(model, responses, theta)))
+
+        np.testing.assert_allclose(model.log_likelihood(responses, theta), expected)
+        np.testing.assert_allclose(
+            model.log_likelihood(responses, np.array(0.3)), expected
+        )
+        if not hierarchical:
+            # The former item-independent product gave [-3.93, -3.72, -4.19, -4.41].
+            np.testing.assert_allclose(
+                expected, [-3.7971, -5.8872, -2.1185, -1.9778], atol=1e-4
+            )
+
+    def test_information_is_fisher_information_of_marginal_curves(self):
+        """Use (dP/dtheta)**2 / (P (1 - P)), not the Bernoulli variance."""
+        model = _strong_higher_order_model()
+        theta = np.array([0.0, 1.0])
+        step = 1e-5
+        probability = model.probability(theta)
+        derivative = (
+            model.probability(theta + step) - model.probability(theta - step)
+        ) / (2 * step)
+        expected = derivative**2 / (probability * (1.0 - probability))
+
+        np.testing.assert_allclose(model.information(theta), expected, rtol=1e-6)
+        np.testing.assert_allclose(
+            model.information(theta, 5), expected[:, 5], rtol=1e-6
+        )
+        np.testing.assert_allclose(expected[0, :3], 0.36, atol=1e-4)
+
+    def test_attribute_probability_uses_documented_logistic_link(self):
+        """P(alpha_k = 1 | theta) = 1 / (1 + exp(-lambda_k (theta - tau_k)))."""
+        model = HigherOrderCDM(2, 2, np.eye(2, dtype=int))
+        model.set_higher_order_params(np.array([1.0, 2.0]), np.array([0.0, 0.5]))
+
+        np.testing.assert_allclose(
+            model.attribute_probability(np.array([1.0])),
+            [[1.0 / (1.0 + np.exp(-1.0)), 1.0 / (1.0 + np.exp(-1.0))]],
+        )
+
+    def test_scoring_methods_use_valid_patterns_and_implied_prior(self):
+        """Classify over hierarchy-valid patterns with the theta-integrated prior."""
+        hierarchy = AttributeHierarchy(adjacency=np.array([[0, 1], [0, 0]]))
+        base = _strong_higher_order_model()
+        model = HigherOrderCDM(6, 2, base.q_matrix, hierarchy=hierarchy)
+        model.set_parameters(**base.parameters)
+        responses = np.array([[1, 1, 1, 0, 0, 1], [0, 0, 0, 1, 1, 0]])
+
+        points = np.linspace(-4, 4, 31)
+        weights = np.exp(-0.5 * points**2)
+        weights /= weights.sum()
+        likelihood = _brute_force_likelihood(model, responses, points)
+        expected_prior = weights @ _brute_force_pattern_prior(model, points)
+        np.testing.assert_allclose(model.class_probabilities, expected_prior)
+        np.testing.assert_allclose(model.class_probabilities.sum(), 1.0)
+
+        posterior = model.attribute_posteriors(responses)
+        log_likelihoods = model.pattern_log_likelihoods(responses)
+        expected_posterior = np.exp(log_likelihoods) * expected_prior
+        expected_posterior /= expected_posterior.sum(axis=1, keepdims=True)
+        assert posterior.shape == (2, 3)
+        np.testing.assert_allclose(posterior, expected_posterior)
+        np.testing.assert_allclose(
+            np.exp(model.log_likelihood(responses, np.zeros(2))),
+            likelihood[:, 15],
+        )
+        np.testing.assert_allclose(
+            model.attribute_marginals(responses), posterior @ model.valid_patterns
+        )
+        for method in ("MLE", "MAP", "EAP"):
+            classified = model.classify_respondents(responses, method=method)
+            assert classified.shape == (2, 2)
+        np.testing.assert_array_equal(
+            model.classify_respondents(responses, method="MAP"), [[1, 0], [0, 0]]
+        )
+        assert not any(
+            np.array_equal(row, [0, 1]) for row in model.classify_respondents(responses)
+        )
+
+    def test_item_parameters_are_public_and_counted(self):
+        """Set G-DINA item coefficients through the higher-order model."""
+        model = HigherOrderCDM(3, 2, np.array([[1, 0], [0, 1], [1, 1]]))
+        assert model.n_parameters == 2 + 2 + 4 + 2 * 2
+        delta = model.parameters["delta"]
+        delta[2, :4] = [0.05, 0.3, 0.3, 0.95]
+        model.set_parameters(delta=delta, loadings=np.array([1.2, 0.8]))
+
+        np.testing.assert_allclose(model.delta_parameters[2], [0.05, 0.3, 0.3, 0.95])
+        np.testing.assert_allclose(model.loadings, [1.2, 0.8])
+        np.testing.assert_allclose(
+            model.probability(np.array([0.0])),
+            model.pattern_probability(np.array([0.0]))
+            @ model.base_model.probability(model.valid_patterns),
+        )
+        model.set_delta_parameters(0, [0.1, 0.8])
+        np.testing.assert_allclose(model.parameters["delta"][0, :2], [0.1, 0.8])
+
+        owned = model.base_model
+        owned.set_delta_parameters(0, [0.3, 0.4])
+        np.testing.assert_allclose(model.delta_parameters[0], [0.1, 0.8])
+
+        before = model.parameters
+        bad = model.parameters["delta"]
+        bad[1, 0] = 1.5
+        with pytest.raises(MirtValidationError, match="outside"):
+            model.set_parameters(delta=bad, thresholds=np.array([1.0, 1.0]))
+        for name, values in before.items():
+            np.testing.assert_array_equal(model.parameters[name], values)
+
+        copied = model.copy()
+        np.testing.assert_array_equal(copied.parameters["delta"], before["delta"])
+        assert copied.reduced_models == model.reduced_models
+
+    def test_rejects_hierarchy_with_other_attribute_count(self):
+        hierarchy = AttributeHierarchy(adjacency=np.zeros((3, 3), dtype=int))
+        with pytest.raises(MirtValidationError, match="hierarchy has 3"):
+            HigherOrderCDM(2, 2, np.eye(2, dtype=int), hierarchy=hierarchy)
 
     def test_copy(self):
         """Test model copying."""
@@ -649,6 +1005,222 @@ class TestFitGDINA:
 
         assert fitted_model._is_fitted
         assert fitted_model.reduced_models == reduced
+
+    def test_fit_returns_result_with_likelihood_and_criteria(self):
+        """Report the marginal log-likelihood at the returned estimates."""
+        rng = np.random.default_rng(11)
+        q_matrix = np.array([[1, 0], [0, 1], [1, 1], [1, 0], [0, 1], [1, 1]])
+        model = GDINA(6, 2, q_matrix, reduced_models=["DINA"] * 6)
+        for item_idx in range(6):
+            model.set_delta_parameters(item_idx, [0.15, 0.85])
+        alpha = model.sample_attribute_patterns(
+            400, seed=12, class_probabilities=[0.4, 0.1, 0.1, 0.4]
+        )
+        responses = model.simulate(alpha, seed=13)
+        responses[rng.random(responses.shape) < 0.05] = -1
+
+        result = fit_gdina(responses, q_matrix, max_iter=200, tol=1e-6)
+        fitted, class_probabilities = result
+
+        assert fitted is result.model and result[0] is fitted and len(result) == 2
+        np.testing.assert_array_equal(class_probabilities, result.class_probabilities)
+        expected_ll = np.sum(
+            np.log(
+                np.exp(fitted.pattern_log_likelihoods(responses)) @ class_probabilities
+            )
+        )
+        np.testing.assert_allclose(result.log_likelihood, expected_ll)
+        assert (
+            result.n_parameters == fitted.n_parameters + 3 == 2 + 2 + 4 + 2 + 2 + 4 + 3
+        )
+        assert result.n_observations == 400
+        np.testing.assert_allclose(result.aic, -2 * expected_ll + 2 * 19)
+        np.testing.assert_allclose(result.bic, -2 * expected_ll + 19 * np.log(400))
+        assert result.converged and 0 < result.n_iterations < 200
+        assert "Log-Likelihood" in result.summary()
+
+        stopped = fit_gdina(responses, q_matrix, max_iter=2, tol=1e-12)
+        assert not stopped.converged and stopped.n_iterations == 2
+
+    def test_fitted_model_scores_with_estimated_class_probabilities(self):
+        """Default MAP classification uses the fitted, not a uniform, prior."""
+        q_matrix = np.vstack((np.eye(3, dtype=int), np.ones((3, 3), dtype=int)))
+        model = GDINA(6, 3, q_matrix, reduced_models=["DINA"] * 6)
+        for item_idx in range(6):
+            model.set_delta_parameters(item_idx, [0.25, 0.75])
+        prior = np.array([0.45, 0.02, 0.02, 0.03, 0.02, 0.03, 0.03, 0.4])
+        responses = model.simulate(model.sample_attribute_patterns(600, 2, prior), 3)
+
+        fitted, class_probabilities = fit_gdina(
+            responses, q_matrix, reduced_models=["DINA"] * 6
+        )
+
+        np.testing.assert_array_equal(fitted.class_probabilities, class_probabilities)
+        np.testing.assert_allclose(
+            fitted.attribute_posteriors(responses),
+            fitted.attribute_posteriors(responses, class_probabilities),
+        )
+        assert not np.allclose(
+            fitted.attribute_marginals(responses),
+            fitted.attribute_marginals(responses, np.ones(8)),
+        )
+        np.testing.assert_array_equal(
+            fitted.copy().class_probabilities, class_probabilities
+        )
+        assert GDINA(6, 3, q_matrix).class_probabilities is None
+
+    def test_fit_imposes_attribute_hierarchy(self):
+        """Keep zero class probability on patterns the hierarchy forbids."""
+        hierarchy = AttributeHierarchy(adjacency=np.array([[0, 1], [0, 0]]))
+        q_matrix = np.array([[1, 0], [0, 1], [1, 1], [1, 0], [0, 1], [1, 1]])
+        responses = np.random.default_rng(5).integers(0, 2, size=(200, 6))
+
+        result = fit_gdina(responses, q_matrix, hierarchy=hierarchy, max_iter=30)
+
+        # Pattern (0, 1) masters attribute 1 without its prerequisite 0.
+        assert result.class_probabilities[2] == 0.0
+        np.testing.assert_allclose(result.class_probabilities.sum(), 1.0)
+        assert result.n_parameters == result.model.n_parameters + 2
+        for method in ("MLE", "MAP"):
+            classified = result.model.classify_respondents(responses, method=method)
+            assert not np.any((classified[:, 0] == 0) & (classified[:, 1] == 1))
+        with pytest.raises(MirtValidationError, match="hierarchy"):
+            fit_gdina(responses, q_matrix, hierarchy=np.array([[0, 1], [0, 0]]))
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"verbose": 1}, "verbose"),
+            ({"tol": True}, "tol"),
+        ],
+    )
+    def test_fit_controls_match_fit_cdm(self, kwargs, message):
+        with pytest.raises(MirtValidationError, match=message):
+            fit_gdina(np.array([[1, 0], [0, 1]]), np.eye(2, dtype=int), **kwargs)
+
+    def test_fit_reuses_gemm_counts_and_warm_starts(self):
+        """Keep the per-item count totals of the former E-step implementation."""
+        rng = np.random.default_rng(9)
+        q_matrix = np.array([[1, 0], [0, 1], [1, 1], [1, 1]])
+        responses = rng.integers(0, 2, size=(300, 4))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        families = ["saturated", "ACDM", "LLM", "RRUM"]
+
+        fitted, class_probabilities = fit_gdina(
+            responses, q_matrix, reduced_models=families, max_iter=1
+        )
+
+        reference = GDINA(4, 2, q_matrix, reduced_models=families)
+        patterns = reference.attribute_patterns
+        probabilities = reference.probability(patterns)
+        log_like = np.zeros((300, 4))
+        for item_idx in range(4):
+            observed = responses[:, item_idx] >= 0
+            values = responses[:, item_idx, None]
+            log_like[observed] += np.where(
+                values[observed] == 1,
+                np.log(probabilities[:, item_idx]),
+                np.log1p(-probabilities[:, item_idx]),
+            )
+        posterior = np.exp(log_like) / np.exp(log_like).sum(axis=1, keepdims=True)
+        np.testing.assert_allclose(
+            class_probabilities, posterior.mean(axis=0), rtol=1e-12
+        )
+        for item_idx in range(4):
+            observed = responses[:, item_idx] >= 0
+            totals = posterior[observed].sum(axis=0)
+            successes = (posterior[observed] * responses[observed, item_idx, None]).sum(
+                axis=0
+            )
+            groups = reference._latent_group_idx(patterns, item_idx)
+            n_groups = 2 ** int(q_matrix[item_idx].sum())
+            expected, _, _ = reference._fit_reduced_parameters(
+                families[item_idx],
+                reference._required_group_patterns(item_idx),
+                np.bincount(groups, weights=successes, minlength=n_groups),
+                np.bincount(groups, weights=totals, minlength=n_groups),
+                reference.delta_parameters[item_idx],
+            )
+            np.testing.assert_allclose(
+                fitted.delta_parameters[item_idx], expected, rtol=1e-7, atol=1e-9
+            )
+
+
+class TestFitHigherOrderCDM:
+    """Tests for higher-order CDM estimation."""
+
+    @staticmethod
+    def _simulate(seed: int, n_persons: int = 2000):
+        rng = np.random.default_rng(seed)
+        n_attributes = 4
+        q_matrix = np.zeros((24, n_attributes), dtype=int)
+        for item_idx in range(24):
+            q_matrix[item_idx, item_idx % n_attributes] = 1
+            if item_idx >= 12:
+                q_matrix[item_idx, (item_idx + 1) % n_attributes] = 1
+        model = HigherOrderCDM(24, n_attributes, q_matrix, reduced_models=["DINA"] * 24)
+        loadings = np.array([1.5, 1.2, 1.8, 1.0])
+        thresholds = np.array([-0.5, 0.0, 0.5, 0.2])
+        model.set_parameters(loadings=loadings, thresholds=thresholds)
+        for item_idx in range(24):
+            model.set_delta_parameters(item_idx, [0.15, 0.85])
+        theta = rng.standard_normal(n_persons)
+        cumulative = np.cumsum(model.pattern_probability(theta), axis=1)
+        indices = np.argmax(rng.random((n_persons, 1)) < cumulative, axis=1)
+        alpha = model.valid_patterns[indices]
+        return model.simulate(alpha, seed=seed + 1), q_matrix, loadings, thresholds
+
+    def test_recovers_item_and_higher_order_parameters(self):
+        responses, q_matrix, loadings, thresholds = self._simulate(5)
+        start = time.perf_counter()
+
+        result = fit_higher_order_cdm(
+            responses, q_matrix, reduced_models=["DINA"] * 24, max_iter=300, tol=1e-6
+        )
+
+        assert time.perf_counter() - start < 5.0
+        fitted = result.model
+        assert result.converged and fitted.is_fitted
+        np.testing.assert_allclose(fitted.loadings, loadings, atol=0.35)
+        np.testing.assert_allclose(fitted.thresholds, thresholds, atol=0.2)
+        np.testing.assert_allclose(
+            np.array(fitted.delta_parameters), [[0.15, 0.85]] * 24, atol=0.05
+        )
+        assert result.n_parameters == fitted.n_parameters == 24 * 2 + 8
+        np.testing.assert_allclose(
+            result.class_probabilities, fitted.class_probabilities
+        )
+        expected_ll = np.sum(
+            np.log(
+                np.exp(fitted.pattern_log_likelihoods(responses))
+                @ result.class_probabilities
+            )
+        )
+        np.testing.assert_allclose(result.log_likelihood, expected_ll)
+
+    def test_em_increases_likelihood_under_hierarchy(self, capsys):
+        responses, q_matrix, _, _ = self._simulate(8, n_persons=500)
+        hierarchy = AttributeHierarchy(
+            adjacency=np.array([[0, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, 0]])
+        )
+
+        result = fit_higher_order_cdm(
+            responses, q_matrix, hierarchy=hierarchy, max_iter=25, verbose=True
+        )
+
+        lines = capsys.readouterr().out.splitlines()
+        log_likelihoods = np.array([float(line.split("=")[1]) for line in lines])
+        assert np.all(np.diff(log_likelihoods) > -1e-6)
+        assert result.class_probabilities.shape == (9,)
+        assert result.model.valid_patterns.shape == (9, 4)
+        assert result.n_iterations <= 25
+
+    def test_validates_controls(self):
+        responses = np.array([[1, 0], [0, 1]])
+        with pytest.raises(MirtValidationError, match="n_quad"):
+            fit_higher_order_cdm(responses, np.eye(2, dtype=int), n_quad=0)
+        with pytest.raises(MirtDataError, match="observed"):
+            fit_higher_order_cdm(np.array([[1, -1], [0, -1]]), np.eye(2, dtype=int))
 
 
 if __name__ == "__main__":

@@ -68,6 +68,28 @@ def _validated_gaussian_parameters(
     return mean_array.copy(), covariance.copy(), cholesky
 
 
+def _correlation_mask(
+    mask: NDArray[np.bool_] | None,
+    n_factors: int,
+) -> NDArray[np.bool_] | None:
+    """Validate a mask of free factor correlations; ``None`` when none is free."""
+    if mask is None:
+        return None
+    values = np.asarray(mask)
+    if values.dtype != np.bool_ or values.shape != (n_factors, n_factors):
+        raise ValueError(
+            f"correlation_mask must be a Boolean array of shape "
+            f"({n_factors}, {n_factors})"
+        )
+    if not np.array_equal(values, values.T):
+        raise ValueError("correlation_mask must be symmetric")
+    if np.any(np.diag(values)):
+        raise ValueError(
+            "correlation_mask selects correlations; its diagonal must be False"
+        )
+    return values.copy() if np.any(values) else None
+
+
 def _theta_points(
     theta: NDArray[np.float64],
     n_factors: int,
@@ -134,6 +156,15 @@ class GroupLatentDistribution:
         Whether to estimate the mean during EM.
     estimate_cov : bool
         Whether to estimate the covariance during EM.
+    correlation_mask : ndarray of bool, optional
+        Symmetric ``(n_factors, n_factors)`` mask, ``False`` on the diagonal,
+        of the factor correlations estimated during EM. The other
+        off-diagonal entries stay at their values. When ``estimate_cov`` is
+        False the variances stay fixed too, so the reference group can
+        estimate correlations with unit variances; when it is True the
+        variances and the masked covariances are estimated. ``None`` (the
+        default) estimates no correlation without ``estimate_cov`` and the
+        whole covariance matrix with it.
     """
 
     mean: NDArray[np.float64]
@@ -141,6 +172,7 @@ class GroupLatentDistribution:
     is_reference: bool = False
     estimate_mean: bool = True
     estimate_cov: bool = True
+    correlation_mask: NDArray[np.bool_] | None = None
     _precision: NDArray[np.float64] = field(init=False, repr=False)
     _cov_snapshot: NDArray[np.float64] = field(init=False, repr=False)
     _log_det: float = field(init=False, repr=False)
@@ -154,6 +186,7 @@ class GroupLatentDistribution:
             self.estimate_mean = False
             self.estimate_cov = False
         self._update_precision()
+        self.correlation_mask = _correlation_mask(self.correlation_mask, self.mean.size)
 
     def _set_parameters(
         self,
@@ -236,14 +269,28 @@ class GroupLatentDistribution:
         mean, _ = self._validated_state()
         return mean.size
 
+    def free_covariance_entries(self) -> NDArray[np.bool_] | None:
+        """Return the symmetric mask of estimated covariance entries, or None.
+
+        Estimated variances add the diagonal to ``correlation_mask``; without
+        a mask they estimate the whole matrix.
+        """
+        mask = _correlation_mask(self.correlation_mask, self.n_factors)
+        if self.estimate_cov:
+            if mask is None:
+                return np.ones((self.n_factors, self.n_factors), dtype=np.bool_)
+            return mask | np.eye(self.n_factors, dtype=np.bool_)
+        return mask
+
     @property
     def n_free_parameters(self) -> int:
         """Count free parameters in this distribution."""
         n = 0
         if self.estimate_mean:
             n += self.n_factors
-        if self.estimate_cov:
-            n += self.n_factors * (self.n_factors + 1) // 2
+        free = self.free_covariance_entries()
+        if free is not None:
+            n += int(np.count_nonzero(np.triu(free)))
         return n
 
     def copy(self) -> GroupLatentDistribution:
@@ -254,6 +301,9 @@ class GroupLatentDistribution:
             is_reference=self.is_reference,
             estimate_mean=self.estimate_mean,
             estimate_cov=self.estimate_cov,
+            correlation_mask=(
+                None if self.correlation_mask is None else self.correlation_mask.copy()
+            ),
         )
 
 
@@ -261,7 +311,9 @@ class MultigroupLatentDensity:
     """Collection of group-specific latent distributions.
 
     This class manages latent distributions for multiple groups, with
-    one reference group having fixed mean=0 and cov=I for identification.
+    one reference group having fixed mean=0 and unit variances for
+    identification. Its factor correlations are zero unless
+    ``correlation_mask`` frees them.
 
     Parameters
     ----------
@@ -271,6 +323,9 @@ class MultigroupLatentDensity:
         Number of latent factors (dimensions).
     reference_group : int
         Index of the reference group (0-indexed).
+    correlation_mask : ndarray of bool, optional
+        Factor correlations estimated in every group (see
+        :class:`GroupLatentDistribution`).
     """
 
     def __init__(
@@ -278,6 +333,7 @@ class MultigroupLatentDensity:
         n_groups: int,
         n_factors: int = 1,
         reference_group: int = 0,
+        correlation_mask: NDArray[np.bool_] | None = None,
     ) -> None:
         n_groups = _positive_integer(n_groups, "n_groups", minimum=2)
         n_factors = _positive_integer(n_factors, "n_factors")
@@ -294,6 +350,7 @@ class MultigroupLatentDensity:
         self.n_groups = n_groups
         self.n_factors = n_factors
         self.reference_group = reference_group
+        mask = _correlation_mask(correlation_mask, n_factors)
 
         self.distributions: list[GroupLatentDistribution] = []
         for g in range(n_groups):
@@ -304,6 +361,7 @@ class MultigroupLatentDensity:
                 is_reference=is_ref,
                 estimate_mean=not is_ref,
                 estimate_cov=not is_ref,
+                correlation_mask=mask,
             )
             self.distributions.append(dist)
 
@@ -366,6 +424,11 @@ class MultigroupLatentDensity:
     ) -> None:
         """Update group distribution from posterior weights.
 
+        Estimated means are posterior means. An estimated covariance without
+        a correlation mask is the posterior covariance; masked correlations
+        maximize the Gaussian likelihood of the posterior second moments
+        with the other entries held, as in an ECM step.
+
         Parameters
         ----------
         theta_points : ndarray
@@ -375,10 +438,13 @@ class MultigroupLatentDensity:
         group_idx : int
             Group index to update.
         """
+        from mirt.estimation.latent_density import _constrained_gaussian_covariance
+
         dist = self._distribution(group_idx)
         theta_array = _theta_points(theta_points, self.n_factors)
         weights_norm = _posterior_weights(weights, len(theta_array))
-        if dist.is_reference or weights_norm.size == 0:
+        free = dist.free_covariance_entries()
+        if (not dist.estimate_mean and free is None) or weights_norm.size == 0:
             return
 
         mean = dist.mean
@@ -387,11 +453,19 @@ class MultigroupLatentDensity:
         if dist.estimate_mean:
             mean = weights_norm @ theta_array
 
-        if dist.estimate_cov:
+        if free is not None:
             diff = theta_array - mean
-            covariance = diff.T @ (weights_norm[:, None] * diff)
-            covariance = (covariance + covariance.T) * 0.5
-            covariance += REGULARIZATION_EPSILON * np.eye(self.n_factors)
+            moment = diff.T @ (weights_norm[:, None] * diff)
+            moment = (moment + moment.T) * 0.5
+            if np.all(free):
+                covariance = moment
+            else:
+                # The Gaussian mean is unrestricted, so centering at its
+                # estimate leaves a zero-mean problem in the covariance.
+                covariance = _constrained_gaussian_covariance(moment, dist.cov, free)
+                covariance = (covariance + covariance.T) * 0.5
+            if dist.estimate_cov:
+                covariance += REGULARIZATION_EPSILON * np.eye(self.n_factors)
 
         dist._set_parameters(mean, covariance)
 
@@ -460,5 +534,6 @@ class MultigroupLatentDensity:
             n_factors=self.n_factors,
             reference_group=self.reference_group,
         )
+        # Each copied distribution carries its own correlation mask.
         new_density.distributions = [d.copy() for d in self.distributions]
         return new_density

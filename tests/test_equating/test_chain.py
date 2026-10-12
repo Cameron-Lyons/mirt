@@ -440,7 +440,7 @@ class TestConcurrentLink:
         def evaluate_once(function, x0, **kwargs):
             return SimpleNamespace(x=x0, fun=function(x0), success=True)
 
-        monkeypatch.setattr(optimize, "minimize", evaluate_once)
+        monkeypatch.setattr(optimize, "least_squares", evaluate_once)
         anchor_matrices = [
             [[(index, index) for index in range(10)]],
             [[(index, index) for index in range(10)]],
@@ -471,7 +471,7 @@ class TestConcurrentLink:
         def evaluate_once(function, x0, **kwargs):
             return SimpleNamespace(x=x0, fun=function(x0), success=True)
 
-        monkeypatch.setattr(optimize, "minimize", evaluate_once)
+        monkeypatch.setattr(optimize, "least_squares", evaluate_once)
 
         concurrent_link(models[:2], [[[(2, 3), (7, 8)]]])
 
@@ -497,16 +497,16 @@ class TestConcurrentLink:
         def evaluate_once(function, x0, **kwargs):
             return SimpleNamespace(x=x0, fun=function(x0), success=True)
 
-        monkeypatch.setattr(optimize, "minimize", evaluate_once)
+        monkeypatch.setattr(optimize, "least_squares", evaluate_once)
 
         concurrent_link(models[:2], [[[(2, 3), (7, 8), (4, 1)]]])
 
         assert selected_calls == [[None], [None]]
 
-    def test_gradient_probes_reevaluate_only_the_perturbed_form(
+    def test_jacobian_probes_reevaluate_only_the_differenced_form(
         self, linked_models, monkeypatch
     ):
-        """A coordinate probe touches one form's curves, not every free form."""
+        """A form's Jacobian columns touch its own curves, not every free form."""
         from scipy import optimize
 
         models, _ = linked_models
@@ -524,14 +524,14 @@ class TestConcurrentLink:
 
         captured = {}
 
-        def evaluate_value_and_gradient(function, x0, *, jac, **kwargs):
+        def evaluate_residuals_and_jacobian(function, x0, *, jac, **kwargs):
             x = np.array([0.1, -0.2, 0.3, 0.05])
             captured["fun"] = function
-            captured["value"] = function(x)
-            captured["gradient"] = jac(x)
-            return SimpleNamespace(x=x0, fun=captured["value"], success=True)
+            captured["residuals"] = function(x)
+            captured["jacobian"] = jac(x)
+            return SimpleNamespace(x=x0, fun=captured["residuals"], success=True)
 
-        monkeypatch.setattr(optimize, "minimize", evaluate_value_and_gradient)
+        monkeypatch.setattr(optimize, "least_squares", evaluate_residuals_and_jacobian)
         anchor_matrices = [
             [[(index, index) for index in range(5)]],
             [[(index, index) for index in range(5)]],
@@ -539,29 +539,89 @@ class TestConcurrentLink:
 
         concurrent_link(models, anchor_matrices)
 
-        # One value evaluation per free form plus two coordinate probes each.
+        # One residual evaluation per free form plus two theta probes each.
         assert calls == [1, 3, 3]
         x = np.array([0.1, -0.2, 0.3, 0.05])
-        step = 1e-8
-        expected = np.array(
+        step = 1e-6
+        expected = np.column_stack(
             [
-                (captured["fun"](x + step * unit) - captured["value"])
-                / ((x + step * unit) - x)[position]
-                for position, unit in enumerate(np.eye(4))
+                (captured["fun"](x + step * unit) - captured["fun"](x - step * unit))
+                / (2.0 * step)
+                for unit in np.eye(4)
             ]
         )
-        # Forward differences amplify last-bit loss changes by about eps / step.
-        assert_allclose(
-            captured["gradient"],
-            expected,
-            rtol=1e-12,
-            atol=np.finfo(np.float64).eps / step,
-        )
+        assert_allclose(captured["jacobian"], expected, rtol=0.0, atol=1e-8)
+
+    @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
+    @pytest.mark.parametrize("family", ["2PL", "GRM"])
+    def test_default_tolerance_recovers_exact_transformations(self, family, method):
+        """Exactly linkable forms are recovered to rounding, like chain_link.
+
+        The former L-BFGS-B default ``tol=1e-4`` left Haebara constants off by
+        about 2.5e-3 and Stocking-Lord constants by about 2e-4.
+        """
+        from mirt.equating import transform_parameters, transform_polytomous_parameters
+        from mirt.models.dichotomous import TwoParameterLogistic
+        from mirt.models.polytomous import GradedResponseModel
+
+        rng = np.random.default_rng(1)
+        n_items = 20
+        if family == "2PL":
+            base = TwoParameterLogistic(n_items)
+            base.set_parameters(
+                discrimination=rng.uniform(0.8, 2.0, n_items),
+                difficulty=rng.normal(0.0, 1.0, n_items),
+            )
+        else:
+            base = GradedResponseModel(n_items, 4)
+            base.set_parameters(
+                discrimination=rng.uniform(0.8, 2.0, n_items),
+                thresholds=np.sort(rng.normal(0.0, 1.0, (n_items, 3)), axis=1),
+            )
+        expected = [(1.0, 0.0), (1.3, 0.4), (0.8, -0.5)]
+        forms = [
+            transform_polytomous_parameters(base, 1 / A, -B / A, model_type="grm")
+            if family == "GRM"
+            else transform_parameters(base, 1 / A, -B / A)
+            for A, B in expected
+        ]
+        pairs = [(item, item) for item in range(n_items)]
+
+        result = concurrent_link(forms, [[pairs, pairs], [pairs]], method=method)
+
+        assert_allclose(result, expected, rtol=0.0, atol=1e-12)
+
+    def test_sparse_jacobian_matches_dense(self, monkeypatch):
+        """Large designs store the two-form-per-row Jacobian sparsely."""
+        import mirt.equating.chain as chain_module
+        from mirt.models.dichotomous import TwoParameterLogistic
+
+        rng = np.random.default_rng(5)
+        models = []
+        for scale, shift in [(1.0, 0.0), (1.2, 0.3), (0.9, -0.4)]:
+            model = TwoParameterLogistic(8)
+            model.set_parameters(
+                discrimination=np.linspace(0.7, 1.8, 8)
+                / scale
+                * np.exp(rng.normal(0.0, 0.05, 8)),
+                difficulty=scale * np.linspace(-1.5, 1.5, 8)
+                + shift
+                + rng.normal(0.0, 0.05, 8),
+            )
+            models.append(model)
+        pairs = [(item, item) for item in range(8)]
+        design = [[pairs, pairs], [pairs]]
+
+        dense = concurrent_link(models, design, method="haebara")
+        monkeypatch.setattr(chain_module, "_DENSE_JACOBIAN_ELEMENTS", 0)
+        sparse = concurrent_link(models, design, method="haebara")
+
+        assert_allclose(sparse, dense, rtol=0.0, atol=1e-8)
 
     @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
     @pytest.mark.parametrize("family", ["3PL", "GRM"])
-    def test_matches_numerical_gradient_lbfgs_oracle(self, family, method):
-        """The separable gradient reproduces whole-objective L-BFGS-B fits."""
+    def test_matches_whole_objective_oracle(self, family, method):
+        """The separable least-squares fit minimizes the whole objective."""
         from scipy import optimize
 
         from mirt.models.dichotomous import ThreeParameterLogistic
@@ -659,10 +719,18 @@ class TestConcurrentLink:
             [constants[1] for constants in result[1:]],
         ]
         assert result[0] == (1.0, 0.0)
-        assert objective(fitted) == pytest.approx(oracle.fun, rel=1e-10, abs=1e-15)
-        # Batched and per-item curves differ in the last bit; the FD gradient
-        # turns that into ~1e-8 drift along the flat optimum.
-        assert_allclose(fitted, oracle.x, atol=1e-6)
+        # The tolerance-limited oracle stops slightly above the minimum, up to
+        # about 1e-6 away along its flattest direction.
+        assert objective(fitted) <= oracle.fun * (1.0 + 1e-12) + 1e-15
+        assert_allclose(fitted, oracle.x, atol=1e-5)
+        step = 1e-6
+        central_gradient = [
+            (objective(fitted + step * unit) - objective(fitted - step * unit))
+            / (2.0 * step)
+            for unit in np.eye(6)
+        ]
+        # Rounding of the criterion value limits stationarity near 1e-9.
+        assert_allclose(central_gradient, 0.0, atol=1e-8)
 
     def test_stocking_lord_and_haebara_use_distinct_losses(self, monkeypatch):
         from scipy import optimize
@@ -682,11 +750,11 @@ class TestConcurrentLink:
         losses = []
 
         def capture_loss(function, x0, **kwargs):
-            loss = function(x0)
-            losses.append(loss)
-            return SimpleNamespace(x=x0, fun=loss, success=True)
+            residuals = function(x0)
+            losses.append(float(residuals @ residuals))
+            return SimpleNamespace(x=x0, fun=residuals, success=True)
 
-        monkeypatch.setattr(optimize, "minimize", capture_loss)
+        monkeypatch.setattr(optimize, "least_squares", capture_loss)
         pairs = [[[(0, 0), (1, 1)]]]
 
         concurrent_link([reference, reversed_items], pairs, method="stocking_lord")
@@ -852,6 +920,188 @@ class TestPolytomousChainLink:
 
         with pytest.raises(ValueError, match="different response families"):
             chain_link([dichotomous[0], polytomous[1]], [([0, 1, 2], [0, 1, 2])])
+
+
+def _noisy_chain(family, seed=7):
+    """Three noisy calibrations of one form on shifted metrics."""
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.models.polytomous import GradedResponseModel
+
+    rng = np.random.default_rng(seed)
+    n_items = 8
+    slopes = rng.uniform(0.7, 1.8, n_items)
+    locations = np.sort(rng.normal(0.0, 1.0, (n_items, 3)), axis=1)
+    models = []
+    for scale, shift in [(1.0, 0.0), (1.25, 0.3), (0.85, -0.4)]:
+        noisy_slopes = slopes / scale * np.exp(rng.normal(0.0, 0.05, n_items))
+        if family == "2PL":
+            model = TwoParameterLogistic(n_items)
+            model.set_parameters(
+                discrimination=noisy_slopes,
+                difficulty=scale * locations[:, 0]
+                + shift
+                + rng.normal(0.0, 0.05, n_items),
+            )
+        else:
+            model = GradedResponseModel(n_items, 4)
+            model.set_parameters(
+                discrimination=noisy_slopes,
+                thresholds=scale * locations
+                + shift
+                + rng.normal(0.0, 0.05, (n_items, 1)),
+            )
+        models.append(model)
+    # The middle form links both neighbours through overlapping anchors.
+    pairs = [([0, 1, 2, 3, 4], [0, 1, 2, 3, 4]), ([2, 3, 4, 5, 6], [1, 2, 3, 4, 5])]
+    vcovs = []
+    for model in models:
+        size = sum(values.size for values in model.parameters.values())
+        root = rng.normal(0.0, 0.03, (size, size))
+        vcovs.append(root @ root.T + 1e-4 * np.eye(size))
+    return models, pairs, vcovs
+
+
+class TestChainStandardErrors:
+    """Delta-method uncertainty propagated through the chain composition."""
+
+    @pytest.mark.parametrize(
+        ("family", "method", "rtol", "reference_index"),
+        [
+            ("2PL", "mean_sigma", 1e-6, 0),
+            ("2PL", "mean_sigma", 1e-6, 1),
+            ("2PL", "mean_sigma", 1e-6, 2),
+            # Relinked curve constants carry Nelder-Mead noise near 1e-8.
+            ("GRM", "stocking_lord", 2e-3, 1),
+        ],
+    )
+    def test_matches_differences_of_the_whole_chain(
+        self, family, method, rtol, reference_index
+    ):
+        """Shared middle-form covariance enters both links' derivatives."""
+        models, pairs, vcovs = _noisy_chain(family)
+
+        result = chain_link(
+            models,
+            pairs,
+            method=method,
+            reference_index=reference_index,
+            compute_drift=False,
+            vcovs=vcovs,
+        )
+
+        def cumulative(varied):
+            chained = chain_link(
+                varied,
+                pairs,
+                method=method,
+                reference_index=reference_index,
+                compute_drift=False,
+            )
+            return np.r_[chained.cumulative_A, chained.cumulative_B]
+
+        covariance = np.zeros((6, 6))
+        for index, model in enumerate(models):
+            names = list(model.parameters)
+            stored = np.concatenate([model.parameters[name].ravel() for name in names])
+            columns = []
+            for coordinate in range(stored.size):
+                step = 1e-4 * max(1.0, abs(stored[coordinate]))
+                probes = []
+                for sign in (1.0, -1.0):
+                    values = stored.copy()
+                    values[coordinate] += sign * step
+                    varied = [form.copy() for form in models]
+                    offset, updates = 0, {}
+                    for name in names:
+                        size = model.parameters[name].size
+                        updates[name] = values[offset : offset + size].reshape(
+                            model.parameters[name].shape
+                        )
+                        offset += size
+                    varied[index].set_parameters(**updates)
+                    probes.append(cumulative(varied))
+                columns.append((probes[0] - probes[1]) / (2.0 * step))
+            jacobian = np.column_stack(columns)
+            covariance += jacobian @ vcovs[index] @ jacobian.T
+
+        expected = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+        actual = np.r_[result.cumulative_A_se, result.cumulative_B_se]
+        assert actual[reference_index] == 0.0
+        assert actual[3 + reference_index] == 0.0
+        np.testing.assert_allclose(actual, expected, rtol=rtol, atol=1e-12)
+        assert result.cumulative_covariance.shape == (3, 2, 2)
+        np.testing.assert_allclose(
+            result.cumulative_covariance[:, 0, 1],
+            [covariance[t, 3 + t] for t in range(3)],
+            rtol=max(rtol, 1e-5),
+            atol=1e-12,
+        )
+        for pair_result in result.pairwise_results:
+            assert pair_result.constants.A_se > 0.0
+            assert pair_result.constants.B_se > 0.0
+
+    def test_composition_jacobian_matches_accumulated_constants(self):
+        from mirt.equating.chain import _cumulative_constant_jacobians
+
+        pairwise = [(1.3, 0.4), (0.8, -0.2), (1.1, 0.5)]
+        for reference_index in range(4):
+
+            def cumulative(values):
+                constants = values.reshape(-1, 2)
+                A, B = accumulate_constants(
+                    list(1.0 / constants[:, 0]),
+                    list(-constants[:, 1] / constants[:, 0]),
+                    reference_index,
+                )
+                return np.r_[A, B]
+
+            flat = np.ravel(pairwise)
+            step = 1e-6
+            numeric = np.column_stack(
+                [
+                    (cumulative(flat + step * unit) - cumulative(flat - step * unit))
+                    / (2.0 * step)
+                    for unit in np.eye(flat.size)
+                ]
+            )
+            analytic = _cumulative_constant_jacobians(pairwise, reference_index)
+
+            np.testing.assert_allclose(analytic[:, 0], numeric[:4], atol=1e-9)
+            np.testing.assert_allclose(analytic[:, 1], numeric[4:], atol=1e-9)
+
+    def test_standard_errors_are_absent_without_covariances(self, linked_models):
+        models, anchor_pairs = linked_models
+
+        result = chain_link(models, anchor_pairs)
+
+        assert result.cumulative_A_se is None
+        assert result.cumulative_B_se is None
+        assert result.cumulative_covariance is None
+        assert result.pairwise_results[0].constants.A_se is None
+
+    def test_summary_reports_standard_errors(self):
+        models, pairs, vcovs = _noisy_chain("2PL")
+
+        summary = chain_linking_summary(
+            chain_link(models, pairs, method="mean_sigma", vcovs=vcovs)
+        )
+
+        assert "SE(A)" in summary and "SE(B)" in summary
+        assert "SE(A)" not in chain_linking_summary(
+            chain_link(models, pairs, method="mean_sigma")
+        )
+
+    def test_covariance_count_must_match_models(self, linked_models):
+        models, anchor_pairs = linked_models
+
+        with pytest.raises(ValueError, match="one covariance per model"):
+            chain_link(models, anchor_pairs, vcovs=[np.eye(20)] * 2)
+
+    def test_covariance_errors_name_the_model(self, linked_models):
+        models, anchor_pairs = linked_models
+
+        with pytest.raises(ValueError, match=r"vcovs\[1\] must be a square"):
+            chain_link(models, anchor_pairs, vcovs=[np.eye(20), np.ones(3), np.eye(20)])
 
 
 class TestDetectLongitudinalDrift:

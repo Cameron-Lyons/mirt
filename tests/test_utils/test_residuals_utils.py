@@ -35,9 +35,8 @@ class TestResidualsUtilities:
     def test_ld_x2_shapes_and_ranges(self, fitted_2pl_model, dichotomous_responses):
         model = fitted_2pl_model.model
         responses = dichotomous_responses["responses"]
-        theta = fscores(model, responses, method="EAP").theta
 
-        chi2, p_values = LD_X2(model, responses, theta, use_rust=False)
+        chi2, p_values = LD_X2(model, responses, use_rust=False)
 
         assert chi2.shape == (responses.shape[1], responses.shape[1])
         assert p_values.shape == (responses.shape[1], responses.shape[1])

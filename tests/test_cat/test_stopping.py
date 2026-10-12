@@ -259,10 +259,10 @@ class TestClassificationStop:
 
     def test_initialization_invalid_confidence(self):
         """Test that invalid confidence raises error."""
-        with pytest.raises(ValueError, match="between 0 and 1"):
+        with pytest.raises(ValueError, match="between 0.5 and 1"):
             ClassificationStop(cut_score=0.0, confidence=0.0)
 
-        with pytest.raises(ValueError, match="between 0 and 1"):
+        with pytest.raises(ValueError, match="between 0.5 and 1"):
             ClassificationStop(cut_score=0.0, confidence=1.0)
 
     def test_should_stop_confident_above(self):
@@ -301,7 +301,7 @@ class TestClassificationStop:
         [
             (-2.0, 0.3, 0.99),
             (-0.2, 0.3, 0.95),
-            (0.0, 0.3, 0.5),
+            (0.0, 0.3, 0.6),
             (0.2, 0.3, 0.75),
             (2.0, 0.3, 0.999),
         ],
@@ -539,3 +539,18 @@ class TestCreateStoppingRule:
 def test_stopping_rules_reject_invalid_configuration(factory, message):
     with pytest.raises(ValueError, match=message):
         factory()
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs", "expected"),
+    [
+        ("se", {}, StandardErrorStop),
+        (" Se ", {}, StandardErrorStop),
+        ("max-items", {"max_items": 5}, MaxItemsStop),
+        ("MAX_ITEMS", {"max_items": 5}, MaxItemsStop),
+        ("theta-change", {}, ThetaChangeStop),
+        ("Theta_Change", {}, ThetaChangeStop),
+    ],
+)
+def test_factory_names_match_the_shared_rule(name, kwargs, expected):
+    assert isinstance(create_stopping_rule(name, **kwargs), expected)

@@ -1,14 +1,14 @@
 //! Computerized Adaptive Testing (CAT) functions.
 
 use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, ToPyArray};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::utils::{
-    EPSILON, compute_eap_with_se, fisher_info_2pl_items, log_sigmoid, normalize_log_posterior,
-    sigmoid,
+    EPSILON, check_quadrature, compute_eap_with_se, normalize_log_posterior, sigmoid, stream_seed,
 };
 
 /// Item parameters for 2PL model
@@ -49,107 +49,93 @@ type CATMseResult<'py> = (
     Bound<'py, PyArray1<f64>>,
 );
 
-/// Compute Fisher information for all items at a given theta
-#[pyfunction]
-pub fn cat_compute_item_info<'py>(
-    py: Python<'py>,
-    theta: f64,
-    discrimination: PyReadonlyArray1<f64>,
-    difficulty: PyReadonlyArray1<f64>,
-) -> Bound<'py, PyArray1<f64>> {
-    let disc = discrimination.as_array().to_vec();
-    let diff = difficulty.as_array().to_vec();
-    let info = fisher_info_2pl_items(theta, &disc, &diff);
-    Array1::from_vec(info).to_pyarray(py)
+/// Validated item bank, grid and stopping controls of one native call.
+struct SimulationInputs {
+    thetas: Vec<f64>,
+    discrimination: Vec<f64>,
+    difficulty: Vec<f64>,
+    nodes: Vec<f64>,
+    weights: Vec<f64>,
+    stopping: StoppingRule,
+    n_replications: usize,
 }
 
-/// Select item with maximum Fisher information from available items
-#[pyfunction]
-pub fn cat_select_max_info(
-    theta: f64,
-    discrimination: PyReadonlyArray1<f64>,
-    difficulty: PyReadonlyArray1<f64>,
-    available_mask: PyReadonlyArray1<bool>,
-) -> i32 {
-    let disc = discrimination.as_array();
-    let diff = difficulty.as_array();
-    let available = available_mask.as_array();
-    let n_items = disc.len();
-
-    let mut best_item: i32 = -1;
-    let mut best_info: f64 = f64::NEG_INFINITY;
-
-    for j in 0..n_items {
-        if !available[j] {
-            continue;
-        }
-        let z = disc[j] * (theta - diff[j]);
-        let p = sigmoid(z);
-        let q = 1.0 - p;
-        let info = disc[j] * disc[j] * p * q;
-
-        if info > best_info {
-            best_info = info;
-            best_item = j as i32;
-        }
-    }
-
-    best_item
-}
-
-/// Incremental EAP update after a single response
-#[pyfunction]
 #[allow(clippy::too_many_arguments)]
-pub fn cat_eap_update<'py>(
-    py: Python<'py>,
-    administered_items: PyReadonlyArray1<i32>,
-    responses: PyReadonlyArray1<i32>,
+fn simulation_inputs(
+    thetas: PyReadonlyArray1<f64>,
     discrimination: PyReadonlyArray1<f64>,
     difficulty: PyReadonlyArray1<f64>,
     quad_points: PyReadonlyArray1<f64>,
     quad_weights: PyReadonlyArray1<f64>,
-) -> (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>) {
-    let items = administered_items.as_array();
-    let resp = responses.as_array();
-    let disc = discrimination.as_array();
-    let diff = difficulty.as_array();
-    let nodes = quad_points.as_array();
-    let weights = quad_weights.as_array();
-
-    let n_quad = nodes.len();
-    let n_administered = items.len();
-
-    let mut log_likes = vec![0.0; n_quad];
-    for q in 0..n_quad {
-        let theta = nodes[q];
-        let mut ll = 0.0;
-        for i in 0..n_administered {
-            let j = items[i] as usize;
-            let r = resp[i];
-            if r >= 0 {
-                let z = disc[j] * (theta - diff[j]);
-                if r == 1 {
-                    ll += log_sigmoid(z);
-                } else {
-                    ll += log_sigmoid(-z);
-                }
-            }
-        }
-        log_likes[q] = ll;
+    se_threshold: f64,
+    max_items: i32,
+    min_items: i32,
+    n_replications: i32,
+) -> PyResult<SimulationInputs> {
+    let discrimination = discrimination.as_array().to_vec();
+    let difficulty = difficulty.as_array().to_vec();
+    if discrimination.len() != difficulty.len() {
+        return Err(PyValueError::new_err(
+            "discrimination and difficulty must have the same length",
+        ));
     }
+    let nodes = quad_points.as_array().to_vec();
+    let weights = quad_weights.as_array().to_vec();
+    check_quadrature(&nodes, &weights)?;
+    let count = |value: i32, name: &str| {
+        usize::try_from(value)
+            .map_err(|_| PyValueError::new_err(format!("{name} must be non-negative")))
+    };
+    let path_width = count(max_items, "max_items")?.min(discrimination.len());
+    if se_threshold.is_nan() || se_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "se_threshold must be a non-negative number",
+        ));
+    }
+    Ok(SimulationInputs {
+        thetas: thetas.as_array().to_vec(),
+        stopping: StoppingRule {
+            se_threshold,
+            max_items: path_width,
+            min_items: count(min_items, "min_items")?.min(path_width),
+        },
+        n_replications: count(n_replications, "n_replications")?,
+        discrimination,
+        difficulty,
+        nodes,
+        weights,
+    })
+}
 
-    let log_posterior: Vec<f64> = (0..n_quad)
-        .map(|q| log_likes[q] + weights[q].ln())
-        .collect();
-
-    let posterior = normalize_log_posterior(&log_posterior);
-    let nodes_vec: Vec<f64> = nodes.to_vec();
-    let (theta_eap, se) = compute_eap_with_se(&posterior, &nodes_vec);
-
-    (
-        Array1::from_vec(vec![theta_eap]).to_pyarray(py),
-        Array1::from_vec(vec![se]).to_pyarray(py),
-    )
+impl SimulationInputs {
+    /// Simulate replication `rep` of theta `theta_idx` on its own stream.
+    ///
+    /// The stream mixes `seed` with both indices, so sessions of one call,
+    /// and of neighbouring seeds, are independent; additive seeds such as
+    /// `seed + 1000 * theta_idx + rep` replayed each other's streams.
+    fn session(
+        &self,
+        theta_idx: usize,
+        rep: usize,
+        seed: u64,
+    ) -> (f64, f64, usize, Vec<i32>, Vec<i32>) {
+        let mut rng = StdRng::seed_from_u64(stream_seed(seed, &[theta_idx as u64, rep as u64]));
+        let items = ItemBank {
+            discrimination: &self.discrimination,
+            difficulty: &self.difficulty,
+        };
+        let quad = Quadrature {
+            points: &self.nodes,
+            weights: &self.weights,
+        };
+        cat_simulate_single(
+            self.thetas[theta_idx],
+            &items,
+            &quad,
+            &self.stopping,
+            &mut rng,
+        )
+    }
 }
 
 /// Simulate a single CAT session and return results
@@ -238,6 +224,9 @@ fn cat_simulate_single(
 }
 
 /// Run batch CAT simulations in parallel
+///
+/// Simulates `n_replications` sessions of every theta, in theta-major order,
+/// each on its own random stream (see [`SimulationInputs::session`]).
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn cat_simulate_batch<'py>(
@@ -252,59 +241,40 @@ pub fn cat_simulate_batch<'py>(
     min_items: i32,
     n_replications: i32,
     seed: u64,
-) -> CATBatchResult<'py> {
-    let thetas = true_thetas.as_array().to_vec();
-    let disc = discrimination.as_array().to_vec();
-    let diff = difficulty.as_array().to_vec();
-    let nodes = quad_points.as_array().to_vec();
-    let weights = quad_weights.as_array().to_vec();
-
-    let n_thetas = thetas.len();
-    let n_reps = usize::try_from(n_replications).unwrap_or(0);
-    let n_total = n_thetas * n_reps;
-    let path_width = usize::try_from(max_items).unwrap_or(0).min(disc.len());
-
-    let stopping = StoppingRule {
+) -> PyResult<CATBatchResult<'py>> {
+    let inputs = simulation_inputs(
+        true_thetas,
+        discrimination,
+        difficulty,
+        quad_points,
+        quad_weights,
         se_threshold,
-        max_items: path_width,
-        min_items: usize::try_from(min_items).unwrap_or(0).min(path_width),
-    };
+        max_items,
+        min_items,
+        n_replications,
+    )?;
+    let n_reps = inputs.n_replications;
+    let n_total = inputs.thetas.len() * n_reps;
+    let path_width = inputs.stopping.max_items;
 
-    let tasks: Vec<(usize, usize)> = (0..n_thetas)
-        .flat_map(|t| (0..n_reps).map(move |r| (t, r)))
-        .collect();
-
-    let results: Vec<CATSimulationRecord> = tasks
-        .par_iter()
-        .map(|(theta_idx, rep)| {
-            let task_seed = seed
-                .wrapping_add(*theta_idx as u64 * 1000)
-                .wrapping_add(*rep as u64);
-            let mut rng = StdRng::seed_from_u64(task_seed);
-
-            let items = ItemBank {
-                discrimination: &disc,
-                difficulty: &diff,
-            };
-            let quad = Quadrature {
-                points: &nodes,
-                weights: &weights,
-            };
-
-            let true_theta = thetas[*theta_idx];
-            let (est_theta, est_se, n_items, administered, responses) =
-                cat_simulate_single(true_theta, &items, &quad, &stopping, &mut rng);
-
-            (
-                est_theta,
-                est_se,
-                n_items,
-                true_theta,
-                administered,
-                responses,
-            )
-        })
-        .collect();
+    let results: Vec<CATSimulationRecord> = py.detach(|| {
+        (0..n_total)
+            .into_par_iter()
+            .map(|task| {
+                let (theta_idx, rep) = (task / n_reps, task % n_reps);
+                let (est_theta, est_se, n_items, administered, responses) =
+                    inputs.session(theta_idx, rep, seed);
+                (
+                    est_theta,
+                    est_se,
+                    n_items,
+                    inputs.thetas[theta_idx],
+                    administered,
+                    responses,
+                )
+            })
+            .collect()
+    });
 
     let mut theta_est = Array1::zeros(n_total);
     let mut se_est = Array1::zeros(n_total);
@@ -324,17 +294,21 @@ pub fn cat_simulate_batch<'py>(
         }
     }
 
-    (
-        theta_est.to_pyarray(py),
-        se_est.to_pyarray(py),
-        n_items.to_pyarray(py),
-        true_theta_out.to_pyarray(py),
-        administered_out.to_pyarray(py),
-        responses_out.to_pyarray(py),
-    )
+    Ok((
+        theta_est.into_pyarray(py),
+        se_est.into_pyarray(py),
+        n_items.into_pyarray(py),
+        true_theta_out.into_pyarray(py),
+        administered_out.into_pyarray(py),
+        responses_out.into_pyarray(py),
+    ))
 }
 
 /// Compute conditional MSE at specified theta values
+///
+/// Runs `n_replications` sessions of every theta, each on its own random
+/// stream as in [`cat_simulate_batch`], and returns each theta's bias, mean
+/// squared error and mean test length.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn cat_conditional_mse<'py>(
@@ -349,87 +323,63 @@ pub fn cat_conditional_mse<'py>(
     min_items: i32,
     n_replications: i32,
     seed: u64,
-) -> CATMseResult<'py> {
-    let thetas = eval_thetas.as_array().to_vec();
-    let disc = discrimination.as_array().to_vec();
-    let diff = difficulty.as_array().to_vec();
-    let nodes = quad_points.as_array().to_vec();
-    let weights = quad_weights.as_array().to_vec();
-
-    let n_thetas = thetas.len();
-    let n_reps = n_replications as usize;
-
-    let stopping = StoppingRule {
+) -> PyResult<CATMseResult<'py>> {
+    let inputs = simulation_inputs(
+        eval_thetas,
+        discrimination,
+        difficulty,
+        quad_points,
+        quad_weights,
         se_threshold,
-        max_items: max_items as usize,
-        min_items: min_items as usize,
-    };
+        max_items,
+        min_items,
+        n_replications,
+    )?;
+    let n_reps = inputs.n_replications;
+    if n_reps == 0 {
+        return Err(PyValueError::new_err("n_replications must be at least 1"));
+    }
 
-    let stats: Vec<(f64, f64, f64)> = thetas
-        .par_iter()
-        .enumerate()
-        .map(|(t_idx, &true_theta)| {
-            let mut estimates = Vec::with_capacity(n_reps);
-            let mut n_items_sum = 0.0;
+    let stats: Vec<(f64, f64, f64)> = py.detach(|| {
+        (0..inputs.thetas.len())
+            .into_par_iter()
+            .map(|t_idx| {
+                let true_theta = inputs.thetas[t_idx];
+                let mut error_sum = 0.0;
+                let mut squared_sum = 0.0;
+                let mut n_items_sum = 0.0;
+                for rep in 0..n_reps {
+                    let (est_theta, _, n_items, _, _) = inputs.session(t_idx, rep, seed);
+                    error_sum += est_theta - true_theta;
+                    squared_sum += (est_theta - true_theta).powi(2);
+                    n_items_sum += n_items as f64;
+                }
+                let n = n_reps as f64;
+                (error_sum / n, squared_sum / n, n_items_sum / n)
+            })
+            .collect()
+    });
 
-            let items = ItemBank {
-                discrimination: &disc,
-                difficulty: &diff,
-            };
-            let quad = Quadrature {
-                points: &nodes,
-                weights: &weights,
-            };
-
-            for rep in 0..n_reps {
-                let task_seed = seed
-                    .wrapping_add(t_idx as u64 * 10000)
-                    .wrapping_add(rep as u64);
-                let mut rng = StdRng::seed_from_u64(task_seed);
-
-                let (est_theta, _, n_items, _, _) =
-                    cat_simulate_single(true_theta, &items, &quad, &stopping, &mut rng);
-
-                estimates.push(est_theta);
-                n_items_sum += n_items as f64;
-            }
-
-            let mean_est: f64 = estimates.iter().sum::<f64>() / n_reps as f64;
-            let bias = mean_est - true_theta;
-            let mse: f64 = estimates
-                .iter()
-                .map(|&e| (e - true_theta).powi(2))
-                .sum::<f64>()
-                / n_reps as f64;
-            let avg_items = n_items_sum / n_reps as f64;
-
-            (bias, mse, avg_items)
-        })
-        .collect();
-
+    let n_thetas = inputs.thetas.len();
     let mut bias = Array1::zeros(n_thetas);
     let mut mse = Array1::zeros(n_thetas);
     let mut avg_items = Array1::zeros(n_thetas);
-
     for (i, (b, m, a)) in stats.into_iter().enumerate() {
         bias[i] = b;
         mse[i] = m;
         avg_items[i] = a;
     }
 
-    (
-        eval_thetas.as_array().to_owned().to_pyarray(py),
-        bias.to_pyarray(py),
-        mse.to_pyarray(py),
-        avg_items.to_pyarray(py),
-    )
+    Ok((
+        Array1::from(inputs.thetas).into_pyarray(py),
+        bias.into_pyarray(py),
+        mse.into_pyarray(py),
+        avg_items.into_pyarray(py),
+    ))
 }
 
 /// Register CAT functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(cat_compute_item_info, m)?)?;
-    m.add_function(wrap_pyfunction!(cat_select_max_info, m)?)?;
-    m.add_function(wrap_pyfunction!(cat_eap_update, m)?)?;
     m.add_function(wrap_pyfunction!(cat_simulate_batch, m)?)?;
     m.add_function(wrap_pyfunction!(cat_conditional_mse, m)?)?;
     Ok(())

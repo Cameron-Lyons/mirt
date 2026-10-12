@@ -112,6 +112,34 @@ def test_invalid_node_indices_are_rejected() -> None:
         gaussian.conditional_variance(-1)
 
 
+def test_ising_conditional_probability_accepts_only_conditioning_nodes() -> None:
+    model = IsingModel(4)
+    model.set_thresholds(np.array([0.3, -0.2, 0.5, -0.7]))
+    model.set_interactions(
+        np.array(
+            [
+                [0.0, 0.8, -0.4, 0.1],
+                [0.8, 0.0, 0.3, 0.0],
+                [-0.4, 0.3, 0.0, -0.6],
+                [0.1, 0.0, -0.6, 0.0],
+            ]
+        )
+    )
+    responses = np.array([[0, 1, 1, 0], [1, 0, 1, 1], [1, 1, 0, 0]])
+    probabilities = model.conditional_probabilities(responses)
+
+    for node in range(4):
+        others = np.delete(responses, node, axis=1)
+        np.testing.assert_allclose(
+            model.conditional_probability(node, others), probabilities[:, node]
+        )
+        np.testing.assert_allclose(
+            model.conditional_probability(node, others[0]), probabilities[:1, node]
+        )
+    with pytest.raises(MirtDataError, match="4 or 3 columns"):
+        model.conditional_probability(0, np.zeros((1, 2), dtype=int))
+
+
 def test_independent_ising_pseudolikelihood_has_closed_form() -> None:
     responses = np.array([[0, 0, 1], [1, 1, 0], [1, 0, 1]])
     expected = -3.0 * np.log(2.0)
@@ -370,6 +398,83 @@ def test_fit_ising_improves_objective_and_reports_convergence() -> None:
     copied = fitted.copy()
     np.testing.assert_array_equal(copied.objective_history, fitted.objective_history)
     assert copied.converged == fitted.converged
+
+
+def _chain_ising_responses(n_nodes: int, n_samples: int, seed: int) -> np.ndarray:
+    weights = np.zeros((n_nodes, n_nodes))
+    index = np.arange(n_nodes - 1)
+    weights[index, index + 1] = weights[index + 1, index] = 0.8
+    model = IsingModel(n_nodes).set_interactions(weights)
+    model.set_thresholds(-0.4 * weights.sum(axis=1))
+    return model.sample(n_samples, method="exact", seed=seed)
+
+
+def _numerical_pseudo_likelihood_gradient(
+    model: IsingModel, responses: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Central differences of the public pseudolikelihood per parameter."""
+    step = 1e-5
+
+    def difference(thresholds: np.ndarray, interactions: np.ndarray) -> float:
+        plus = model.copy().set_thresholds(model.thresholds + thresholds)
+        plus.set_interactions(model.interactions + interactions)
+        minus = model.copy().set_thresholds(model.thresholds - thresholds)
+        minus.set_interactions(model.interactions - interactions)
+        return (
+            plus.pseudo_likelihood(responses) - minus.pseudo_likelihood(responses)
+        ) / (2.0 * step)
+
+    n_nodes = model.n_nodes
+    no_edges = np.zeros((n_nodes, n_nodes))
+    threshold_gradient = np.array(
+        [difference(step * np.eye(n_nodes)[node], no_edges) for node in range(n_nodes)]
+    )
+    edge_gradient = []
+    for row, column in zip(*np.triu_indices(n_nodes, k=1), strict=True):
+        shift = np.zeros((n_nodes, n_nodes))
+        shift[row, column] = shift[column, row] = step
+        edge_gradient.append(difference(np.zeros(n_nodes), shift))
+    return threshold_gradient, np.asarray(edge_gradient)
+
+
+@pytest.mark.parametrize("regularization", [0.0, 0.02])
+def test_fit_ising_defaults_reach_the_penalized_optimum(regularization: float) -> None:
+    responses = _chain_ising_responses(10, 3000, seed=1)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        fitted, _ = fit_ising(responses, regularization=regularization)
+
+    assert fitted.converged
+    assert fitted.objective_history.size == fitted.n_iterations + 1
+    assert np.all(np.diff(fitted.objective_history) >= -1e-12)
+    threshold_gradient, edge_gradient = _numerical_pseudo_likelihood_gradient(
+        fitted, responses
+    )
+    edges = fitted.interactions[np.triu_indices(10, k=1)]
+    nonzero = edges != 0.0
+    # Karush-Kuhn-Tucker conditions of the L1-penalized pseudolikelihood.
+    np.testing.assert_allclose(threshold_gradient, 0.0, atol=1e-5)
+    np.testing.assert_allclose(
+        edge_gradient[nonzero] - regularization * np.sign(edges[nonzero]),
+        0.0,
+        atol=1e-5,
+    )
+    assert np.all(np.abs(edge_gradient[~nonzero]) <= regularization + 1e-5)
+    if regularization > 0.0:
+        # The nine chain edges survive and most absent edges are exact zeros.
+        assert np.all(fitted.interactions[np.arange(9), np.arange(1, 10)] != 0.0)
+        assert np.count_nonzero(~nonzero) >= 30
+
+
+def test_fit_ising_warns_when_stopped_before_convergence() -> None:
+    responses = _chain_ising_responses(10, 3000, seed=1)
+
+    with pytest.warns(RuntimeWarning, match="optimality residual"):
+        fitted, _ = fit_ising(responses, max_iter=2)
+
+    assert not fitted.converged
+    assert fitted.n_iterations == 2
 
 
 @pytest.mark.parametrize(

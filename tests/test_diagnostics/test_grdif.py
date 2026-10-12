@@ -360,3 +360,59 @@ class TestGRDIFEdgeCases:
         pairwise = compute_pairwise_rdif(data, groups, model="2PL")
         expected_pairs = n_groups * (n_groups - 1) // 2
         assert len(pairwise["pairs"]) == expected_pairs
+
+
+def _impact_data(seed: int, dif_shift: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    """2PL responses with a focal mean of -1 and optional DIF in item 0."""
+    rng = np.random.default_rng(seed)
+    n_per_group, n_items = 1000, 20
+    discrimination = rng.uniform(0.8, 2.0, n_items)
+    difficulty = np.tile(rng.uniform(-1.5, 1.5, n_items), (2 * n_per_group, 1))
+    difficulty[n_per_group:, 0] += dif_shift
+    theta = np.concatenate(
+        [rng.normal(0.0, 1.0, n_per_group), rng.normal(-1.0, 1.0, n_per_group)]
+    )
+    prob = 1.0 / (1.0 + np.exp(-discrimination * (theta[:, None] - difficulty)))
+    data = (rng.random(prob.shape) < prob).astype(np.int_)
+    return data, np.repeat(["reference", "focal"], n_per_group)
+
+
+class TestGRDIFUnderImpact:
+    """Groups that differ in ability but not in item functioning."""
+
+    def test_dif_free_items_keep_nominal_false_positive_rate(self):
+        shares = {suffix: [] for suffix in ("r", "s", "rs")}
+        pairwise_shares = []
+        for seed in (7, 8):
+            data, groups = _impact_data(seed)
+            result = compute_grdif(data, groups, model="2PL")
+            for suffix, values in shares.items():
+                values.append(np.mean(result[f"p_value_{suffix}"] < 0.05))
+            pairwise = compute_pairwise_rdif(data, groups, model="2PL")
+            pairwise_shares.append(np.mean(pairwise["p_values_s"] < 0.05))
+
+        # Raw group MSRs, not centred at their model expectation P(1 - P),
+        # flagged 70-90% of these items through GRDIF_S and GRDIF_RS.
+        for suffix, values in shares.items():
+            assert np.mean(values) <= 0.15, suffix
+        assert np.mean(pairwise_shares) <= 0.15
+        # Shrunken EAP abilities bias the raw residuals (GRDIF_R), but the
+        # centred squared residuals stay calibrated.
+        eap = compute_grdif(data, groups, model="2PL", scoring_method="EAP")
+        assert np.mean(eap["p_value_s"] < 0.05) <= 0.2
+
+    def test_dif_is_still_detected_under_impact(self):
+        data, groups = _impact_data(9, dif_shift=0.8)
+
+        result = compute_grdif(data, groups, model="2PL")
+
+        assert result["p_value_r"][0] < 1e-6
+        assert result["p_value_rs"][0] < 1e-6
+        assert np.mean(result["p_value_rs"][1:] < 0.05) <= 0.15
+        expected = result["msr_expected"]
+        assert expected.shape == result["msr"].shape
+        # The focal group answers further from P = 0.5 on average, so the
+        # raw MSRs differ between groups while their excess does not.
+        excess_spread = grdif_effect_size(data, groups, result, effect_type="delta_msr")
+        raw_spread = np.ptp(result["msr"], axis=0)
+        assert np.median(excess_spread[1:]) < np.median(raw_spread[1:])

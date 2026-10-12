@@ -365,6 +365,36 @@ def test_s_x2_rejects_invalid_inference_controls(options, message):
         compute_s_x2(TwoParameterLogistic(4), np.ones((10, 4)), **options)
 
 
+def test_default_quadrature_shrinks_with_the_number_of_factors():
+    """41 points in four factors exceed the grid bound, which used to raise."""
+    from mirt.exceptions import MirtValidationError
+    from mirt.models import TwoParameterLogistic
+
+    rng = np.random.default_rng(0)
+    slopes = np.kron(np.eye(4), np.full((3, 1), 1.4))
+    model = TwoParameterLogistic(12, n_factors=4)
+    model.set_parameters(discrimination=slopes, difficulty=np.linspace(-1, 1, 12))
+    theta = rng.standard_normal((300, 4))
+    probability = 1 / (1 + np.exp(-(theta @ slopes.T - 1.4 * np.linspace(-1, 1, 12))))
+    responses = (rng.random(probability.shape) < probability).astype(int)
+
+    default = compute_s_x2(model, responses)
+    explicit = compute_s_x2(model, responses, n_quadpts=9)
+    for name in ("S_X2", "df", "p_value"):
+        assert_allclose(default[name], explicit[name])
+    assert [itemfit_module._sx2_quadpts(None, f) for f in (1, 2, 3, 5, 8)] == [
+        41,
+        41,
+        21,
+        7,
+        4,
+    ]
+    with pytest.raises(MirtValidationError, match="omit n_quadpts to use 9"):
+        compute_s_x2(model, responses, n_quadpts=41)
+    with pytest.raises(MirtValidationError, match="quadrature_points"):
+        itemfit_module._sx2_quadpts(None, 17)
+
+
 @pytest.mark.parametrize("value", [np.inf, 0.5, 2])
 def test_s_x2_rejects_invalid_observed_categories(value):
     from mirt.models import TwoParameterLogistic
@@ -500,8 +530,8 @@ def test_multidimensional_latent_mixture_and_scaled_probability_masses():
     assert_allclose(result["S_X2"], expected)
     assert_allclose(result["df"], degrees)
     model.n_factors = 4
-    with pytest.raises(ValueError, match="bounded explicit quadrature"):
-        compute_s_x2(model, responses)
+    with pytest.raises(ValueError, match="supply quadrature_points"):
+        compute_s_x2(model, responses, n_quadpts=41)
 
 
 def test_s_x2_bounds_response_counting_and_evaluates_only_quadrature_nodes(monkeypatch):

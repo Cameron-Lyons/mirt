@@ -392,3 +392,68 @@ def test_unobserved_items_skip_optimization(kind, monkeypatch):
     estimator._optimize_item_mc(model, 1, responses, theta, weights)
     for name, values in original.items():
         np.testing.assert_array_equal(model.parameters[name], values)
+
+
+def _sparse_middle_category_responses():
+    """Graded responses whose item 0 uses category 1 twice in 600 persons."""
+    rng = np.random.default_rng(5)
+    theta = rng.standard_normal(600)
+    thresholds = np.tile([-1.0, 0.0, 1.0], (8, 1))
+    thresholds[0] = [-1.0, -0.98, 1.0]
+    cumulative = 1 / (1 + np.exp(-1.5 * (theta[:, None, None] - thresholds[None])))
+    responses = (rng.random((600, 8))[:, :, None] < cumulative).sum(axis=2)
+    assert np.bincount(responses[:, 0], minlength=4)[1] == 2
+    return responses
+
+
+def _assert_ordered_graded_item(model, item):
+    from mirt.estimation._graded_order import THRESHOLD_GAP
+
+    thresholds = model.parameters["thresholds"][item]
+    assert np.all(np.diff(thresholds) >= THRESHOLD_GAP * (1 - 1e-9))
+    probabilities = model.probability(np.linspace(-4, 4, 17)[:, None], item)
+    assert np.all(probabilities >= 0.0)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: QMCEMEstimator(n_samples=64, seed=1),
+        lambda: MCEMEstimator(n_samples=50, seed=1),
+        lambda: StochasticEMEstimator(n_chains=2, seed=1),
+    ],
+    ids=["qmcem", "mcem", "stochastic"],
+)
+def test_sparse_graded_category_keeps_thresholds_ordered(factory):
+    # Shared-grid and person-specific M-steps both used to install [6, -6, 1.4]
+    # after one iteration, giving category 1 probabilities near -1.
+    responses = _sparse_middle_category_responses()
+    model = GradedResponseModel(8, n_categories=4)
+    estimator = factory()
+    estimator._rng = np.random.default_rng(1)
+    samples, weights = estimator._e_step_mc(model, responses, np.zeros(1), np.eye(1), 1)
+
+    estimator._m_step_mc(model, responses, samples, weights)
+
+    for item in range(model.n_items):
+        _assert_ordered_graded_item(model, item)
+
+
+def test_sparse_graded_category_fit_matches_em_thresholds():
+    from mirt.estimation.em import EMEstimator
+
+    responses = _sparse_middle_category_responses()
+    reference = EMEstimator(compute_standard_errors=False).fit(
+        GradedResponseModel(8, n_categories=4), responses
+    )
+    result = QMCEMEstimator(seed=1).fit(
+        GradedResponseModel(8, n_categories=4), responses
+    )
+
+    assert result.converged
+    _assert_ordered_graded_item(result.model, 0)
+    np.testing.assert_allclose(
+        result.model.parameters["thresholds"][0],
+        reference.model.parameters["thresholds"][0],
+        atol=0.05,
+    )

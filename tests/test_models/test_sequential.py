@@ -10,6 +10,7 @@ from mirt.models.sequential import (
     ContinuationRatioModel,
     SequentialResponseModel,
 )
+from mirt.utils.information import testinfo as total_information
 
 MODEL_CLASSES = (
     SequentialResponseModel,
@@ -429,3 +430,22 @@ def test_copy_is_independent(configured_model):
     np.testing.assert_array_equal(copied.thresholds, configured_model.thresholds)
     copied.thresholds[0, 0] = 99.0
     assert configured_model.thresholds[0, 0] != 99.0
+
+
+def test_adjacent_category_information_stays_nonnegative_in_the_tails():
+    model = AdjacentCategoryModel(1, n_categories=5)
+    model.set_parameters(
+        discrimination=np.array([2.0]), thresholds=np.array([[-1.0, 0.0, 1.0, 2.0]])
+    )
+    theta = np.linspace(-40.0, 40.0, 8001)
+
+    information = model.information(theta, 0)
+
+    # E[k^2] - E[k]^2 gave -7.1e-15 at theta = 20 and 24 negative values here.
+    assert np.all(information >= 0.0)
+    probabilities = model.probability(theta, 0)
+    categories = np.arange(5)
+    mean = probabilities @ categories
+    centered = np.sum(probabilities * (categories - mean[:, None]) ** 2, axis=1)
+    np.testing.assert_allclose(information, 4.0 * centered, rtol=1e-12, atol=0.0)
+    assert np.all(total_information(model, np.linspace(-25.0, 25.0, 11)) >= 0.0)

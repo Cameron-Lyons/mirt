@@ -5,12 +5,14 @@ placed on the target metric with
 
 ``a_linked = scaling * a_source @ rotation``
 
-and, for models with a linear item intercept,
+and, for every linear item intercept,
 
 ``d_linked = d_source - (a_source @ rotation) @ translation``.
 
-The corresponding latent-coordinate transformation is implemented by
-:func:`transform_mirt_theta`.
+Graded response and generalized partial credit models have one intercept
+``-sum(a) * b_k`` per category threshold or step, and each one transforms
+this way. The corresponding latent-coordinate transformation is implemented
+by :func:`transform_mirt_theta`.
 """
 
 from __future__ import annotations
@@ -29,7 +31,9 @@ if TYPE_CHECKING:
 
 
 FloatArray = NDArray[np.float64]
-ParameterStyle = Literal["slopes_intercepts", "discrimination_difficulty"]
+ParameterStyle = Literal[
+    "slopes_intercepts", "discrimination_difficulty", "discrimination_locations"
+]
 
 
 @dataclass
@@ -49,9 +53,12 @@ class ProcrustesResult:
     transformed_loadings
         All source slopes transformed to the target metric.
     transformed_intercepts
-        All source linear intercepts transformed to the target metric.
+        All source linear intercepts transformed to the target metric. GRM
+        and GPCM models have one column per category intercept
+        ``-sum(a) * b_k``; columns beyond an item's categories are zero.
     intercept_rmse
-        Root mean squared anchor-intercept residual, when available.
+        Root mean squared anchor-intercept residual over every category
+        intercept, when available.
     anchor_items_old, anchor_items_new
         Anchor mappings used to estimate the transformation.
     """
@@ -69,9 +76,37 @@ class ProcrustesResult:
 
 @dataclass(frozen=True)
 class _LinearParameters:
+    """Slopes and intercepts of a compensatory model.
+
+    ``intercepts`` has one value per item, or for GRM and GPCM models one
+    column per category location stored as ``location_name``; ``active``
+    marks the columns within each item's categories.
+    """
+
     slopes: FloatArray
     intercepts: FloatArray
     style: ParameterStyle
+    location_name: str | None = None
+    active: NDArray[np.bool_] | None = None
+
+    def intercept_columns(self) -> tuple[FloatArray, NDArray[np.bool_]]:
+        """Intercepts as a matrix with one row per item, and its active mask."""
+        if self.intercepts.ndim == 1:
+            return self.intercepts[:, None], np.ones(
+                (self.intercepts.size, 1), dtype=np.bool_
+            )
+        assert self.active is not None
+        return self.intercepts, self.active
+
+    def translated_intercepts(
+        self, rotated_slopes: FloatArray, shift: FloatArray
+    ) -> FloatArray:
+        """Every active intercept ``d - (a @ R) @ t``; padding stays zero."""
+        offset = rotated_slopes @ shift
+        if self.intercepts.ndim == 1:
+            return self.intercepts - offset
+        assert self.active is not None
+        return np.where(self.active, self.intercepts - offset[:, None], 0.0)
 
 
 def _as_finite_matrix(value: object, name: str) -> FloatArray:
@@ -121,16 +156,27 @@ def _validate_solver_controls(max_iter: int, tol: float) -> None:
 
 
 def _extract_linear_parameters(model: BaseItemModel) -> _LinearParameters:
-    """Extract the slope/intercept form used by compensatory MIRT models."""
+    """Extract the slope/intercept form used by compensatory MIRT models.
+
+    GRM and GPCM models list their category locations ``b_k`` in
+    ``_slope_sum_locations``; their intercepts are ``-sum(a) * b_k``.
+    """
     try:
         params = model.parameters
     except (AttributeError, TypeError) as exc:
         raise ValueError("model must expose a parameters mapping") from exc
 
+    category_locations = [
+        name
+        for name in getattr(model, "_slope_sum_locations", ())
+        if name in params and np.ndim(params[name]) == 2
+    ]
     if "slopes" in params and "intercepts" in params:
         slopes = _as_finite_matrix(params["slopes"], "model slopes")
         intercepts = np.asarray(params["intercepts"], dtype=np.float64)
         style: ParameterStyle = "slopes_intercepts"
+    elif "discrimination" in params and len(category_locations) == 1:
+        return _extract_category_intercepts(model, params, category_locations[0])
     elif "discrimination" in params and "difficulty" in params:
         slopes = _as_finite_matrix(params["discrimination"], "model discrimination")
         difficulty = np.asarray(params["difficulty"], dtype=np.float64)
@@ -145,24 +191,55 @@ def _extract_linear_parameters(model: BaseItemModel) -> _LinearParameters:
         style = "discrimination_difficulty"
     else:
         raise ValueError(
-            "model must use either slopes/intercepts or multidimensional "
-            "discrimination with scalar difficulty"
+            "model must use either slopes/intercepts, multidimensional "
+            "discrimination with scalar difficulty, or multidimensional "
+            "discrimination with GRM thresholds or GPCM steps"
         )
 
     if intercepts.ndim != 1 or intercepts.shape[0] != slopes.shape[0]:
         raise ValueError("model intercepts must contain one value per item")
     if not np.all(np.isfinite(intercepts)):
         raise ValueError("model intercepts must contain only finite values")
+    _validate_slope_dimensions(model, slopes)
+    return _LinearParameters(slopes, intercepts, style)
+
+
+def _validate_slope_dimensions(model: BaseItemModel, slopes: FloatArray) -> None:
     if slopes.shape[1] < 2:
         raise ValueError("multidimensional linking requires at least two factors")
-
     n_items = getattr(model, "n_items", slopes.shape[0])
     n_factors = getattr(model, "n_factors", slopes.shape[1])
     if slopes.shape != (n_items, n_factors):
         raise ValueError(
             "model slope shape does not match its declared item/factor dimensions"
         )
-    return _LinearParameters(slopes, intercepts, style)
+
+
+def _extract_category_intercepts(
+    model: BaseItemModel,
+    params: dict[str, FloatArray],
+    location_name: str,
+) -> _LinearParameters:
+    """Extract one intercept ``-sum(a) * b_k`` per GRM threshold or GPCM step."""
+    if np.ndim(params["discrimination"]) != 2:
+        raise ValueError("multidimensional linking requires at least two factors")
+    slopes = _as_finite_matrix(params["discrimination"], "model discrimination")
+    locations = np.asarray(params[location_name], dtype=np.float64)
+    if locations.shape[0] != slopes.shape[0]:
+        raise ValueError(f"model {location_name} must contain one row per item")
+    category_counts = np.asarray(model.n_categories, dtype=np.intp)
+    if category_counts.shape != (slopes.shape[0],) or np.any(
+        category_counts - 1 > locations.shape[1]
+    ):
+        raise ValueError(f"model {location_name} do not cover every item's categories")
+    active = np.arange(locations.shape[1])[None, :] < (category_counts[:, None] - 1)
+    if not np.all(np.isfinite(locations[active])):
+        raise ValueError(f"model {location_name} must contain only finite values")
+    intercepts = np.where(active, -np.sum(slopes, axis=1)[:, None] * locations, 0.0)
+    _validate_slope_dimensions(model, slopes)
+    return _LinearParameters(
+        slopes, intercepts, "discrimination_locations", location_name, active
+    )
 
 
 def _validate_anchor_indices(
@@ -195,19 +272,29 @@ def _validate_anchor_indices(
 def _difficulty_from_intercepts(
     slopes: FloatArray, intercepts: FloatArray
 ) -> FloatArray:
+    """Locations ``-d / sum(a)`` of one intercept, or a row of them, per item."""
     slope_sums = np.sum(slopes, axis=1)
     threshold = np.finfo(np.float64).eps * np.maximum(
         1.0, np.linalg.norm(slopes, axis=1)
     )
     near_zero = np.abs(slope_sums) <= threshold
-    if np.any(near_zero & (np.abs(intercepts) > threshold)):
+    row_shape = (-1,) + (1,) * (intercepts.ndim - 1)
+    nonzero = np.abs(intercepts) > threshold.reshape(row_shape)
+    if intercepts.ndim > 1:
+        nonzero = np.any(nonzero, axis=tuple(range(1, intercepts.ndim)))
+    if np.any(near_zero & nonzero):
         raise ValueError(
             "the transformed intercept cannot be represented by the model's "
             "scalar-difficulty parameterization because an item has zero summed slope"
         )
 
     difficulty = np.zeros_like(intercepts)
-    np.divide(-intercepts, slope_sums, out=difficulty, where=~near_zero)
+    np.divide(
+        -intercepts,
+        slope_sums.reshape(row_shape),
+        out=difficulty,
+        where=np.broadcast_to(~near_zero.reshape(row_shape), intercepts.shape),
+    )
     return difficulty
 
 
@@ -228,9 +315,48 @@ def _set_linear_parameters(
                     "loading pattern"
                 )
         model.set_parameters(slopes=slopes, intercepts=intercepts)
+    elif extracted.style == "discrimination_locations":
+        assert extracted.location_name is not None and extracted.active is not None
+        stored = np.asarray(model.parameters[extracted.location_name])
+        locations = np.where(
+            extracted.active, _difficulty_from_intercepts(slopes, intercepts), stored
+        )
+        model.set_parameters(
+            discrimination=slopes, **{extracted.location_name: locations}
+        )
     else:
         difficulty = _difficulty_from_intercepts(slopes, intercepts)
         model.set_parameters(discrimination=slopes, difficulty=difficulty)
+
+
+def _anchor_intercepts(
+    target: _LinearParameters,
+    source: _LinearParameters,
+    old_indices: NDArray[np.intp],
+    new_indices: NDArray[np.intp],
+    source_intercepts: FloatArray | None = None,
+) -> tuple[NDArray[np.intp], FloatArray, FloatArray]:
+    """Pair every anchor intercept of the two forms.
+
+    Returns each anchor's number of intercepts and the target and source
+    intercepts, stacked anchor by anchor. ``source_intercepts`` replaces the
+    source intercepts, for example with transformed values.
+    """
+    target_values, target_active = target.intercept_columns()
+    source_values, source_active = source.intercept_columns()
+    if source_intercepts is not None:
+        source_values = source_intercepts.reshape(source_values.shape)
+    counts = np.count_nonzero(target_active[old_indices], axis=1)
+    if not np.array_equal(counts, np.count_nonzero(source_active[new_indices], axis=1)):
+        raise ValueError(
+            "corresponding anchor items must have the same number of categories"
+        )
+    # Active intercepts lead each row, so equal counts align the categories.
+    return (
+        counts,
+        target_values[old_indices][target_active[old_indices]],
+        source_values[new_indices][source_active[new_indices]],
+    )
 
 
 def link_mirt(
@@ -241,7 +367,7 @@ def link_mirt(
     rotation: Literal["orthogonal", "oblique"] = "orthogonal",
     scaling: bool = True,
     translation: bool = True,
-    gamma: float = 0.5,
+    gamma: float = 1.0,
     max_iter: int = 100,
     tol: float = 1e-6,
 ) -> ProcrustesResult:
@@ -250,8 +376,44 @@ def link_mirt(
     ``model_old`` defines the target metric and ``model_new`` defines the source
     metric.  Anchor slopes identify the rotation and dilation.  Anchor linear
     intercepts identify the latent-coordinate translation by least squares.
-    Models may use native ``slopes``/``intercepts`` parameters or the
-    multidimensional 2PL ``discrimination``/scalar ``difficulty`` convention.
+
+    Parameters
+    ----------
+    model_old : BaseItemModel
+        Target calibration. Models may use native ``slopes``/``intercepts``
+        parameters, the multidimensional 2PL ``discrimination``/scalar
+        ``difficulty`` convention, or multidimensional GRM thresholds or
+        GPCM steps, whose category intercepts ``-sum(a) * b_k`` all
+        identify the translation.
+    model_new : BaseItemModel
+        Source calibration, with the same number of factors.
+    anchor_items_old, anchor_items_new : list[int]
+        Corresponding anchor items. Polytomous anchors must have the same
+        number of categories on both forms.
+    rotation : {"orthogonal", "oblique"}
+        ``"orthogonal"`` fits the orthogonal Procrustes rotation (with
+        reflections). ``"oblique"`` fits a general nonsingular
+        transformation by least squares, the oblique Procrustes linking of
+        Li and Lissitz (2000), which recovers any exact linear metric
+        difference.
+    scaling : bool
+        Whether to estimate a uniform dilation of the rotated slopes.
+    translation : bool
+        Whether to estimate the latent-coordinate translation.
+    gamma : float
+        Oblique weight in ``[0, 1]``. The default 1 is unrestricted least
+        squares; smaller values ridge the oblique transformation toward the
+        orthogonal solution, which ``gamma=0`` returns. The ridge can
+        stabilize nearly collinear anchors but biases a genuine oblique
+        difference. Ignored for orthogonal rotation.
+    max_iter, tol : int, float
+        Validated and retained for call compatibility; the oblique solution
+        is computed directly.
+
+    Returns
+    -------
+    ProcrustesResult
+        Transformation and transformed source parameters.
     """
     if rotation not in {"orthogonal", "oblique"}:
         raise ValueError("rotation must be 'orthogonal' or 'oblique'")
@@ -299,24 +461,28 @@ def link_mirt(
             scaling=bool(scaling),
         )
 
-    rotated_anchor_slopes = A_source @ R
+    counts, target_intercepts, source_intercepts = _anchor_intercepts(
+        target_params, source_params, old_indices, new_indices
+    )
     if translation:
-        intercept_delta = (
-            source_params.intercepts[new_indices]
-            - target_params.intercepts[old_indices]
+        # Every category intercept of an anchor shares its rotated slopes.
+        shift, _, _, _ = linalg.lstsq(
+            np.repeat(A_source @ R, counts, axis=0),
+            source_intercepts - target_intercepts,
         )
-        shift, _, _, _ = linalg.lstsq(rotated_anchor_slopes, intercept_delta)
     else:
         shift = np.zeros(n_factors, dtype=np.float64)
 
     transformed_slopes = scale * source_params.slopes @ R
-    transformed_intercepts = (
-        source_params.intercepts - (source_params.slopes @ R) @ shift
+    transformed_intercepts = source_params.translated_intercepts(
+        source_params.slopes @ R, shift
     )
-    intercept_residual = (
-        target_params.intercepts[old_indices] - transformed_intercepts[new_indices]
+    _, _, linked_intercepts = _anchor_intercepts(
+        target_params, source_params, old_indices, new_indices, transformed_intercepts
     )
-    intercept_rmse = float(np.sqrt(np.mean(intercept_residual**2)))
+    intercept_rmse = float(
+        np.sqrt(np.mean((target_intercepts - linked_intercepts) ** 2))
+    )
 
     return ProcrustesResult(
         rotation_matrix=R,
@@ -364,18 +530,21 @@ def orthogonal_procrustes_rotation(
 def oblique_procrustes_rotation(
     A_target: FloatArray,
     A_source: FloatArray,
-    gamma: float = 0.5,
+    gamma: float = 1.0,
     max_iter: int = 100,
     tol: float = 1e-6,
     scaling: bool = True,
 ) -> tuple[FloatArray, float, float]:
-    """Fit a stable regularized oblique Procrustes transformation.
+    """Fit an oblique Procrustes linking transformation.
 
-    ``gamma=0`` returns the orthogonal similarity solution and ``gamma=1``
-    returns the unrestricted least-squares transformation.  Intermediate
-    values ridge the general transformation toward the orthogonal solution.
-    ``max_iter`` and ``tol`` are validated and retained for call compatibility;
-    the solution is computed directly without iteration.
+    The default ``gamma=1`` returns the unrestricted least-squares
+    transformation of ``A_source`` toward ``A_target``, which recovers any
+    exact nonsingular metric difference.  ``gamma=0`` returns the orthogonal
+    similarity solution, and intermediate values ridge the general
+    transformation toward it, an opt-in regularization that biases genuine
+    oblique differences.  ``max_iter`` and ``tol`` are validated and retained
+    for call compatibility; the solution is computed directly without
+    iteration.
     """
     if not np.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
         raise ValueError("gamma must be finite and in [0, 1]")
@@ -434,7 +603,11 @@ def transform_mirt_parameters(
     s: float = 1.0,
     in_place: bool = False,
 ) -> BaseItemModel:
-    """Transform compensatory MIRT item parameters to a linked metric."""
+    """Transform compensatory MIRT item parameters to a linked metric.
+
+    Slopes become ``s * a @ R`` and every intercept, including each GRM or
+    GPCM category intercept ``-sum(a) * b_k``, becomes ``d - (a @ R) @ t``.
+    """
     extracted = _extract_linear_parameters(model)
     rotation = _as_finite_matrix(R, "R")
     n_factors = extracted.slopes.shape[1]
@@ -459,8 +632,8 @@ def transform_mirt_parameters(
             raise ValueError("t must contain only finite values")
 
     transformed_slopes = s * extracted.slopes @ rotation
-    transformed_intercepts = (
-        extracted.intercepts - (extracted.slopes @ rotation) @ shift
+    transformed_intercepts = extracted.translated_intercepts(
+        extracted.slopes @ rotation, shift
     )
 
     output = model if in_place else deepcopy(model)
@@ -634,9 +807,14 @@ def compute_mirt_linking_fit(
             )
         if not np.all(np.isfinite(transformed_intercepts)):
             raise ValueError("transformed_intercepts must contain only finite values")
-        intercept_residual = (
-            target_params.intercepts[old_indices] - transformed_intercepts[new_indices]
+        _, target_intercepts, linked_intercepts = _anchor_intercepts(
+            target_params,
+            source_params,
+            old_indices,
+            new_indices,
+            transformed_intercepts,
         )
+        intercept_residual = target_intercepts - linked_intercepts
         result["intercept_rmse"] = float(
             np.sqrt(np.mean(intercept_residual * intercept_residual))
         )
@@ -652,9 +830,37 @@ def target_rotation(
 ) -> tuple[FloatArray, FloatArray]:
     """Rotate a loading matrix toward a fully specified target matrix.
 
-    Zero target entries are treated as target zeros.  Orthogonal rotation uses
-    the exact Procrustes solution; oblique rotation uses the exact least-squares
-    solution.  The solver controls are retained for call compatibility.
+    Both rotations minimize ``sum((A @ rotation - T) ** 2)``; zero target
+    entries are target zeros.
+
+    Parameters
+    ----------
+    A : ndarray of shape (n_items, n_factors)
+        Loadings to rotate, with full column rank.
+    T : ndarray of shape (n_items, n_factors)
+        Target loadings.
+    rotation_type : {"orthogonal", "oblique"}
+        ``"orthogonal"`` returns the exact orthogonal Procrustes rotation,
+        GPArotation's ``targetT``. ``"oblique"`` is the oblique target
+        rotation of Browne (2001), GPArotation's ``targetQ``: rotated
+        factors keep unit variance, so the implied factor correlation
+        matrix ``inv(rotation) @ inv(rotation).T`` has a unit diagonal. It is
+        minimized by gradient projection from the identity, as in
+        GPArotation. An unrestricted least-squares transformation, which
+        also rescales the factors, is
+        :func:`oblique_procrustes_rotation` with ``scaling=False``.
+    max_iter : int
+        Maximum gradient-projection iterations of the oblique rotation.
+    tol : float
+        Convergence tolerance on the norm of the projected gradient of the
+        oblique rotation (GPArotation's ``eps``).
+
+    Returns
+    -------
+    rotated : ndarray of shape (n_items, n_factors)
+        ``A @ rotation``.
+    rotation : ndarray of shape (n_factors, n_factors)
+        Rotation matrix.
     """
     if rotation_type not in {"orthogonal", "oblique"}:
         raise ValueError("rotation_type must be 'orthogonal' or 'oblique'")
@@ -679,9 +885,21 @@ def target_rotation(
         )
         rotation = U @ Vt
     else:
-        rotation, _, _, _ = linalg.lstsq(loadings, target)
-        if np.linalg.matrix_rank(rotation) < n_factors:
-            raise ValueError("the fitted oblique rotation is singular")
+        from mirt.utils.rotation import rotate_loadings
+
+        try:
+            _, rotation, _ = rotate_loadings(
+                loadings,
+                method="targetQ",
+                target=target,
+                max_iter=int(max_iter),
+                tol=float(tol),
+                reflect=False,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"the fitted oblique rotation is singular or ill-conditioned: {exc}"
+            ) from exc
     return loadings @ rotation, rotation
 
 

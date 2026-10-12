@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from mirt._logistic import _sigmoid_derivative
 from mirt._model_defaults import uses_builtin_model_hooks, uses_original_model_hook
+from mirt.cat._names import resolve_name
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtModelError
 
@@ -723,11 +724,5 @@ def create_mcat_selection_strategy(
         "random": RandomMCATSelection,
     }
 
-    normalized = method.strip().lower().replace("_", "-")
-    for name, strategy_class in strategies.items():
-        if name.lower() == normalized:
-            return strategy_class(**kwargs)
-    valid = ", ".join(strategies.keys())
-    raise ValueError(
-        f"Unknown MCAT selection method '{method}'. Valid options: {valid}"
-    )
+    _, strategy_class = resolve_name(method, strategies, kind="MCAT selection method")
+    return strategy_class(**kwargs)

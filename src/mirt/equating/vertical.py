@@ -186,7 +186,7 @@ def vertical_scale(
     linking_method: str = "stocking_lord",
     reference_grade: int = 0,
     enforce_monotonicity: bool = True,
-    n_quadpts: int = 31,
+    n_quadpts: int | None = None,
     max_iter: int = 500,
     tol: float = 1e-4,
 ) -> VerticalScaleResult:
@@ -212,7 +212,10 @@ def vertical_scale(
     method : str
         Vertical scaling method:
         - "chain": Sequential pairwise linking (default)
-        - "concurrent": Simultaneous curve matching across grade calibrations
+        - "concurrent": Simultaneous curve matching across grade calibrations.
+          Dichotomous, GRM, GPCM, PCM, and NRM grades get per-pair anchor
+          diagnostics and fit statistics from their own curves; other
+          polytomous families are matched on expected scores without them.
         - "fixed_anchor": Joint response calibration with reference anchors fixed
         - "floating_anchor": Joint response calibration with shared anchors estimated
     linking_method : str
@@ -227,10 +230,20 @@ def vertical_scale(
         during density estimation, preserving the identified reference mean.
         Chain and concurrent linking adjust grade locations after fitting to
         make person-score means strictly increasing.
-    n_quadpts : int
-        Quadrature points for fixed- and floating-anchor calibration.
+    n_quadpts : int, optional
+        Quadrature points for fixed- and floating-anchor calibration. The
+        default is the grid of :func:`mirt.multigroup.fit_multigroup`: 61
+        points equally spaced on ``[-6, 6]`` of the reference grade's metric,
+        weighted by each grade's own normal density, so grades far above the
+        reference grade are integrated as accurately as it is. The grid
+        grows to cover grades whose distributions reach beyond it.
     max_iter : int
-        Maximum joint calibration EM iterations.
+        Maximum joint calibration EM iterations. Joint calibration uses
+        SQUAREM-accelerated EM (``accelerate="squarem"`` of
+        :class:`~mirt.multigroup.MultigroupEMEstimator`): grade means linked
+        through a few anchor items drift slowly along a flat likelihood
+        ridge, where plain EM needs thousands of iterations.
+        ``calibration_result.n_iterations`` counts E-steps.
     tol : float
         Joint calibration log-likelihood convergence tolerance.
 
@@ -744,11 +757,9 @@ def _concurrent_vertical_scale(
     from mirt.equating.linking import (
         LinkingConstants,
         LinkingResult,
-        _compute_anchor_diagnostics,
-        _compute_fit_statistics,
-        _link_form,
         _validate_curve_grid,
     )
+    from mirt.equating.polytomous import _link_diagnostics
 
     pairs = [
         _resolve_anchor_pair(lower, upper)
@@ -773,21 +784,25 @@ def _concurrent_vertical_scale(
     theta_grid, weights = _validate_curve_grid((-4.0, 4.0), 61, None)
     linking_results = []
     for index, (anchors_lower, anchors_upper) in enumerate(pairs):
-        form_lower = _link_form(grade_models[index].model, anchors_lower, "lower")
-        form_upper = _link_form(grade_models[index + 1].model, anchors_upper, "upper")
         # Recover the upper -> lower map implied by the joint common metric.
         A = final_A[index + 1] / final_A[index]
         B = (final_B[index + 1] - final_B[index]) / final_A[index]
+        anchor_diagnostics, fit_statistics = _link_diagnostics(
+            grade_models[index].model,
+            grade_models[index + 1].model,
+            anchors_lower,
+            anchors_upper,
+            A,
+            B,
+            theta_grid,
+            weights,
+        )
         linking_results.append(
             LinkingResult(
                 constants=LinkingConstants(A, B, method=linking_method),
                 anchor_items=anchors_lower,
-                anchor_diagnostics=_compute_anchor_diagnostics(
-                    form_lower, form_upper, A, B, anchors_lower, theta_grid
-                ),
-                fit_statistics=_compute_fit_statistics(
-                    form_lower, form_upper, A, B, theta_grid, weights
-                ),
+                anchor_diagnostics=anchor_diagnostics,
+                fit_statistics=fit_statistics,
                 convergence_info={
                     "method": linking_method,
                     "success": True,

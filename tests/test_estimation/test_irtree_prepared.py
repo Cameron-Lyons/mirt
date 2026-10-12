@@ -212,7 +212,7 @@ def test_borrowed_likelihood_buffers_remain_intact_and_prior_is_preserved(
     np.testing.assert_array_equal(cached, values)
 
 
-def test_node_objective_gradient_matches_clipped_likelihood(monkeypatch):
+def test_node_objective_gradient_matches_node_likelihood(monkeypatch):
     model, _, pseudo, traits, valid, _, posterior, estimator = _problem(
         "direction_intensity", points=3
     )
@@ -227,17 +227,16 @@ def test_node_objective_gradient_matches_clipped_likelihood(monkeypatch):
         points = theta[:, traits[item, node]]
 
         def reference(params):
-            p = np.clip(
-                expit(params[0] * (points - params[1])), PROB_EPSILON, 1 - PROB_EPSILON
-            )
-            return -np.sum(
-                correct[item, node] * np.log(p)
-                + (totals[item, node] - correct[item, node]) * np.log1p(-p)
+            # Saturated nodes keep the exact likelihood rather than a clip.
+            logits = params[0] * (points - params[1])
+            return np.sum(
+                correct[item, node] * np.logaddexp(0.0, -logits)
+                + (totals[item, node] - correct[item, node]) * np.logaddexp(0.0, logits)
             )
 
         trial = np.array([4.0, -0.3])
         value, gradient = objective(trial)
-        np.testing.assert_allclose(value, reference(trial), atol=1e-12)
+        np.testing.assert_allclose(value, reference(trial), rtol=1e-13, atol=1e-12)
         for coordinate in range(2):
             offset = np.zeros(2)
             offset[coordinate] = 1e-5

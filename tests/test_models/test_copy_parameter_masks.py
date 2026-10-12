@@ -216,11 +216,12 @@ def test_multilevel_wrapper_copies_preserve_restricted_base_model(wrapper):
 
     copied = model.copy()
 
-    assert base.n_parameters == model.base_model.n_parameters == 13
-    assert copied.base_model.n_parameters == 13
+    # Four slopes, loadings and difficulties; the testlet variances are fixed.
+    assert base.n_parameters == model.base_model.n_parameters == 11
+    assert copied.base_model.n_parameters == 11
     copied.base_model.set_free_parameter_masks(None)
-    assert copied.base_model.n_parameters == 14
-    assert base.n_parameters == model.base_model.n_parameters == 13
+    assert copied.base_model.n_parameters == 12
+    assert base.n_parameters == model.base_model.n_parameters == 11
 
 
 def test_higher_order_copy_preserves_nested_item_restrictions():

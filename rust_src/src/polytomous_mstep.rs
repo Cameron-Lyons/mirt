@@ -7,12 +7,19 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 
 use crate::counts::category_item_counts;
-use crate::utils::sigmoid;
+use crate::utils::{check_bounds, sigmoid};
 
 /// Worker pool whose lifetime is controlled by the Python fit context.
 #[pyclass]
 pub struct EMThreadPool {
     pool: rayon::ThreadPool,
+}
+
+impl EMThreadPool {
+    /// Workers shared by the native M-steps of one fit.
+    pub(crate) fn pool(&self) -> &rayon::ThreadPool {
+        &self.pool
+    }
 }
 
 #[pymethods]
@@ -127,8 +134,21 @@ fn objective(
     (value, gradient)
 }
 
-fn bounds(index: usize) -> (f64, f64) {
-    if index == 0 { (0.1, 5.0) } else { (-6.0, 6.0) }
+/// Optimizer boxes of one family: the slope, then every threshold or step.
+#[derive(Clone, Copy, Debug)]
+struct Boxes {
+    slope: (f64, f64),
+    location: (f64, f64),
+}
+
+impl Boxes {
+    fn get(&self, index: usize) -> (f64, f64) {
+        if index == 0 {
+            self.slope
+        } else {
+            self.location
+        }
+    }
 }
 
 /// Smallest gap between adjacent graded thresholds, as in the generic
@@ -176,12 +196,13 @@ struct Region {
     segments: Vec<Segment>,
     /// Whether a coordinate belongs to a segment rather than to a plain box.
     ordered: Vec<bool>,
+    boxes: Boxes,
 }
 
 impl Region {
     /// Returns `None` when fixed thresholds are disordered or leave no room
     /// for their free neighbours. Parameters must be finite.
-    fn new(x: &[f64], free: Vec<bool>, grm: bool) -> Option<Self> {
+    fn new(x: &[f64], free: Vec<bool>, grm: bool, boxes: Boxes) -> Option<Self> {
         let k = x.len();
         let mut segments = Vec::new();
         let mut ordered = vec![false; k];
@@ -199,7 +220,7 @@ impl Region {
                 while end + 1 < k && free[end + 1] {
                     end += 1;
                 }
-                let (low, high) = bounds(start);
+                let (low, high) = boxes.get(start);
                 let lower = if start > 1 {
                     low.max(x[start - 1] + MIN_GAP)
                 } else {
@@ -227,6 +248,7 @@ impl Region {
             free,
             segments,
             ordered,
+            boxes,
         })
     }
 
@@ -237,13 +259,13 @@ impl Region {
     fn project(&self, y: &mut [f64]) {
         for (j, value) in y.iter_mut().enumerate() {
             if self.free[j] && !self.ordered[j] {
-                let (low, high) = bounds(j);
+                let (low, high) = self.boxes.get(j);
                 *value = value.clamp(low, high);
             }
         }
         for segment in &self.segments {
             let values = &mut y[segment.start..=segment.end];
-            let (low, high) = bounds(segment.start);
+            let (low, high) = self.boxes.get(segment.start);
             let clamped = |i: usize| values[i].clamp(low, high);
             let last = values.len() - 1;
             if clamped(0) >= segment.lower
@@ -288,7 +310,7 @@ impl Region {
     fn groups(&self, x: &[f64], gradient: &[f64]) -> Vec<Option<usize>> {
         let mut groups: Vec<Option<usize>> = (0..x.len())
             .map(|j| {
-                let (low, high) = bounds(j);
+                let (low, high) = self.boxes.get(j);
                 let blocked =
                     (x[j] <= low && gradient[j] > 0.0) || (x[j] >= high && gradient[j] < 0.0);
                 (self.free[j] && !self.ordered[j] && !blocked).then_some(j)
@@ -460,7 +482,7 @@ fn optimize(
 }
 
 #[pyfunction]
-#[pyo3(signature = (responses, posterior, points, parameters, free, categories, grm, max_iter, ftol, epsilon, n_jobs, pool=None))]
+#[pyo3(signature = (responses, posterior, points, parameters, free, categories, grm, max_iter, ftol, epsilon, n_jobs, slope_bounds, location_bounds, pool=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn m_step_polytomous<'py>(
     py: Python<'py>,
@@ -475,8 +497,16 @@ pub fn m_step_polytomous<'py>(
     ftol: f64,
     epsilon: f64,
     n_jobs: usize,
+    slope_bounds: (f64, f64),
+    location_bounds: (f64, f64),
     pool: Option<PyRef<'_, EMThreadPool>>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    check_bounds("slope_bounds", slope_bounds)?;
+    check_bounds("location_bounds", location_bounds)?;
+    let boxes = Boxes {
+        slope: slope_bounds,
+        location: location_bounds,
+    };
     let responses = responses.as_array();
     let posterior = posterior.as_array();
     let points = points.as_array().to_vec();
@@ -518,7 +548,7 @@ pub fn m_step_polytomous<'py>(
             return Err(PyValueError::new_err("response category out of range"));
         }
         for c in 0..k {
-            let (lo, hi) = bounds(c);
+            let (lo, hi) = boxes.get(c);
             if free[[j, c]] && !(lo..=hi).contains(&parameters[[j, c]]) {
                 return Err(PyValueError::new_err(
                     "free parameters must lie within optimizer bounds",
@@ -527,11 +557,13 @@ pub fn m_step_polytomous<'py>(
         }
         let values = parameters.row(j).to_vec();
         let item_free = free.row(j).iter().take(k).copied().collect();
-        regions.push(Region::new(&values[..k], item_free, grm).ok_or_else(|| {
-            PyValueError::new_err(
-                "fixed graded thresholds must be ordered and leave room for free ones",
-            )
-        })?);
+        regions.push(
+            Region::new(&values[..k], item_free, grm, boxes).ok_or_else(|| {
+                PyValueError::new_err(
+                    "fixed graded thresholds must be ordered and leave room for free ones",
+                )
+            })?,
+        );
     }
     let posterior = posterior.as_standard_layout();
     let posterior_rows = posterior.as_slice().expect("standard layout posterior");
@@ -585,7 +617,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_GAP, Region, objective, optimize};
+    use super::{Boxes, MIN_GAP, Region, objective, optimize};
+
+    const BOXES: Boxes = Boxes {
+        slope: (0.1, 5.0),
+        location: (-6.0, 6.0),
+    };
     use crate::utils::sigmoid;
 
     /// Deterministic uniform draws in `[low, high)`.
@@ -635,12 +672,12 @@ mod tests {
 
     #[test]
     fn ordered_projection_matches_the_box_projection() {
-        let region = Region::new(&[1.0, -1.0, 0.0, 1.0], vec![true; 4], true).unwrap();
+        let region = Region::new(&[1.0, -1.0, 0.0, 1.0], vec![true; 4], true, BOXES).unwrap();
         let mut y = vec![7.0, -8.0, 0.5, 6.5];
         region.project(&mut y);
         assert_eq!(y, vec![5.0, -6.0, 0.5, 6.0]);
         let free = vec![true, false, true];
-        let gpcm = Region::new(&[1.0, 2.0, -2.0], free, false).unwrap();
+        let gpcm = Region::new(&[1.0, 2.0, -2.0], free, false, BOXES).unwrap();
         let mut steps = vec![0.0, 2.0, 3.0];
         gpcm.project(&mut steps);
         assert_eq!(steps, vec![0.1, 2.0, 3.0]);
@@ -651,7 +688,7 @@ mod tests {
         // (-1e-6 - 2e-6) + 2e-6 rounds below -1e-6.
         let x = [1.0, -3.0, -2.0, -1.0, 0.0];
         let free = vec![true, true, true, true, false];
-        let region = Region::new(&x, free, true).unwrap();
+        let region = Region::new(&x, free, true, BOXES).unwrap();
         let mut y = vec![1.0, 1.0, 2.0, 3.0, 0.0];
         region.project(&mut y);
         assert_eq!(y[3], -MIN_GAP);
@@ -664,7 +701,7 @@ mod tests {
         let x = [1.0, -1.0, 0.0, 0.5, 1.0, 2.0, 3.0];
         let mut free = vec![true; x.len()];
         free[4] = false;
-        let region = Region::new(&x, free, true).unwrap();
+        let region = Region::new(&x, free, true, BOXES).unwrap();
         for seed in 0..200 {
             let mut y = uniforms(seed, x.len(), -7.0, 7.0);
             y[0] = x[0];
@@ -690,12 +727,12 @@ mod tests {
     #[test]
     fn region_rejects_fixed_thresholds_without_room() {
         let disordered = [1.0, 0.5, -0.5, 1.0];
-        assert!(Region::new(&disordered, vec![true, false, false, true], true).is_none());
-        assert!(Region::new(&disordered, vec![true, false, false, true], false).is_some());
+        assert!(Region::new(&disordered, vec![true, false, false, true], true, BOXES).is_none());
+        assert!(Region::new(&disordered, vec![true, false, false, true], false, BOXES).is_some());
         let crowded = [1.0, 0.0, 0.0, 1e-6];
-        assert!(Region::new(&crowded, vec![true, false, true, false], true).is_none());
+        assert!(Region::new(&crowded, vec![true, false, true, false], true, BOXES).is_none());
         let roomy = [1.0, 0.0, 0.0, 3e-6];
-        assert!(Region::new(&roomy, vec![true, false, true, false], true).is_some());
+        assert!(Region::new(&roomy, vec![true, false, true, false], true, BOXES).is_some());
     }
 
     #[test]
@@ -709,7 +746,7 @@ mod tests {
             [1.0, -2.0, -1.9, 2.0],
             [2.0, 1.0, -1.0, 0.5],
         ] {
-            let region = Region::new(&start, free.clone(), true).unwrap();
+            let region = Region::new(&start, free.clone(), true, BOXES).unwrap();
             let x = optimize(
                 start.to_vec(),
                 &region,
@@ -747,7 +784,7 @@ mod tests {
         ] {
             let mut counts = graded_counts(&points, 1.3, &start[1..], 400.0);
             counts[2 * points.len()..4 * points.len()].fill(0.0);
-            let region = Region::new(&start, free, true).unwrap();
+            let region = Region::new(&start, free, true, BOXES).unwrap();
             let x = optimize(
                 start.clone(),
                 &region,
@@ -780,7 +817,7 @@ mod tests {
         counts[2 * points.len()..3 * points.len()].fill(0.0);
         let start = [1.0, -1.5, 0.3, -0.1, 2.0];
         let free = vec![true, true, false, true, true];
-        let region = Region::new(&start, free, true).unwrap();
+        let region = Region::new(&start, free, true, BOXES).unwrap();
         let x = optimize(
             start.to_vec(),
             &region,

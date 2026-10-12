@@ -23,7 +23,7 @@ from mirt.estimation.constraints import EqualityConstraint, FixedConstraint
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.latent_density import GaussianDensity
 from mirt.estimation.mixed_format_em import MixedFormatEMEstimator
-from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.quadrature import build_quadrature, default_quadpts
 from mirt.estimation.standard_errors import (
     _flatten_parameters,
     _marginal_log_likelihoods,
@@ -75,8 +75,9 @@ def graded() -> np.ndarray:
     return _graded_data(seed=2, n_persons=800)
 
 
-def _marginal(model, responses, n_quadpts: int = 21) -> float:
-    quadrature = GaussHermiteQuadrature(n_quadpts, 1)
+def _marginal(model, responses) -> float:
+    # The default EM grid of one factor.
+    quadrature = build_quadrature(default_quadpts(1), 1)
     mass = quadrature.weights / quadrature.weights.sum()
     return float(_marginal_log_likelihoods(model, responses, quadrature, mass).sum())
 
@@ -128,6 +129,195 @@ def test_equal_slopes_match_a_rasch_fit_with_estimated_variance(
         atol=0.03,
     )
     assert equal_slopes.log_likelihood == pytest.approx(rasch.log_likelihood, abs=0.05)
+
+
+def _rasch_data(n_items: int = 10, n_persons: int = 1500) -> np.ndarray:
+    """Rasch responses with a latent standard deviation of 1.5."""
+    rng = np.random.default_rng(2024)
+    theta = rng.normal(0.0, 1.5, n_persons)
+    difficulty = np.linspace(-1.8, 1.8, n_items)
+    probability = 1.0 / (1.0 + np.exp(-(theta[:, None] - difficulty)))
+    return (rng.random(probability.shape) < probability).astype(int)
+
+
+def test_fit_mirt_1pl_estimates_the_common_slope_of_r_rasch() -> None:
+    # R mirt 1.48 on these data: mirt(x, 1, "Rasch") has logLik -8138.931,
+    # latent variance 2.3085 and 11 parameters; the 2PL has logLik -8134.621.
+    data = _rasch_data()
+    rasch = mirt.fit_mirt(data, model="1PL")
+    slopes = rasch.model.parameters["discrimination"]
+    errors = rasch.standard_errors["discrimination"]
+
+    assert rasch.n_parameters == rasch.model.n_parameters == 11
+    assert np.unique(slopes).size == 1 and np.unique(errors).size == 1
+    assert slopes[0] ** 2 == pytest.approx(2.3085, abs=0.01)
+    assert rasch.log_likelihood == pytest.approx(-8138.931, abs=0.01)
+    assert 0.0 < errors[0] < 0.1
+    assert rasch.aic == pytest.approx(-2 * rasch.log_likelihood + 22)
+
+    full = mirt.fit_mirt(data, model="2PL")
+    assert full.n_parameters - rasch.n_parameters == 9
+    statistic = 2 * (full.log_likelihood - rasch.log_likelihood)
+    assert statistic == pytest.approx(2 * (8138.931 - 8134.621), abs=0.02)
+
+    # The same model as a 2PL with every slope tied.
+    tied = mirt.fit_mirt(data, model="2PL", constraints=[("discrimination", None)])
+    assert tied.log_likelihood == pytest.approx(rasch.log_likelihood, abs=1e-3)
+    assert_allclose(tied.standard_errors["discrimination"], errors, rtol=1e-3)
+
+
+def test_rasch_is_an_alias_of_the_common_slope_1pl() -> None:
+    data = _rasch_data()
+    onepl = mirt.fit_mirt(data, model="1PL", compute_standard_errors=False)
+    rasch = mirt.fit_mirt(data, model="Rasch", compute_standard_errors=False)
+    per_item = mirt.fit_mirt(
+        data, model=["Rasch"] * data.shape[1], compute_standard_errors=False
+    )
+
+    for result in (rasch, per_item):
+        assert type(result.model) is type(onepl.model)
+        assert result.log_likelihood == pytest.approx(onepl.log_likelihood)
+        assert result.n_parameters == onepl.n_parameters
+
+
+def test_1pl_slope_can_still_be_held_at_one_and_round_trips() -> None:
+    from mirt.results.fit_result import FitResult
+
+    data = _rasch_data()
+    free = mirt.fit_mirt(data, model="1PL", compute_standard_errors=False)
+    fixed = mirt.fit_mirt(
+        data, model="1PL", fixed={"discrimination": True}, compute_standard_errors=False
+    )
+    assert fixed.n_parameters == 10
+    assert_allclose(fixed.model.parameters["discrimination"], 1.0)
+    # A latent SD of 1.5 is far from the unit slope.
+    assert free.log_likelihood > fixed.log_likelihood + 50
+
+    restored = FitResult.from_dict(free.to_dict())
+    assert restored.model.estimate_discrimination
+    assert restored.model.n_parameters == free.n_parameters == 11
+    assert_allclose(
+        restored.model.parameters["discrimination"],
+        free.model.parameters["discrimination"],
+    )
+
+
+def test_pcm_estimates_one_common_slope() -> None:
+    from mirt.models.polytomous import GeneralizedPartialCredit
+
+    rng = np.random.default_rng(1)
+    true = GeneralizedPartialCredit(6, n_categories=4).set_parameters(
+        discrimination=np.full(6, 2.0),
+        steps=np.sort(rng.normal(0.0, 0.8, (6, 3)), axis=1),
+    )
+    data = true.simulate(rng.standard_normal((1000, 1)), seed=2)
+    pcm = mirt.fit_mirt(data, model="PCM")
+    tied = mirt.fit_mirt(data, model="GPCM", constraints=[("discrimination", None)])
+
+    slopes = pcm.model.parameters["discrimination"]
+    assert np.unique(slopes).size == 1
+    assert slopes[0] == pytest.approx(2.0, abs=0.2)
+    assert pcm.n_parameters == 1 + 6 * 3
+    assert pcm.log_likelihood == pytest.approx(tied.log_likelihood, abs=1e-3)
+    assert np.all(np.isfinite(pcm.standard_errors["discrimination"]))
+
+
+@pytest.mark.parametrize("missing", [0.0, 0.2])
+def test_pcm_common_slope_step_maximizes_the_expected_log_likelihood(missing) -> None:
+    from scipy.optimize import minimize_scalar
+
+    from mirt.estimation import em as em_module
+    from mirt.models.polytomous import PartialCreditModel
+
+    rng = np.random.default_rng(4)
+    categories = [3, 5, 4, 2, 4, 4]
+    model = PartialCreditModel(6, categories, estimate_discrimination=True)
+    steps = np.where(
+        model.free_parameter_masks["steps"], rng.normal(0.0, 0.8, (6, 4)), 0.0
+    )
+    model.set_parameters(steps=steps, discrimination=np.full(6, 1.4))
+    responses = model.simulate(rng.standard_normal((600, 1)), seed=5)
+    responses[rng.random(responses.shape) < missing] = -1
+    model.set_parameters(discrimination=np.full(6, 0.9))
+    nodes = build_quadrature(61, 1).nodes
+    log_joint = model.log_likelihood_batch(responses, nodes) - 0.5 * nodes[:, 0] ** 2
+    posterior = np.exp(log_joint - log_joint.max(axis=1, keepdims=True))
+    posterior /= posterior.sum(axis=1, keepdims=True)
+    frequencies = rng.integers(1, 4, responses.shape[0]).astype(np.float64)
+    weighted = posterior * frequencies[:, None]
+
+    statistics = em_module._partial_credit_counts(responses, frequencies, 5)
+    slope = em_module._common_slope_newton(
+        model, nodes[:, 0], (statistics, weighted), (0.1, 20.0)
+    )
+
+    def negative_expected_log_likelihood(value: float) -> float:
+        trial = model.copy().set_parameters(discrimination=np.full(6, value))
+        total = 0.0
+        for item, n_categories in enumerate(categories):
+            log_probability = np.log(trial.probability(nodes, item))
+            for category in range(n_categories):
+                rows = responses[:, item] == category
+                total += weighted[rows].sum(axis=0) @ log_probability[:, category]
+        return -total
+
+    expected = minimize_scalar(
+        negative_expected_log_likelihood,
+        bounds=(0.1, 20.0),
+        method="bounded",
+        options={"xatol": 1e-10},
+    ).x
+    assert slope == pytest.approx(expected, abs=1e-6)
+
+
+def test_pcm_slope_statistics_are_tabulated_once_per_fit(monkeypatch) -> None:
+    from mirt.backends.rust._helpers import RUST_AVAILABLE
+    from mirt.estimation import em as em_module
+    from mirt.models.polytomous import PartialCreditModel
+
+    if not RUST_AVAILABLE:
+        pytest.skip("the common-slope step needs the native polytomous M-step")
+    data = mirt.simdata("GPCM", n_persons=400, n_items=5, n_categories=4, seed=3)
+    tabulate = em_module._partial_credit_counts
+    calls = []
+
+    def counted(*args):
+        calls.append(args[0])
+        return tabulate(*args)
+
+    monkeypatch.setattr(em_module, "_partial_credit_counts", counted)
+    estimator = EMEstimator(compute_standard_errors=False, use_gpu=False)
+    result = estimator.fit(
+        PartialCreditModel(5, n_categories=4, estimate_discrimination=True), data
+    )
+
+    assert result.converged and result.n_iterations > 2
+    assert len(calls) == 1
+    assert estimator._slope_counts is None
+
+
+def test_family_tied_slopes_need_an_estimator_that_ties_them() -> None:
+    from mirt.estimation.bl import BLEstimator
+    from mirt.estimation.weighted import WeightedEMEstimator
+
+    data = _rasch_data(n_items=4, n_persons=200)
+    for estimator in (BLEstimator(max_iter=5), WeightedEMEstimator(max_iter=5)):
+        with pytest.raises(MirtModelError, match="keeps equal across items"):
+            estimator.fit(OneParameterLogistic(4, estimate_discrimination=True), data)
+    model = OneParameterLogistic(4, estimate_discrimination=True)
+    with pytest.raises(MirtValidationError, match="every item together"):
+        model.set_free_parameter_masks(
+            {"discrimination": np.array([True, False, True, True])}
+        )
+    # Held fixed, the slope is the classical Rasch model again.
+    model.set_free_parameter_masks({"discrimination": np.zeros(4, dtype=bool)})
+    result = BLEstimator(max_iter=50).fit(model, data)
+    assert result.n_parameters == 4
+    # The samplers cannot tie slopes, so fit_mirt refuses rather than fit a
+    # different model under the same name.
+    for model_name, estimation in (("1PL", "MHRM"), ("PCM", "Gibbs")):
+        with pytest.raises(MirtValidationError, match="only estimation='EM'"):
+            mirt.fit_mirt(data, model=model_name, estimation=estimation)
 
 
 def test_tied_coordinates_stay_bitwise_equal(binary, graded) -> None:
@@ -365,17 +555,14 @@ def test_numerical_item_objectives_match_the_analytic_fit(binary) -> None:
         )
 
 
-def test_constraints_bypass_native_full_iterations(monkeypatch, binary) -> None:
-    import mirt.backends.rust.estimation as native_estimation
+def test_constraints_bypass_the_native_3pl_iteration(monkeypatch, binary) -> None:
     import mirt.estimation.em as em
 
     def refuse(*args, **kwargs):
         raise AssertionError("native fast path used with constraints")
 
-    monkeypatch.setattr(native_estimation, "_em_fit_2pl_prepared", refuse)
     monkeypatch.setattr(em, "em_iteration_3pl", refuse)
 
-    mirt.fit_mirt(binary, "2PL", constraints=ALL_SLOPES, max_iter=3)
     mirt.fit_mirt(binary, "3PL", constraints=ALL_SLOPES, max_iter=3)
 
 
@@ -520,7 +707,7 @@ def test_complete_data_errors_sum_the_member_curvatures(binary, equal_slopes) ->
         binary, "2PL", constraints=ALL_SLOPES, se_method="complete_data", tol=1e-9
     )
     model = result.model
-    quadrature = GaussHermiteQuadrature(21, 1)
+    quadrature = build_quadrature(default_quadpts(1), 1)
     log_likelihood = model.log_likelihood_batch(binary, quadrature.nodes)
     log_joint = log_likelihood + np.log(quadrature.weights)
     posterior = np.exp(log_joint - log_joint.max(axis=1, keepdims=True))

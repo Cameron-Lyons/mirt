@@ -2,65 +2,25 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 EXPECTED_EXPORTS = (
-    "PreparedArrays",
     "RUST_AVAILABLE",
     "is_rust_available",
     "rust_enabled",
-    "compute_log_likelihoods_2pl",
-    "compute_log_likelihoods_3pl",
-    "compute_log_likelihoods_mirt",
-    "e_step_complete",
-    "compute_expected_counts",
-    "compute_expected_counts_polytomous",
-    "compute_expected_counts_parallel",
-    "compute_eap_scores",
-    "compute_wle_scores",
-    "em_fit_2pl",
-    "gibbs_sample_2pl",
     "mhrm_fit_2pl",
     "bootstrap_fit_2pl",
-    "em_iteration_2pl",
     "em_iteration_3pl",
-    "m_step_dichotomous_parallel",
-    "sibtest_compute_beta",
-    "sibtest_all_items",
-    "compute_standardized_residuals",
-    "compute_q3_matrix",
-    "compute_ld_chi2_matrix",
-    "compute_item_se_parallel",
-    "compute_hessian_block_diagonal",
-    "compute_fit_statistics",
-    "compute_probabilities_batch",
-    "compute_probabilities_batch_3pl",
-    "compute_expected_variance_batch",
     "simulate_grm",
     "simulate_gpcm",
     "simulate_dichotomous",
-    "generate_plausible_values_posterior",
-    "generate_plausible_values_mcmc",
-    "compute_observed_margins",
-    "compute_expected_margins",
-    "generate_bootstrap_indices",
-    "resample_responses",
-    "impute_from_probabilities",
-    "multiple_imputation",
-    "cat_compute_item_info",
-    "cat_select_max_info",
-    "cat_eap_update",
-    "cat_simulate_batch",
     "cat_simulate_batch_full",
     "cat_conditional_mse",
-    "lord_wingersky_recursion",
-    "lord_wingersky_polytomous",
-    "eapsum_from_distribution",
-    "fixed_calib_em",
-    "stocking_lord_criterion",
     "compute_log_likelihoods_grm",
     "compute_log_likelihoods_gpcm",
     "compute_alpha_if_deleted",
@@ -69,10 +29,6 @@ EXPECTED_EXPORTS = (
     "multigroup_e_step_2pl",
     "multigroup_e_step_3pl",
     "multigroup_e_step_nrm",
-    "multigroup_expected_counts",
-    "gvem_e_step",
-    "gvem_m_step",
-    "gvem_compute_elbo",
     "coordinate_descent_mstep_regularized",
     "rt_joint_log_likelihood",
     "rt_accept_person_proposals",
@@ -80,10 +36,6 @@ EXPECTED_EXPORTS = (
     "bkt_backward",
     "bkt_forward_backward_batch",
     "bkt_viterbi",
-    "bkt_ffbs",
-    "bkt_ffbs_batch",
-    "longitudinal_log_likelihood",
-    "compute_growth_trajectory",
     "observed_score_distribution_2pl",
 )
 
@@ -102,6 +54,34 @@ def test_public_backend_export_order_is_unchanged() -> None:
     import mirt.backends.rust as rust_backend
 
     assert rust_backend.__all__ == list(EXPECTED_EXPORTS)
+
+
+def test_every_backend_export_has_a_package_caller() -> None:
+    import mirt.backends.rust as rust_backend
+
+    package = Path(rust_backend.__file__).resolve().parents[2]
+    backend = Path(rust_backend.__file__).resolve().parent
+    # Count names used in code, including lazy-import registry strings, but
+    # not mentions in comments or docstrings.
+    referenced: set[str] = set()
+    for path in package.rglob("*.py"):
+        if backend in path.resolve().parents:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Name):
+                referenced.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                referenced.add(node.attr)
+            elif isinstance(node, ast.alias):
+                referenced.add(node.name)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                referenced.add(node.value)
+    unused = [name for name in rust_backend.__all__ if name not in referenced]
+
+    assert not unused, (
+        "mirt.backends.rust exports wrappers that no package module outside "
+        f"the backend calls; route a caller to them or delete them: {unused}"
+    )
 
 
 def test_compatibility_shim_defers_and_caches_symbols() -> None:
@@ -180,7 +160,7 @@ def test_plain_backend_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "native_loaded": False,
         "backend_submodules": [],
-        "export_count": 77,
+        "export_count": len(EXPECTED_EXPORTS),
         "exports_visible": True,
     }
 
@@ -270,7 +250,7 @@ def test_star_import_resolves_every_public_backend_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 77,
+        "export_count": len(EXPECTED_EXPORTS),
         "all_cached": True,
     }
 

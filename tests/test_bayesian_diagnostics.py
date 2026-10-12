@@ -6,8 +6,8 @@ import pytest
 from mirt.diagnostics.bayesian import (
     PSISResult,
     WAICResult,
-    compare_models,
     dic,
+    loo_compare,
     psis_loo,
     waic,
 )
@@ -162,12 +162,11 @@ class TestModelComparison:
         result1 = psis_loo(log_lik1)
         result2 = psis_loo(log_lik2)
 
-        comparison = compare_models(result1, result2, names=["Model A", "Model B"])
+        comparison = loo_compare(result1, result2, names=["Model A", "Model B"])
 
-        assert "Model Comparison" in comparison
-        assert "Model A" in comparison
-        assert "Model B" in comparison
-        assert "LOOIC" in comparison
+        assert list(comparison["Model"]) == ["Model A", "Model B"]
+        assert "looic" in comparison.columns
+        assert comparison["elpd_diff"][1] < 0
 
     def test_compare_waic_results(self):
         """Test comparing WAIC results."""
@@ -179,10 +178,10 @@ class TestModelComparison:
         result1 = waic(log_lik1)
         result2 = waic(log_lik2)
 
-        comparison = compare_models(result1, result2, names=["Model A", "Model B"])
+        comparison = loo_compare(result1, result2, names=["Model A", "Model B"])
 
-        assert "Model Comparison" in comparison
-        assert "WAIC" in comparison
+        assert list(comparison["Model"]) == ["Model A", "Model B"]
+        assert "waic" in comparison.columns
 
 
 class TestIntegration:

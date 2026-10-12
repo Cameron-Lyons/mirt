@@ -18,6 +18,7 @@ from mirt.models.dichotomous import (
     TwoParameterLogistic,
     UnipolarLogLogistic,
 )
+from mirt.models.polytomous import GradedResponseModel, NominalResponseModel
 from mirt.models.sequential import (
     AdjacentCategoryModel,
     ContinuationRatioModel,
@@ -319,6 +320,31 @@ def test_unidimensional_families_reject_non_unit_factor_counts(
 ) -> None:
     with pytest.raises(ValueError):
         ThreeParameterLogistic(3, n_factors=n_factors)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("n_factors", [1.5, 2.5, np.float64(0.5), np.nan, np.inf])
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda n: TwoParameterLogistic(3, n_factors=n),
+        lambda n: ThreeParameterLogistic(3, n_factors=n),
+        lambda n: GradedResponseModel(3, 4, n_factors=n),
+        lambda n: NominalResponseModel(3, 4, n_factors=n),
+    ],
+)
+def test_non_integer_factor_counts_raise_validation_errors(factory, n_factors) -> None:
+    # TwoParameterLogistic(5, n_factors=1.5) failed later with a TypeError.
+    with pytest.raises(MirtValidationError, match="n_factors"):
+        factory(n_factors)
+
+
+@pytest.mark.parametrize("n_factors", [2.0, np.float64(2.0), np.int64(2)], ids=repr)
+def test_integral_multidimensional_factor_counts_are_stored_as_int(n_factors) -> None:
+    model = TwoParameterLogistic(3, n_factors=n_factors)
+
+    assert type(model.n_factors) is int and model.n_factors == 2
+    assert model.discrimination.shape == (3, 2)
+    assert model.copy().n_factors == 2
 
 
 def test_float_unit_factor_count_still_scores() -> None:

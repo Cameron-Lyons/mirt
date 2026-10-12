@@ -103,3 +103,108 @@ def test_direct_estimators_share_response_validation():
 
     with pytest.raises(MirtDataError, match="integer response codes"):
         estimator.fit(model, np.array([[0.0, 0.5]]))
+
+
+def _recoded_binary_data() -> np.ndarray:
+    from mirt import simdata
+
+    data = np.asarray(simdata(n_persons=80, n_items=4, seed=3))
+    data[np.flatnonzero(data[:, 0] == 1)[:5], 0] = 2
+    return data
+
+
+def _two_pl_fit(data: np.ndarray):
+    clean = np.where(data > 1, 1, data)
+    return fit_mirt(clean, model="2PL", max_iter=20, compute_standard_errors=False)
+
+
+@pytest.mark.parametrize(
+    "fit",
+    [
+        pytest.param(
+            lambda data: EMEstimator(n_quadpts=11, max_iter=2).fit(
+                TwoParameterLogistic(4), data
+            ),
+            id="EMEstimator",
+        ),
+        pytest.param(
+            lambda data: _gibbs(use_rust=True).fit(TwoParameterLogistic(4), data),
+            id="GibbsSampler-native",
+        ),
+        pytest.param(
+            lambda data: _gibbs(use_rust=False).fit(TwoParameterLogistic(4), data),
+            id="GibbsSampler-numpy",
+        ),
+        pytest.param(
+            lambda data: _mhrm(use_rust=True).fit(TwoParameterLogistic(4), data),
+            id="MHRMEstimator-native",
+        ),
+        pytest.param(
+            lambda data: _mhrm(use_rust=False).fit(TwoParameterLogistic(4), data),
+            id="MHRMEstimator-numpy",
+        ),
+        pytest.param(
+            lambda data: _gvem().fit(TwoParameterLogistic(4), data),
+            id="GVEMEstimator",
+        ),
+        pytest.param(
+            lambda data: _bootstrap_se()(_two_pl_fit(data), data, n_bootstrap=2),
+            id="bootstrap_se",
+        ),
+        pytest.param(
+            lambda data: _bootstrap_ci()(_two_pl_fit(data), data, n_bootstrap=2),
+            id="bootstrap_ci",
+        ),
+    ],
+)
+def test_estimators_reject_non_binary_codes_for_dichotomous_models(fit):
+    # Regression: only fit_mirt rejected a code 2, which the estimators read
+    # as a count (slopes ran to the bound) or, natively, as incorrect.
+    with pytest.raises(MirtDataError, match="dichotomous responses must be coded"):
+        fit(_recoded_binary_data())
+
+
+def test_estimators_reject_codes_outside_polytomous_categories():
+    from mirt.models.polytomous import GradedResponseModel
+
+    data = np.array([[0, 1], [1, 2], [2, 0], [1, 1]])
+    with pytest.raises(MirtDataError, match="below n_categories"):
+        EMEstimator(n_quadpts=5, max_iter=1).fit(
+            GradedResponseModel(2, n_categories=[3, 2]), data
+        )
+
+
+def _gibbs(*, use_rust: bool):
+    from mirt.estimation.mcmc import GibbsSampler
+
+    return GibbsSampler(n_iter=20, burnin=5, seed=1, use_rust=use_rust)
+
+
+def _mhrm(*, use_rust: bool):
+    from mirt.estimation.mcmc import MHRMEstimator
+
+    return MHRMEstimator(
+        n_cycles=10,
+        burnin=2,
+        seed=1,
+        use_rust=use_rust,
+        compute_standard_errors=False,
+    )
+
+
+def _gvem():
+    from mirt.estimation.gvem import GVEMEstimator
+
+    return GVEMEstimator(max_iter=2)
+
+
+def _bootstrap_se():
+    from mirt.utils.bootstrap import bootstrap_se
+
+    return bootstrap_se
+
+
+def _bootstrap_ci():
+    from mirt.utils.bootstrap import bootstrap_ci
+
+    return bootstrap_ci

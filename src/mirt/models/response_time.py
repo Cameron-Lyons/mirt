@@ -14,6 +14,7 @@ from mirt.backends.rust.response_time import (
     rt_joint_log_likelihood_samples,
 )
 from mirt.exceptions import MirtValidationError
+from mirt.models.base import validate_item_index
 
 AccuracyModel = Literal["2PL", "3PL"]
 _LOG_2PI = float(np.log(2.0 * np.pi))
@@ -322,17 +323,7 @@ class ResponseTimeModel:
         return self
 
     def _validate_item_idx(self, item_idx: int) -> int:
-        if isinstance(item_idx, bool) or not isinstance(item_idx, (int, np.integer)):
-            raise MirtValidationError(
-                "item_idx must be an integer",
-                parameter="item_idx",
-                value=item_idx,
-                expected="integer",
-            )
-        item_idx = int(item_idx)
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
-        return item_idx
+        return validate_item_index(item_idx, self.n_items)
 
     @staticmethod
     def _person_vector(

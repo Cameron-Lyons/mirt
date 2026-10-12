@@ -5,10 +5,34 @@
 
 use numpy::ndarray::{Array1, Array2, ArrayView1};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
 use crate::utils::{EPSILON, sigmoid};
+
+/// Return a `PyValueError` for the first `(name, length, expected)` whose
+/// length differs; the kernels index every vector by person or item.
+fn check_lengths(checks: &[(&str, usize, usize)]) -> PyResult<()> {
+    for &(name, length, expected) in checks {
+        if length != expected {
+            return Err(PyValueError::new_err(format!(
+                "{name} must have shape ({expected},), got ({length},)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check that a matrix argument has the shape of the response matrix.
+fn check_matrix(name: &str, shape: (usize, usize), expected: (usize, usize)) -> PyResult<()> {
+    if shape != expected {
+        return Err(PyValueError::new_err(format!(
+            "{name} must have shape {expected:?}, got {shape:?}"
+        )));
+    }
+    Ok(())
+}
 
 /// Log-normal density.
 #[inline]
@@ -84,7 +108,7 @@ pub fn rt_joint_log_likelihood<'py>(
     difficulty: PyReadonlyArray1<f64>,
     time_discrimination: PyReadonlyArray1<f64>,
     time_intensity: PyReadonlyArray1<f64>,
-) -> Bound<'py, PyArray1<f64>> {
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let responses = responses.as_array();
     let log_rt = log_rt.as_array();
     let theta = theta.as_array();
@@ -94,7 +118,16 @@ pub fn rt_joint_log_likelihood<'py>(
     let time_disc = time_discrimination.as_array();
     let time_int = time_intensity.as_array();
 
-    let n_persons = responses.nrows();
+    let (n_persons, n_items) = responses.dim();
+    check_matrix("log_rt", log_rt.dim(), responses.dim())?;
+    check_lengths(&[
+        ("theta", theta.len(), n_persons),
+        ("tau", tau.len(), n_persons),
+        ("discrimination", disc.len(), n_items),
+        ("difficulty", diff.len(), n_items),
+        ("time_discrimination", time_disc.len(), n_items),
+        ("time_intensity", time_int.len(), n_items),
+    ])?;
     let log_likes: Vec<f64> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
@@ -112,7 +145,7 @@ pub fn rt_joint_log_likelihood<'py>(
         })
         .collect();
 
-    Array1::from(log_likes).to_pyarray(py)
+    Ok(Array1::from(log_likes).to_pyarray(py))
 }
 
 /// Compute joint log-likelihood for 3PL response time model.
@@ -129,7 +162,7 @@ pub fn rt_joint_log_likelihood_3pl<'py>(
     guessing: PyReadonlyArray1<f64>,
     time_discrimination: PyReadonlyArray1<f64>,
     time_intensity: PyReadonlyArray1<f64>,
-) -> Bound<'py, PyArray1<f64>> {
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let responses = responses.as_array();
     let log_rt = log_rt.as_array();
     let theta = theta.as_array();
@@ -139,8 +172,18 @@ pub fn rt_joint_log_likelihood_3pl<'py>(
     let time_disc = time_discrimination.as_array();
     let time_int = time_intensity.as_array();
 
-    let n_persons = responses.nrows();
+    let (n_persons, n_items) = responses.dim();
     let guess = guessing.as_array().to_vec();
+    check_matrix("log_rt", log_rt.dim(), responses.dim())?;
+    check_lengths(&[
+        ("theta", theta.len(), n_persons),
+        ("tau", tau.len(), n_persons),
+        ("discrimination", disc.len(), n_items),
+        ("difficulty", diff.len(), n_items),
+        ("guessing", guess.len(), n_items),
+        ("time_discrimination", time_disc.len(), n_items),
+        ("time_intensity", time_int.len(), n_items),
+    ])?;
 
     let log_likes: Vec<f64> = (0..n_persons)
         .into_par_iter()
@@ -159,7 +202,7 @@ pub fn rt_joint_log_likelihood_3pl<'py>(
         })
         .collect();
 
-    Array1::from(log_likes).to_pyarray(py)
+    Ok(Array1::from(log_likes).to_pyarray(py))
 }
 
 /// Compute paired joint log likelihoods for posterior samples.
@@ -176,7 +219,7 @@ pub fn rt_joint_log_likelihood_samples<'py>(
     guessing: Option<PyReadonlyArray1<f64>>,
     time_discrimination: PyReadonlyArray1<f64>,
     time_intensity: PyReadonlyArray1<f64>,
-) -> Bound<'py, PyArray2<f64>> {
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let responses = responses.as_array();
     let log_rt = log_rt.as_array();
     let theta = theta.as_array();
@@ -188,7 +231,21 @@ pub fn rt_joint_log_likelihood_samples<'py>(
     let guess = guessing.map(|values| values.as_array().to_vec());
 
     let n_samples = theta.nrows();
-    let n_persons = responses.nrows();
+    let (n_persons, n_items) = responses.dim();
+    check_matrix("log_rt", log_rt.dim(), responses.dim())?;
+    check_matrix("theta", theta.dim(), (n_samples, n_persons))?;
+    check_matrix("tau", tau.dim(), (n_samples, n_persons))?;
+    check_lengths(&[
+        ("discrimination", disc.len(), n_items),
+        ("difficulty", diff.len(), n_items),
+        (
+            "guessing",
+            guess.as_ref().map_or(n_items, Vec::len),
+            n_items,
+        ),
+        ("time_discrimination", time_disc.len(), n_items),
+        ("time_intensity", time_int.len(), n_items),
+    ])?;
     let log_likes: Vec<f64> = (0..n_samples * n_persons)
         .into_par_iter()
         .map(|flat_index| {
@@ -208,9 +265,9 @@ pub fn rt_joint_log_likelihood_samples<'py>(
         })
         .collect();
 
-    Array2::from_shape_vec((n_samples, n_persons), log_likes)
+    Ok(Array2::from_shape_vec((n_samples, n_persons), log_likes)
         .expect("sample likelihood result shape must be valid")
-        .to_pyarray(py)
+        .to_pyarray(py))
 }
 
 /// Accept or reject pre-generated joint ability and speed proposals.
@@ -238,11 +295,11 @@ pub fn rt_accept_person_proposals<'py>(
     covariance_inverse: PyReadonlyArray2<f64>,
     log_determinant: f64,
     guessing: Option<PyReadonlyArray1<f64>>,
-) -> (
+) -> PyResult<(
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<i32>>,
-) {
+)> {
     let responses = responses.as_array();
     let log_rt = log_rt.as_array();
     let theta = theta.as_array();
@@ -258,7 +315,28 @@ pub fn rt_accept_person_proposals<'py>(
     let covariance_inverse = covariance_inverse.as_array();
     let guessing = guessing.map(|values| values.as_array().to_vec());
 
-    let results: Vec<(f64, f64, i32)> = (0..responses.nrows())
+    let (n_persons, n_items) = responses.dim();
+    check_matrix("log_rt", log_rt.dim(), responses.dim())?;
+    check_matrix("covariance_inverse", covariance_inverse.dim(), (2, 2))?;
+    check_lengths(&[
+        ("theta", theta.len(), n_persons),
+        ("tau", tau.len(), n_persons),
+        ("theta_proposed", theta_proposed.len(), n_persons),
+        ("tau_proposed", tau_proposed.len(), n_persons),
+        ("log_uniform", log_uniform.len(), n_persons),
+        ("discrimination", discrimination.len(), n_items),
+        ("difficulty", difficulty.len(), n_items),
+        (
+            "guessing",
+            guessing.as_ref().map_or(n_items, Vec::len),
+            n_items,
+        ),
+        ("time_discrimination", time_discrimination.len(), n_items),
+        ("time_intensity", time_intensity.len(), n_items),
+        ("mean", mean.len(), 2),
+    ])?;
+
+    let results: Vec<(f64, f64, i32)> = (0..n_persons)
         .into_par_iter()
         .map(|person| {
             let current_likelihood = joint_log_likelihood_single(
@@ -314,11 +392,11 @@ pub fn rt_accept_person_proposals<'py>(
     let new_tau = Array1::from_iter(results.iter().map(|result| result.1));
     let accepted = Array1::from_iter(results.iter().map(|result| result.2));
 
-    (
+    Ok((
         new_theta.to_pyarray(py),
         new_tau.to_pyarray(py),
         accepted.to_pyarray(py),
-    )
+    ))
 }
 
 /// Log bivariate normal density for single observation.

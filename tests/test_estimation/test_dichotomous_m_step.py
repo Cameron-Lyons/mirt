@@ -1,4 +1,4 @@
-"""Check EM gradients against the public, clipped item likelihood."""
+"""Check EM gradients against the public item likelihood."""
 
 from copy import deepcopy
 from types import MethodType, SimpleNamespace
@@ -6,13 +6,19 @@ from types import MethodType, SimpleNamespace
 import numpy as np
 import pytest
 from scipy.optimize import minimize
-from scipy.special import xlog1py, xlogy
+from scipy.special import expit, xlog1py, xlogy
 
 import mirt
 from mirt.estimation import em as em_module
-from mirt.estimation._dichotomous_objective import prepare_dichotomous_objective
+from mirt.estimation._dichotomous_objective import (
+    guessing_items_objective,
+    prepare_dichotomous_objective,
+    prepare_logistic_objective,
+)
 from mirt.estimation.em import EMEstimator
+from mirt.estimation.latent_density import GaussianDensity
 from mirt.estimation.priors import NormalPrior
+from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     OneParameterLogistic,
@@ -54,13 +60,23 @@ def _public_objective(model, estimator, points, observed, correct, params):
     return -np.sum(xlogy(correct, p) + xlog1py(observed - correct, -p))
 
 
+def _kernel_objective(model, estimator, points, observed, correct, params):
+    """The public likelihood, clipped only near a free asymptote."""
+    working = deepcopy(model)
+    estimator._set_item_params(working, 0, params)
+    p = working.probability(points, 0)
+    if "guessing" in working.parameters:
+        p = np.maximum(p, estimator.prob_epsilon)
+    if "upper" in working.parameters:
+        p = np.minimum(p, 1 - estimator.prob_epsilon)
+    return -np.sum(xlogy(correct, p) + xlog1py(observed - correct, -p))
+
+
 @pytest.mark.parametrize("kind", _KINDS)
 @pytest.mark.parametrize("epsilon", [1e-10, 0.1])
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_dichotomous_gradient_matches_public_clipped_likelihood(
-    kind, epsilon, bounded, dtype
-):
+def test_dichotomous_gradient_matches_public_likelihood(kind, epsilon, bounded, dtype):
     model = _model(kind)
     original = model.parameters
     rng = np.random.default_rng(914)
@@ -76,16 +92,24 @@ def test_dichotomous_gradient_matches_public_clipped_likelihood(
     )
     assert objective is not None
     actual, gradient = objective(params)
-    expected = _public_objective(model, estimator, points, observed, correct, params)
-    np.testing.assert_allclose(actual, expected, rtol=1e-12)
+    # Nothing saturates at the default clip, where the value is unchanged.
+    # The wide clip compares exact tails with a reference that loses
+    # precision as probabilities approach one.
+    expected = _kernel_objective(model, estimator, points, observed, correct, params)
+    np.testing.assert_allclose(
+        actual, expected, rtol=1e-12 if epsilon < 1e-6 else 1e-10
+    )
+    if epsilon < 1e-6:
+        clipped = _public_objective(model, estimator, points, observed, correct, params)
+        assert actual == pytest.approx(clipped, rel=1e-12)
     numerical = np.empty_like(params)
     for index in range(params.size):
         offset = np.zeros_like(params)
         offset[index] = 1e-5
-        high = _public_objective(
+        high = _kernel_objective(
             model, estimator, points, observed, correct, params + offset
         )
-        low = _public_objective(
+        low = _kernel_objective(
             model, estimator, points, observed, correct, params - offset
         )
         numerical[index] = (high - low) / 2e-5
@@ -124,13 +148,7 @@ def test_prepared_dichotomous_optimizer_matches_numerical_likelihood(kind):
     assert analytic_fit.nfev < numeric_fit.nfev
 
 
-@pytest.mark.parametrize("kind", _KINDS)
-def test_fully_clipped_dichotomous_tails_have_zero_gradient(kind):
-    model = _model(kind)
-    if "guessing" in model.parameters:
-        model.set_parameters(guessing=np.array([0.0]))
-    if "upper" in model.parameters:
-        model.set_parameters(upper=np.array([1.0]))
+def _saturated_tails(model):
     points = np.zeros((4, model.n_factors))
     points[:, 0] = [-1000, -30, 30, 1000]
     observed = np.array([3.0, 5.0, 2.0, 4.0])
@@ -141,9 +159,60 @@ def test_fully_clipped_dichotomous_tails_have_zero_gradient(kind):
         loss, gradient = estimator._neg_expected_loglik_with_grad_dichotomous(
             model, 0, points, observed, correct, params
         )
-    expected = _public_objective(model, estimator, points, observed, correct, params)
-    np.testing.assert_allclose(loss, expected, rtol=1e-14)
-    np.testing.assert_array_equal(gradient, 0.0)
+    return estimator, points, observed, correct, params, loss, gradient
+
+
+@pytest.mark.parametrize("kind", ["1PL", "2PL", "2PL-multi"])
+def test_saturated_logistic_tails_keep_the_exact_likelihood(kind):
+    # Regression: clipped probabilities left these tails flat, so the
+    # itemwise optimizer stopped on items whose expected responses saturate.
+    model = _model(kind)
+    _, points, observed, correct, _, loss, gradient = _saturated_tails(model)
+    slopes = model.parameters["discrimination"].reshape(-1)
+    location = model.parameters["difficulty"][0]
+    logits = points @ slopes - slopes.sum() * location
+    expected = np.sum(
+        correct * np.logaddexp(0.0, -logits)
+        + (observed - correct) * np.logaddexp(0.0, logits)
+    )
+    np.testing.assert_allclose(loss, expected, rtol=1e-13)
+    residual = observed * expit(logits) - correct
+    expected_gradient = [-slopes.sum() * residual.sum()]
+    if kind != "1PL":
+        expected_gradient = [*((points - location).T @ residual), *expected_gradient]
+    np.testing.assert_allclose(gradient, expected_gradient, rtol=1e-13)
+
+
+@pytest.mark.parametrize("kind", ["3PL", "4PL"])
+def test_guessing_tails_clip_only_near_free_asymptotes(kind):
+    # The exact derivative in a free asymptote is 1/p beyond the clip, which
+    # L-BFGS-B cannot step against, so only the 3PL's fixed one stays exact.
+    model = _model(kind).set_parameters(guessing=np.array([0.0]))
+    if kind == "4PL":
+        model.set_parameters(upper=np.array([1.0]))
+    estimator, points, observed, correct, params, loss, gradient = _saturated_tails(
+        model
+    )
+    clipped = _public_objective(model, estimator, points, observed, correct, params)
+    if kind == "4PL":
+        np.testing.assert_allclose(loss, clipped, rtol=1e-14)
+        np.testing.assert_array_equal(gradient, 0.0)
+        return
+    # Only the node at 30 approaches the upper asymptote with a representable
+    # failure probability; the one at 1000 underflows and keeps the clip.
+    logit = 1.2 * (30.0 - 0.25)
+    failure = expit(-logit)
+    exact = -(
+        correct[2] * np.log1p(-failure) + (observed[2] - correct[2]) * np.log(failure)
+    )
+    high = 1.0 - estimator.prob_epsilon
+    clipped_node = -(xlogy(correct[2], high) + xlog1py(observed[2] - correct[2], -high))
+    np.testing.assert_allclose(loss, clipped - clipped_node + exact, rtol=1e-14)
+    score = (observed[2] - correct[2]) / failure - correct[2] / (1.0 - failure)
+    common = score * failure * (1.0 - failure)
+    np.testing.assert_allclose(
+        gradient, [common * (30.0 - 0.25), -1.2 * common, failure * score], rtol=1e-12
+    )
 
 
 @pytest.mark.parametrize("observed", [0.0, 3.0])
@@ -162,6 +231,51 @@ def test_saturated_probabilities_and_zero_counts_do_not_produce_nan(kind, observ
         )
     assert loss == 0.0
     np.testing.assert_array_equal(gradient, 0.0)
+
+
+def test_itemwise_3pl_m_step_leaves_saturated_easy_starts():
+    # Regression: a 3PL item started where every incorrect response
+    # saturates had a flat clipped objective, and stopped there. Its upper
+    # asymptote is fixed, so that tail keeps the exact likelihood.
+    rng = np.random.default_rng(5)
+    responses = rng.integers(0, 2, (356, 3))
+    responses[:, 0] = 1
+    responses[rng.choice(356, 6, replace=False), 0] = 0
+    model = ThreeParameterLogistic(3)
+    estimator = EMEstimator(use_rust=False, use_gpu=False)
+    estimator._quadrature = GaussHermiteQuadrature(41)
+    estimator._latent_density = GaussianDensity()
+    posterior, _ = estimator._e_step(model, responses)
+    points = estimator._quadrature.nodes
+    optimum = estimator._optimize_item_params(model, 0, responses, posterior, points)
+    start = deepcopy(model)
+    estimator._set_item_params(start, 0, np.array([5.0, -30.0, 0.2]))
+    estimate = estimator._optimize_item_params(start, 0, responses, posterior, points)
+    _, _, objective, _ = estimator._item_objective(
+        model, 0, responses, posterior, points
+    )
+    assert objective(estimate)[0] == pytest.approx(objective(optimum)[0], rel=1e-6)
+
+
+def test_batched_3pl_objective_matches_the_itemwise_one():
+    theta = np.linspace(-6.0, 6.0, 41)
+    rng = np.random.default_rng(12)
+    observed = rng.uniform(1.0, 10.0, (3, 41))
+    correct = observed * rng.random((3, 41))
+    # Items saturating toward the fixed upper asymptote, toward the free
+    # guessing one, and neither.
+    x = np.array([[4.0, -9.0, 0.2], [3.0, 8.0, 0.0], [1.0, 0.0, 0.1]])
+    batched = guessing_items_objective(theta, correct, observed, 1e-10)
+    loss, gradient, information = batched(np.arange(3), x, True)
+    np.testing.assert_array_equal(batched(np.arange(3), x, False)[0], loss)
+    assert np.isfinite(information).all()
+    for item in range(3):
+        itemwise = prepare_logistic_objective(
+            theta[:, None], observed[item], correct[item], 1e-10, has_guessing=True
+        )
+        value, item_gradient = itemwise(x[item])
+        assert loss[item] == pytest.approx(value, rel=1e-14)
+        np.testing.assert_allclose(gradient[item], item_gradient, rtol=1e-12)
 
 
 def test_four_parameter_positive_tail_retains_representable_gradient():

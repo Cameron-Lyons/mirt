@@ -26,6 +26,117 @@ _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES = 131_072
 _POLYTOMOUS_MAX_INFORMATION_VALUES = 1_000_000
 
 
+def _validate_index(value: int, size: int, parameter: str) -> int:
+    """Return ``value`` as an ``int`` in ``[0, size)`` or raise ``MirtIndexError``."""
+    try:
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError
+        index = operator.index(value)
+    except TypeError:
+        raise MirtIndexError(
+            f"{parameter} must be an integer", parameter=parameter, value=value
+        ) from None
+    if index < 0 or index >= size:
+        raise MirtIndexError(
+            f"{parameter} {index} out of range [0, {size})", parameter=parameter
+        )
+    return index
+
+
+def validate_item_index(item_idx: int, n_items: int) -> int:
+    """Return ``item_idx`` as an ``int`` in ``[0, n_items)``.
+
+    Booleans, non-integers and negative indices raise
+    :class:`~mirt.exceptions.MirtIndexError`, which is both an ``IndexError``
+    and a ``ValueError``.
+    """
+    return _validate_index(item_idx, n_items, "item_idx")
+
+
+def validate_category_index(
+    index: int, n_values: int, *, parameter: str = "category"
+) -> int:
+    """Return a category or threshold ``index`` as an ``int`` in ``[0, n_values)``.
+
+    Parameters
+    ----------
+    index : int
+        Category, threshold or step index of one item.
+    n_values : int
+        Number of valid values for that item: its category count for a
+        category, or one less for a threshold.
+    parameter : str, default="category"
+        Argument name used in error messages.
+
+    Returns
+    -------
+    int
+        The validated index.
+
+    Raises
+    ------
+    MirtIndexError
+        For booleans, non-integers, negative indices, and indices of padding
+        beyond the item's own categories, as :func:`validate_item_index` does.
+    """
+    return _validate_index(index, n_values, parameter)
+
+
+def _validated_category_counts(
+    n_items: int, n_categories: int | list[int]
+) -> list[int]:
+    """Return one Python ``int`` category count of at least two per item.
+
+    A scalar applies to every item. Integers include NumPy integer scalars,
+    such as ``X.max() + 1``; booleans and floats raise
+    :class:`~mirt.exceptions.MirtValidationError`.
+    """
+
+    def is_integer(value: object) -> bool:
+        return isinstance(value, (int, np.integer)) and not isinstance(
+            value, (bool, np.bool_)
+        )
+
+    if is_integer(n_categories):
+        counts = [int(n_categories)] * n_items
+    else:
+        try:
+            values = list(n_categories)
+        except TypeError:
+            raise MirtValidationError(
+                "n_categories must be an integer or one integer per item",
+                parameter="n_categories",
+                value=n_categories,
+                expected="integer or list of integers",
+            ) from None
+        if len(values) != n_items:
+            raise MirtValidationError(
+                f"Length of n_categories ({len(values)}) must match n_items ({n_items})",
+                parameter="n_categories",
+                value=len(values),
+                expected=str(n_items),
+            )
+        for value in values:
+            if not is_integer(value):
+                raise MirtValidationError(
+                    "n_categories must contain integers",
+                    parameter="n_categories",
+                    value=value,
+                    expected="integers >= 2",
+                )
+        counts = [int(value) for value in values]
+
+    for i, n_cat in enumerate(counts):
+        if n_cat < 2:
+            raise MirtValidationError(
+                f"Item {i} has {n_cat} categories; minimum is 2",
+                parameter="n_categories",
+                value=n_cat,
+                expected=">= 2",
+            )
+    return counts
+
+
 def _dichotomous_batch_fallback(
     responses: NDArray[np.int_], probabilities: NDArray[np.float64]
 ) -> NDArray[np.float64]:
@@ -87,8 +198,20 @@ class BaseItemModel(ABC):
     model_name: str = "BaseModel"
     n_params_per_item: int = 0
     supports_multidimensional: bool = False
-    # Stored parameters common to every item rather than indexed by item.
+    # Stored parameters common to every item rather than indexed by item,
+    # which EM estimates in a joint M-step (for example rating-scale
+    # thresholds).
     _shared_parameters: frozenset[str] = frozenset()
+    # Model-level parameters that no item owns, such as mixing proportions or
+    # testlet variances. The family's own fitting routine estimates them.
+    _global_parameters: frozenset[str] = frozenset()
+    # Stored slopes, with factors on the last axis, that an orthogonal factor
+    # rotation maps among themselves (see ``_rotational_indeterminacy``).
+    _rotatable_slopes: str | None = None
+    # Per-item locations ``b`` of multidimensional logits ``a @ theta -
+    # sum(a) * b``, which a factor rotation rescales to keep ``sum(a) * b``
+    # (see ``mirt.utils.rotation.apply_rotation_to_model``).
+    _slope_sum_locations: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -113,6 +236,18 @@ class BaseItemModel(ABC):
                 value=n_factors,
                 expected="> 0",
             )
+        if (
+            isinstance(n_factors, (float, np.floating))
+            and not float(n_factors).is_integer()
+        ):
+            raise MirtValidationError(
+                "n_factors must be a positive integer",
+                parameter="n_factors",
+                value=n_factors,
+                expected="integer >= 1",
+            )
+        # Store a plain int even when given 2.0, True or np.int64(2).
+        n_factors = int(n_factors)
         if not self.supports_multidimensional:
             if n_factors != 1:
                 raise MirtModelError(
@@ -120,8 +255,6 @@ class BaseItemModel(ABC):
                     model_type=self.model_name,
                     n_factors=n_factors,
                 )
-            # Store a plain int even when given 1.0, True or np.int64(1).
-            n_factors = 1
 
         self.n_items = n_items
         self.n_factors = n_factors
@@ -249,9 +382,43 @@ class BaseItemModel(ABC):
 
     @property
     def n_parameters(self) -> int:
-        return sum(
-            int(np.count_nonzero(mask)) for mask in self.free_parameter_masks.values()
-        )
+        """Number of identified free parameters, as used by AIC, BIC and LRTs.
+
+        This counts the coordinates of ``free_parameter_masks``, less the
+        ``F(F - 1) / 2`` rotational indeterminacy of an exploratory model with
+        ``F >= 2`` factors (see :meth:`_rotational_indeterminacy`). R mirt
+        removes the same count by fixing the upper triangle of the first
+        ``F - 1`` items' slopes in exploratory models.
+        """
+        masks = self.free_parameter_masks
+        count = sum(int(np.count_nonzero(mask)) for mask in masks.values())
+        return count - self._rotational_indeterminacy(masks)
+
+    def _rotational_indeterminacy(self, masks: Mapping[str, NDArray[np.bool_]]) -> int:
+        """Return the free coordinates that only an orthogonal rotation determines.
+
+        Under a standard normal latent density, rotating the factors by an
+        orthogonal ``R`` and every slope vector by ``R`` leaves the marginal
+        likelihood unchanged. The rotation has ``F(F - 1) / 2`` free angles
+        when every slope coordinate is free on all factors or none, as in an
+        exploratory model. A loading pattern, including one set with
+        ``set_free_parameter_masks``, identifies the rotation instead, and
+        this returns zero. Only families whose logits depend on the abilities
+        through slope-weighted sums name their slope parameter in
+        ``_rotatable_slopes``; noncompensatory curves are not rotation
+        invariant.
+        """
+        n_factors = self.n_factors
+        name = self._rotatable_slopes
+        if n_factors < 2 or name is None or name in self._free_parameter_restrictions:
+            return 0
+        mask = masks.get(name)
+        if mask is None or mask.ndim < 2 or mask.shape[-1] != n_factors:
+            return 0
+        rows = mask.reshape(-1, n_factors)
+        if np.any(rows.any(axis=1) != rows.all(axis=1)):
+            return 0
+        return min(n_factors * (n_factors - 1) // 2, int(np.count_nonzero(rows)))
 
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
@@ -385,34 +552,21 @@ class BaseItemModel(ABC):
     def _validate_item_index(self, item_idx: int) -> int:
         """Return ``item_idx`` as an ``int`` in ``[0, n_items)``.
 
-        Booleans, non-integers and negative indices raise
-        :class:`~mirt.exceptions.MirtIndexError`, which is both an
-        ``IndexError`` and a ``ValueError``.
+        See :func:`validate_item_index`.
         """
-        try:
-            if isinstance(item_idx, (bool, np.bool_)):
-                raise TypeError
-            index = operator.index(item_idx)
-        except TypeError:
-            raise MirtIndexError(
-                "item_idx must be an integer", parameter="item_idx", value=item_idx
-            ) from None
-        if index < 0 or index >= self.n_items:
-            raise MirtIndexError(
-                f"item_idx {index} out of range [0, {self.n_items})",
-                parameter="item_idx",
-            )
-        return index
+        return validate_item_index(item_idx, self.n_items)
 
     def _item_indexed(self, name: str) -> bool:
         """Whether stored parameter ``name`` has one leading row per item.
 
-        Parameters listed in ``_shared_parameters`` apply to every item even
-        when their length happens to equal ``n_items``.
+        Parameters listed in ``_shared_parameters`` or ``_global_parameters``
+        are never per-item, even when their length happens to equal
+        ``n_items``.
         """
         values = self._parameters[name]
         return (
             name not in self._shared_parameters
+            and name not in self._global_parameters
             and values.ndim >= 1
             and values.shape[0] == self.n_items
         )
@@ -761,27 +915,7 @@ class PolytomousItemModel(BaseItemModel):
         n_factors: int = 1,
         item_names: list[str] | None = None,
     ) -> None:
-        if isinstance(n_categories, int):
-            self._n_categories = [n_categories] * n_items
-        else:
-            if len(n_categories) != n_items:
-                raise MirtValidationError(
-                    f"Length of n_categories ({len(n_categories)}) must match n_items ({n_items})",
-                    parameter="n_categories",
-                    value=len(n_categories),
-                    expected=str(n_items),
-                )
-            self._n_categories = list(n_categories)
-
-        for i, n_cat in enumerate(self._n_categories):
-            if n_cat < 2:
-                raise MirtValidationError(
-                    f"Item {i} has {n_cat} categories; minimum is 2",
-                    parameter="n_categories",
-                    value=n_cat,
-                    expected=">= 2",
-                )
-
+        self._n_categories = _validated_category_counts(n_items, n_categories)
         super().__init__(n_items, n_factors, item_names)
 
     @property

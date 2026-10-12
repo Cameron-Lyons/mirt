@@ -16,6 +16,7 @@ from mirt.diagnostics.multiple_testing import (
 )
 from mirt.scoring._common import validate_scoring_responses
 from mirt.typing import PersonFitStatistic
+from mirt.utils._validation import validate_alpha as _validate_alpha
 from mirt.utils.numeric import (
     _FitStatsAccumulator,
     _fourth_central_moment,
@@ -235,19 +236,6 @@ def _coerce_zh(zh: ArrayLike) -> NDArray[np.float64]:
     return values
 
 
-def _validate_alpha(alpha: object) -> float:
-    """Return a finite significance threshold strictly between zero and one."""
-    if isinstance(alpha, (bool, np.bool_)):
-        raise ValueError("alpha must be finite and in (0, 1)")
-    try:
-        value = float(alpha)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("alpha must be finite and in (0, 1)") from exc
-    if not np.isfinite(value) or not 0.0 < value < 1.0:
-        raise ValueError("alpha must be finite and in (0, 1)")
-    return value
-
-
 def _validate_alternative(alternative: object) -> PersonFitAlternative:
     """Return a supported normal-tail alternative."""
     if not isinstance(alternative, str) or alternative not in _PERSON_FIT_ALTERNATIVES:
@@ -284,11 +272,53 @@ def _compute_zh_vectorized(
     probabilities: NDArray[np.float64],
     valid_mask: NDArray[np.bool_],
 ) -> NDArray[np.float64]:
-    n_persons, n_items = responses.shape
+    """Standardized log-likelihood ``Zh`` of every person (row)."""
+    ll, expected_ll, var_ll = _log_likelihood_moments(
+        model, responses, probabilities, valid_mask, axis=1
+    )
+    return _standardized_log_likelihood(ll, expected_ll, var_ll, valid_mask.sum(axis=1))
 
-    ll = np.zeros(n_persons)
-    expected_ll = np.zeros(n_persons)
-    var_ll = np.zeros(n_persons)
+
+def _standardized_log_likelihood(
+    ll: NDArray[np.float64],
+    expected_ll: NDArray[np.float64],
+    var_ll: NDArray[np.float64],
+    counts: NDArray[np.int_],
+) -> NDArray[np.float64]:
+    """Return ``(l0 - E[l0]) / sqrt(Var[l0])``, or NaN without information.
+
+    Sums of fewer than two responses, or with (near) zero variance, are NaN.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(
+            (counts >= 2) & (var_ll > PROB_EPSILON),
+            (ll - expected_ll) / np.sqrt(var_ll),
+            np.nan,
+        )
+
+
+def _log_likelihood_moments(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    probabilities: NDArray[np.float64],
+    valid_mask: NDArray[np.bool_],
+    *,
+    axis: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Sum response log-likelihoods, their expectations and variances.
+
+    Each observed response contributes its log-likelihood ``l0``, the
+    expectation ``E = sum_k P_k log P_k`` and the variance
+    ``sum_k P_k log^2 P_k - E^2`` of its log-likelihood under the model
+    (Drasgow, Levine & Williams, 1985). Sums run over items (``axis=1``,
+    person fit) or over persons (``axis=0``, item fit). Missing responses
+    contribute nothing.
+    """
+    n_persons, n_items = responses.shape
+    size = n_persons if axis == 1 else n_items
+    ll = np.zeros(size)
+    expected_ll = np.zeros(size)
+    var_ll = np.zeros(size)
 
     category_width = probabilities.shape[2] if probabilities.ndim == 3 else 1
     chunk_size = max(
@@ -299,6 +329,22 @@ def _compute_zh_vectorized(
         ),
     )
 
+    def accumulate(
+        start: int,
+        stop: int,
+        person_ll: NDArray[np.float64],
+        item_expected_ll: NDArray[np.float64],
+        item_var_ll: NDArray[np.float64],
+        block_valid: NDArray[np.bool_],
+    ) -> None:
+        target = slice(None) if axis == 1 else slice(start, stop)
+        for total, values in (
+            (ll, person_ll),
+            (expected_ll, item_expected_ll),
+            (var_ll, item_var_ll),
+        ):
+            total[target] += np.sum(np.where(block_valid, values, 0.0), axis=axis)
+
     if probabilities.ndim == 2:
         for start in range(0, n_items, chunk_size):
             stop = min(start + chunk_size, n_items)
@@ -307,24 +353,16 @@ def _compute_zh_vectorized(
                 PROB_EPSILON,
                 1 - PROB_EPSILON,
             )
-            block_valid = valid_mask[:, start:stop]
             block_responses = responses[:, start:stop]
             log_p = np.log(probs)
             log_q = np.log(1 - probs)
-
-            person_ll = np.where(block_responses == 1, log_p, log_q)
-            ll += np.sum(np.where(block_valid, person_ll, 0.0), axis=1)
-
-            item_expected_ll = probs * log_p + (1 - probs) * log_q
-            expected_ll += np.sum(
-                np.where(block_valid, item_expected_ll, 0.0),
-                axis=1,
-            )
-
-            item_var_ll = probs * (1 - probs) * (log_p - log_q) ** 2
-            var_ll += np.sum(
-                np.where(block_valid, item_var_ll, 0.0),
-                axis=1,
+            accumulate(
+                start,
+                stop,
+                np.where(block_responses == 1, log_p, log_q),
+                probs * log_p + (1 - probs) * log_q,
+                probs * (1 - probs) * (log_p - log_q) ** 2,
+                valid_mask[:, start:stop],
             )
     else:
         category_counts = np.asarray(model.n_categories, dtype=np.int64)
@@ -352,60 +390,20 @@ def _compute_zh_vectorized(
                 safe_responses,
                 0,
                 category_counts[None, start:stop] - 1,
-            )
+            ).astype(np.intp, copy=False)
             person_ll = np.take_along_axis(
                 log_probs,
                 safe_responses[..., None],
                 axis=2,
             )[..., 0]
-            ll += np.sum(np.where(block_valid, person_ll, 0.0), axis=1)
-
             item_expected_ll = np.sum(probs * log_probs, axis=2)
-            expected_ll += np.sum(
-                np.where(block_valid, item_expected_ll, 0.0),
-                axis=1,
+            accumulate(
+                start,
+                stop,
+                person_ll,
+                item_expected_ll,
+                np.sum(probs * log_probs**2, axis=2) - item_expected_ll**2,
+                block_valid,
             )
 
-            item_var_ll = np.sum(probs * log_probs**2, axis=2) - item_expected_ll**2
-            var_ll += np.sum(
-                np.where(block_valid, item_var_ll, 0.0),
-                axis=1,
-            )
-
-    valid_count = valid_mask.sum(axis=1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        zh = np.where(
-            (valid_count >= 2) & (var_ll > PROB_EPSILON),
-            (ll - expected_ll) / np.sqrt(var_ll),
-            np.nan,
-        )
-
-    return zh
-
-
-def flag_aberrant_persons(
-    fit_stats: dict[str, NDArray[np.float64]],
-    criteria: dict[str, tuple[float, float]] | None = None,
-) -> NDArray[np.bool_]:
-    if criteria is None:
-        criteria = {
-            "infit": (0.5, 1.5),
-            "outfit": (0.5, 1.5),
-            "Zh": (-2.0, 2.0),
-            "lz": (-2.0, 2.0),
-        }
-
-    if not fit_stats:
-        raise ValueError("fit_stats must contain at least one statistic")
-
-    first_stat = next(iter(fit_stats.values()))
-    n_persons = len(first_stat)
-
-    flags = np.zeros(n_persons, dtype=bool)
-
-    for stat_name, (lower, upper) in criteria.items():
-        if stat_name in fit_stats:
-            values = fit_stats[stat_name]
-            flags |= (values < lower) | (values > upper)
-
-    return flags
+    return ll, expected_ll, var_ll

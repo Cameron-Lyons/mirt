@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -97,6 +97,95 @@ class ReportBuilder(HTMLReport):
     ) -> None:
         super().__init__(title)
         self.fit_result = fit_result
+
+    def _response_matrix(self, responses: Any) -> NDArray[Any]:
+        """Read responses as the model's items, with missing values coded -1.
+
+        A DataFrame with named columns is matched to the model's item names
+        first, as :func:`mirt.fscores` does, so a reordered frame gives the
+        same report. Nullable columns (``pd.NA``) and ``NaN`` become the
+        missing code ``-1`` that :func:`mirt.fit_mirt` and the diagnostics
+        accept; other values are left for the diagnostics to validate.
+        """
+        import numpy as np
+
+        from mirt.utils.data import _missing_coded_responses, align_response_columns
+
+        model = getattr(self.fit_result, "model", None)
+        aligned = align_response_columns(responses, getattr(model, "item_names", None))
+        return np.asarray(_missing_coded_responses(aligned))
+
+    def _limited_information_fit(
+        self, responses: NDArray[Any]
+    ) -> tuple[dict[str, float], str]:
+        """Compute fit indices and name the statistic behind them.
+
+        Binary items use M2 and ordinal items M2*. When M2* has no degrees
+        of freedom and C2 has some, C2 is reported, as
+        :func:`mirt.diagnostics.modelfit.compute_fit_indices` does by default,
+        but without its fallback warning: the report names the statistic.
+        """
+        import numpy as np
+
+        from mirt.diagnostics.modelfit import compute_fit_indices
+
+        model = self.fit_result.model
+        counts = (
+            model.n_categories
+            if getattr(model, "is_polytomous", False)
+            else [2] * model.n_items
+        )
+        statistic = "M2*" if np.any(np.asarray(counts) > 2) else "M2"
+        indices = compute_fit_indices(self.fit_result, responses, type=statistic)
+        if statistic == "M2*" and indices["M2_df"] == 0:
+            c2_indices = compute_fit_indices(self.fit_result, responses, type="C2")
+            if c2_indices["M2_df"] > 0:
+                return c2_indices, "C2"
+        return indices, statistic
+
+    @staticmethod
+    def _statistic_note(statistic: str) -> str:
+        """Explain a C2 statistic that replaced an untestable M2*."""
+        if statistic != "C2":
+            return ""
+        return (
+            "<p><em>Note:</em> M2* has no degrees of freedom for these items and "
+            "parameters, so the hybrid C2 statistic (Cai &amp; Monroe, 2014) is "
+            "reported, and RMSEA, CFI and TLI are based on it.</p>"
+        )
+
+    def _wright_map_section(
+        self, theta: NDArray[np.float64], title: str, *, level: int = 2
+    ) -> str:
+        """Embed one Wright map per factor, or a note where none applies.
+
+        Factors without located items, and families without item locations
+        such as nominal response models, are reported in a note instead of
+        failing the report.
+        """
+        import numpy as np
+
+        from mirt.reports._plots import create_wright_map_base64
+        from mirt.reports._templates import embedded_plot, escape_text, section
+
+        model = self.fit_result.model
+        n_factors = int(getattr(model, "n_factors", 1))
+        theta_values = np.asarray(theta)
+        factors = range(n_factors if theta_values.ndim == 2 else 1)
+        plots: list[str] = []
+        notes: list[str] = []
+        for factor in factors:
+            label = f" (factor {factor + 1})" if n_factors > 1 else ""
+            try:
+                image = create_wright_map_base64(model, theta, factor=factor)
+            except ValueError as exc:
+                notes.append(f"Wright map{label} not shown: {exc}.")
+            else:
+                plots.append(embedded_plot(image, f"Wright Map{label}"))
+        content = "".join(plots) + "".join(
+            f"<p><em>{escape_text(note)}</em></p>" for note in notes
+        )
+        return section(title, content, level=level)
 
     def _model_summary_section(self, label: str = "Model") -> str:
         """Render model dimensions and fit statistics as a summary section."""

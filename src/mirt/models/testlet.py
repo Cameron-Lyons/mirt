@@ -6,18 +6,21 @@ among items within testlets (e.g., items sharing a common passage).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
 from numbers import Integral
 from typing import Self
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.optimize import brentq
 
 from mirt._core import sigmoid
 from mirt._correlation import pairwise_correlations
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel
+from mirt.models.multidimensional import standardized_loadings
 
 _PAIRWISE_CORRELATION_TARGET_ELEMENTS = 2_000_000
 _TESTLET_LIKELIHOOD_TARGET_ELEMENTS = 1_000_000
@@ -222,6 +225,63 @@ def _validate_binary_responses(
     return codes, observed
 
 
+class _TestletPairMoment:
+    """Moment condition of one testlet's standard deviation ``sigma``.
+
+    Calling it returns the observed minus the model-implied sum of the
+    within-testlet response covariances given the general abilities, over
+    the item pairs each person answered. Its root in ``sigma`` is the moment
+    estimate. Rows are processed in bounded chunks.
+    """
+
+    def __init__(
+        self,
+        theta: NDArray[np.float64],
+        responses: NDArray[np.float64],
+        observed: NDArray[np.float64],
+        discrimination: NDArray[np.float64],
+        difficulty: NDArray[np.float64],
+        loadings: NDArray[np.float64],
+        nodes: NDArray[np.float64],
+        weights: NDArray[np.float64],
+    ) -> None:
+        self.base = theta[:, None] * discrimination[None, :] - difficulty[None, :]
+        self.responses = responses
+        self.observed = observed
+        self.loadings = loadings
+        self.nodes = nodes
+        self.weights = weights
+        self.rows = max(
+            1,
+            _TESTLET_LIKELIHOOD_TARGET_ELEMENTS // max(1, loadings.size * nodes.size),
+        )
+
+    def __call__(self, sigma: float) -> float:
+        total = 0.0
+        shift = sigma * self.loadings[:, None] * self.nodes[None, :]
+        for start in range(0, self.base.shape[0], self.rows):
+            stop = start + self.rows
+            observed = self.observed[start:stop]
+            curves = sigmoid(self.base[start:stop, :, None] + shift[None, :, :])
+            marginal = curves @ self.weights
+            residual = observed * (self.responses[start:stop] - marginal)
+            observed_pairs = 0.5 * (
+                residual.sum(axis=1) ** 2 - np.sum(residual**2, axis=1)
+            )
+            # E[sum_{j<k} P_j P_k] - sum_{j<k} m_j m_k for the answered items.
+            weighted = curves * observed[:, :, None]
+            joint = 0.5 * (
+                weighted.sum(axis=1) ** 2 - np.sum(weighted * curves, axis=1)
+            )
+            answered = observed * marginal
+            independent = 0.5 * (
+                answered.sum(axis=1) ** 2 - np.sum(answered * marginal, axis=1)
+            )
+            implied_pairs = joint @ self.weights - independent
+            total += float(np.sum(observed_pairs - implied_pairs))
+        return total
+
+
 def _pairwise_complete_correlations(
     residuals: NDArray[np.float64],
     observed: NDArray[np.bool_],
@@ -253,16 +313,40 @@ class TestletModel(DichotomousItemModel):
 
     where:
     - theta: General ability factor
-    - gamma_t: Testlet-specific random effect (one per testlet)
+    - gamma_t: Testlet-specific random effect, ``N(0, sigma_t^2)``
     - a_j: Item discrimination on general factor
     - d_j: Item loading on testlet factor
     - b_j: Item difficulty
+    - sigma_t^2: Testlet variance (``testlet_variances``)
 
-    This is similar to a bifactor model but constrained to the testlet structure.
+    This is a bifactor model whose specific slopes are ``d_j * sigma_t``. A
+    full theta holds the standardized testlet effects ``z_t = gamma_t /
+    sigma_t``, which are standard normal like the general factor, so
+    ``probability`` with every factor evaluates ``logistic(a_j * theta +
+    d_j * sigma_t * z_t - b_j)``; general-only theta integrates ``z_t`` out.
+
+    Only the products ``d_j * sigma_t`` are identified. A testlet's variance
+    is therefore held fixed, at 1 unless set otherwise, while any loading of
+    its testlet is free, as R mirt's ``bfactor`` fixes specific-factor
+    variances. Fixing every loading of a testlet with
+    ``set_free_parameter_masks``, for example at 1 as in the random
+    testlet-effect model of Wang and Wilson (2005), frees its variance, which
+    :class:`~mirt.estimation.em.EMEstimator` and
+    :class:`~mirt.estimation.bifactor_em.BifactorEMEstimator` then estimate.
+    Both fit testlet models by the Gibbons-Hedeker dimension reduction, one
+    (general, testlet) grid per testlet; EM falls back to the full product
+    grid only for options the reduction lacks.
+
+    References
+    ----------
+    Wang, W.-C., & Wilson, M. (2005). The Rasch testlet model. *Applied
+    Psychological Measurement*, 29(2), 126-149.
     """
 
     model_name = "Testlet"
     supports_multidimensional = True
+    _global_parameters = frozenset({"testlet_variances"})
+    _parameter_boxes = {"testlet_variances": (0.0, 25.0)}
     __test__ = False
 
     def __init__(
@@ -321,10 +405,84 @@ class TestletModel(DichotomousItemModel):
         return self._parameters["testlet_variances"].copy()
 
     @property
+    def _shared_parameters(self) -> frozenset[str]:
+        """Parameters shared by the items of a testlet rather than one item.
+
+        The testlet variances belong to no item; EM's shared-parameter step
+        estimates each free one from the expected counts of every item.
+        """
+        return frozenset({"testlet_variances"})
+
+    def _family_loading_mask(self) -> NDArray[np.bool_]:
+        """Return the loadings the family leaves free: those of testlet items."""
+        return self._testlet_positions >= 0
+
+    @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        """Free coordinates; a testlet's variance only with all loadings fixed.
+
+        Loadings and the variance of a testlet enter the model only through
+        their products ``d_j * sigma_t``, so the variance is free only when
+        no loading of its testlet is free and at least one is nonzero.
+        """
         masks = super().free_parameter_masks
-        masks["testlet_loadings"] &= self._testlet_membership >= 0
-        return self._apply_free_parameter_restrictions(masks)
+        masks["testlet_loadings"] &= self._family_loading_mask()
+        masks = self._apply_free_parameter_restrictions(masks)
+        loadings = self._parameters["testlet_loadings"]
+        for position in range(self._n_testlets):
+            items = self._testlet_positions == position
+            if np.any(masks["testlet_loadings"][items]) or not np.any(
+                loadings[items] != 0.0
+            ):
+                masks["testlet_variances"][position] = False
+        return masks
+
+    def set_free_parameter_masks(
+        self, masks: Mapping[str, NDArray[np.bool_]] | None
+    ) -> Self:
+        """Restrict free coordinates without changing parameter values.
+
+        Fixing every loading of a testlet frees its variance (see
+        :attr:`free_parameter_masks`). A ``testlet_variances`` mask is checked
+        against the loadings in the same call, so it may hold such a
+        variance fixed again but cannot free the variance of a testlet whose
+        loadings are free.
+
+        Raises
+        ------
+        MirtValidationError
+            If a mask is malformed or frees a coordinate the family fixes.
+        """
+        if (
+            masks is None
+            or not isinstance(masks, Mapping)
+            or "testlet_variances" not in masks
+        ):
+            return super().set_free_parameter_masks(masks)
+        previous = self._free_parameter_restrictions
+        super().set_free_parameter_masks(
+            {name: mask for name, mask in masks.items() if name != "testlet_variances"}
+        )
+        allowed = self.free_parameter_masks["testlet_variances"]
+        mask = np.asarray(masks["testlet_variances"])
+        if mask.dtype != np.bool_ or mask.shape != allowed.shape:
+            self._free_parameter_restrictions = previous
+            raise MirtValidationError(
+                f"Mask for testlet_variances must be Boolean with shape "
+                f"{allowed.shape}",
+                parameter="masks",
+            )
+        if np.any(mask & ~allowed):
+            self._free_parameter_restrictions = previous
+            raise MirtValidationError(
+                "Mask for testlet_variances cannot free model-family fixed "
+                "parameters: a testlet variance is identified only when every "
+                "loading of its testlet is fixed",
+                parameter="masks",
+            )
+        if not np.array_equal(mask, allowed):
+            self._free_parameter_restrictions["testlet_variances"] = mask.copy()
+        return self
 
     @property
     def n_quadpts(self) -> int:
@@ -361,6 +519,76 @@ class TestletModel(DichotomousItemModel):
     def difficulty(self) -> NDArray[np.float64]:
         """Item difficulties."""
         return self._parameters["difficulty"]
+
+    def _testlet_slopes(self) -> NDArray[np.float64]:
+        """Return each item's slope ``d_j * sigma_t`` on its standardized effect.
+
+        Standalone items have zero slopes.
+        """
+        slopes = np.zeros(self.n_items, dtype=np.float64)
+        in_testlet = self._testlet_positions >= 0
+        slopes[in_testlet] = self._parameters["testlet_loadings"][in_testlet] * np.sqrt(
+            self._parameters["testlet_variances"][self._testlet_positions[in_testlet]]
+        )
+        return slopes
+
+    def get_loading_matrix(self) -> NDArray[np.float64]:
+        """Return the bifactor slopes on the general and standardized testlet factors.
+
+        Returns
+        -------
+        ndarray of shape (n_items, 1 + n_testlets)
+            Discriminations in the first column and each testlet item's
+            ``d_j * sigma_t`` in the column of its testlet, the slopes of the
+            equivalent :class:`~mirt.models.bifactor.BifactorModel`.
+        """
+        loadings = np.zeros((self.n_items, self.n_factors), dtype=np.float64)
+        loadings[:, 0] = self._parameters["discrimination"]
+        in_testlet = np.flatnonzero(self._testlet_positions >= 0)
+        loadings[in_testlet, 1 + self._testlet_positions[in_testlet]] = (
+            self._testlet_slopes()[in_testlet]
+        )
+        return loadings
+
+    def _standardized_components(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Return standardized general and testlet loadings and uniquenesses.
+
+        The slopes of :meth:`get_loading_matrix` are converted with
+        ``D = 1.702`` as :class:`~mirt.models.bifactor.BifactorModel` does
+        (see :func:`~mirt.models.multidimensional.standardized_loadings`);
+        standalone items have zero testlet loadings.
+        """
+        loadings, communalities = standardized_loadings(self.get_loading_matrix())
+        testlet = np.zeros(self.n_items, dtype=np.float64)
+        in_testlet = np.flatnonzero(self._testlet_positions >= 0)
+        testlet[in_testlet] = loadings[
+            in_testlet, 1 + self._testlet_positions[in_testlet]
+        ]
+        return loadings[:, 0], testlet, 1.0 - communalities
+
+    def _score_variance_components(
+        self, items: NDArray[np.intp] | None = None
+    ) -> tuple[float, float, float]:
+        """Return general, testlet and unique variance of a standardized sum.
+
+        The general and testlet components are squared loading sums, the
+        unique component the sum of the uniquenesses ``1 - h2``.
+        """
+        if items is None:
+            items = np.arange(self.n_items)
+        general, testlet, unique = self._standardized_components()
+        positions = self._testlet_positions[items]
+        testlet_variance = sum(
+            float(np.sum(testlet[items[positions == position]]) ** 2)
+            for position in np.unique(positions[positions >= 0])
+        )
+        return (
+            float(np.sum(general[items]) ** 2),
+            testlet_variance,
+            float(np.sum(unique[items])),
+        )
 
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         """Atomically set finite parameters while preserving testlet constraints."""
@@ -481,7 +709,9 @@ class TestletModel(DichotomousItemModel):
         """Compute response probabilities.
 
         For the testlet model, theta should include both general and
-        testlet-specific factors: theta = [theta_general, gamma_1, ..., gamma_T]
+        testlet-specific factors: theta = [theta_general, z_1, ..., z_T],
+        where ``z_t = gamma_t / sigma_t`` is the standardized effect of
+        testlet ``t``, which enters with slope ``d_j * sigma_t``.
 
         If only general theta is provided (1D), testlet effects are
         integrated out using quadrature.
@@ -506,20 +736,20 @@ class TestletModel(DichotomousItemModel):
         if item_idx is not None:
             item = self._validate_item_index(item_idx)
         a = self._parameters["discrimination"]
-        d = self._parameters["testlet_loadings"]
+        slopes = self._testlet_slopes()
         b = self._parameters["difficulty"]
         if item_idx is not None:
             position = self._testlet_positions[item]
             linear = a[item] * theta_values[:, 0] - b[item]
             if position >= 0:
-                linear += d[item] * theta_values[:, position + 1]
+                linear += slopes[item] * theta_values[:, position + 1]
             return sigmoid(linear)
 
         linear = a[None, :] * theta_values[:, :1] - b[None, :]
         in_testlet = self._testlet_positions >= 0
         if np.any(in_testlet):
             linear[:, in_testlet] += (
-                d[None, in_testlet]
+                slopes[None, in_testlet]
                 * theta_values[:, self._testlet_positions[in_testlet] + 1]
             )
         return sigmoid(linear)
@@ -539,14 +769,14 @@ class TestletModel(DichotomousItemModel):
             return self._marginal_probability_pairs(theta_values[:, 0], indices)
 
         discrimination = self._parameters["discrimination"][indices]
-        loadings = self._parameters["testlet_loadings"][indices]
+        slopes = self._testlet_slopes()[indices]
         difficulty = self._parameters["difficulty"][indices]
         positions = self._testlet_positions[indices]
         linear = discrimination * theta_values[:, 0] - difficulty
         in_testlet = positions >= 0
         rows = np.flatnonzero(in_testlet)
         linear[rows] += (
-            loadings[rows]
+            slopes[rows]
             * theta_values[
                 rows,
                 positions[rows] + 1,
@@ -613,7 +843,8 @@ class TestletModel(DichotomousItemModel):
 
         General-only theta values use the derivative of the quadrature-marginal
         probability. Full theta values use the squared norm of each item's
-        active general and testlet loadings.
+        slopes on the general and standardized testlet factors, ``a_j`` and
+        ``d_j * sigma_t``.
         """
         theta_values = self._prepare_theta(theta)
         if theta_values.shape[1] == 1:
@@ -629,19 +860,44 @@ class TestletModel(DichotomousItemModel):
             )
 
         probability = self.probability(theta_values, item_idx)
+        squared_loading = (
+            self._parameters["discrimination"] ** 2 + self._testlet_slopes() ** 2
+        )
         if item_idx is not None:
             item = self._validate_item_index(item_idx)
-            squared_loading = self._parameters["discrimination"][item] ** 2
-            if self._testlet_positions[item] >= 0:
-                squared_loading += self._parameters["testlet_loadings"][item] ** 2
-            return squared_loading * probability * (1.0 - probability)
-
-        squared_loading = self._parameters["discrimination"] ** 2
-        in_testlet = self._testlet_positions >= 0
-        squared_loading[in_testlet] += (
-            self._parameters["testlet_loadings"][in_testlet] ** 2
-        )
+            return squared_loading[item] * probability * (1.0 - probability)
         return squared_loading[None, :] * probability * (1.0 - probability)
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        """Set one item's discrimination, loading or difficulty.
+
+        Raises
+        ------
+        MirtValidationError
+            For testlet variances, which no single item owns, and for the
+            common loadings of a constrained testlet, which its items share;
+            set them with ``set_parameters``.
+        """
+        if param_name in self._global_parameters:
+            self._validate_item_index(item_idx)
+            raise MirtValidationError(
+                f"Parameter {param_name} does not have per-item values; use "
+                "set_parameters",
+                parameter=param_name,
+            )
+        if param_name in self._shared_parameters:
+            self._validate_item_index(item_idx)
+            raise MirtValidationError(
+                f"{param_name} are shared by the items of each testlet; use "
+                "set_parameters",
+                parameter=param_name,
+            )
+        super().set_item_parameter(item_idx, param_name, value)
 
     def get_testlet_items(self, testlet_idx: int) -> list[int]:
         """Get indices of items belonging to a testlet.
@@ -718,41 +974,33 @@ class TestletModel(DichotomousItemModel):
     def testlet_reliability(self) -> dict[int, float]:
         """Compute reliability for each testlet.
 
-        Returns omega-like reliability coefficient for items within each testlet.
+        McDonald's omega total of each testlet's items from the standardized
+        loadings of the equivalent bifactor model (slopes ``a_j`` and
+        ``d_j * sigma_t``, ``D = 1.702``), as
+        :meth:`BifactorModel.omega_subscale
+        <mirt.models.bifactor.BifactorModel.omega_subscale>` computes it: the
+        squared general and testlet loading sums over the variance of the
+        sum of standardized latent responses, which adds the uniquenesses
+        ``1 - h2``.
 
         Returns
         -------
         dict
-            Testlet index -> reliability coefficient
+            Testlet index -> reliability coefficient, NaN for a testlet with
+            fewer than two items
         """
         reliabilities = {}
 
-        for position, testlet_idx in enumerate(self._unique_testlets):
-            items = self.get_testlet_items(testlet_idx)
+        for testlet_idx in self._unique_testlets:
+            items = np.asarray(self.get_testlet_items(testlet_idx), dtype=np.intp)
 
             if len(items) < 2:
                 reliabilities[int(testlet_idx)] = np.nan
                 continue
 
-            general_loadings = self._parameters["discrimination"][items]
-            testlet_loadings = self._parameters["testlet_loadings"][items]
-
-            sum_general = general_loadings.sum()
-            sum_testlet = testlet_loadings.sum()
-
-            var_general = sum_general**2
-            var_testlet = (
-                sum_testlet**2 * self._parameters["testlet_variances"][position]
-            )
-            var_unique = len(items)
-
-            total_var = var_general + var_testlet + var_unique
-            if total_var > 0:
-                omega = (var_general + var_testlet) / total_var
-            else:
-                omega = np.nan
-
-            reliabilities[int(testlet_idx)] = float(omega)
+            general, testlet, unique = self._score_variance_components(items)
+            common = general + testlet
+            reliabilities[int(testlet_idx)] = float(common / (common + unique))
 
         return reliabilities
 
@@ -848,7 +1096,12 @@ class BifactorTestletModel(TestletModel):
     testlet_membership : NDArray or list
         Testlet assignment for each item.
     constrain_testlet_loadings : bool, default=False
-        If True, constrain testlet loadings to be equal within testlet.
+        If True, constrain testlet loadings to be equal within testlet. The
+        first item of each testlet stores the free common loading and the
+        others copy it. Each common loading is shared by its testlet's
+        items, so EM estimates it from all of their expected counts, and
+        estimators without a shared-parameter step refuse the model unless
+        the loadings are held fixed.
     item_names : list of str, optional
         Names for items.
     """
@@ -876,14 +1129,25 @@ class BifactorTestletModel(TestletModel):
         return self._constrain_loadings
 
     @property
-    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
-        masks = super().free_parameter_masks
+    def _shared_parameters(self) -> frozenset[str]:
+        """Testlet variances, and the common loadings when they are constrained.
+
+        A common loading belongs to every item of its testlet, so EM's
+        shared-parameter step estimates it from their summed expected counts
+        rather than an itemwise step from its first item's.
+        """
         if self._constrain_loadings:
-            masks["testlet_loadings"].fill(False)
+            return frozenset({"testlet_loadings", "testlet_variances"})
+        return frozenset({"testlet_variances"})
+
+    def _family_loading_mask(self) -> NDArray[np.bool_]:
+        """Return the stored free loadings: the first item of each constrained testlet."""
+        mask = super()._family_loading_mask()
+        if self._constrain_loadings:
+            mask = np.zeros(self.n_items, dtype=np.bool_)
             for label in self._unique_testlets:
-                first = self.get_testlet_items(int(label))[0]
-                masks["testlet_loadings"][first] = True
-        return self._apply_free_parameter_restrictions(masks)
+                mask[self.get_testlet_items(int(label))[0]] = True
+        return mask
 
     def _canonical_parameter_values(
         self, name: str, values: NDArray[np.float64]
@@ -968,48 +1232,46 @@ class BifactorTestletModel(TestletModel):
     def explained_variance(self) -> dict[str, float]:
         """Compute variance explained by general and testlet factors.
 
+        Shares of the items' latent response variance, averaged over items,
+        from the standardized loadings of the equivalent bifactor model
+        (slopes ``a_j`` and ``d_j * sigma_t`` divided by ``D = 1.702``; see
+        :func:`~mirt.models.multidimensional.standardized_loadings`). For
+        each item the squared general and testlet loadings and the
+        uniqueness ``1 - h2`` sum to one.
+
         Returns
         -------
         dict
-            Contains 'general', 'testlet', and 'unique' variance proportions.
+            Contains 'general', 'testlet', and 'unique' variance proportions,
+            and their common part 'total_common', the mean communality.
         """
-        general = self._parameters["discrimination"]
-        testlet = self._parameters["testlet_loadings"]
-
-        var_general = np.mean(general**2)
-        var_testlet = np.mean(testlet**2)
-        var_unique = 1.0
-
-        total = var_general + var_testlet + var_unique
-
+        general, testlet, unique = self._standardized_components()
         return {
-            "general": var_general / total,
-            "testlet": var_testlet / total,
-            "unique": var_unique / total,
-            "total_common": (var_general + var_testlet) / total,
+            "general": float(np.mean(general**2)),
+            "testlet": float(np.mean(testlet**2)),
+            "unique": float(np.mean(unique)),
+            "total_common": float(np.mean(1.0 - unique)),
         }
 
     def omega_hierarchical(self) -> float:
         """Compute omega hierarchical (general factor saturation).
 
+        McDonald's omega hierarchical from the standardized loadings of the
+        equivalent bifactor model, as
+        :meth:`BifactorModel.omega_hierarchical
+        <mirt.models.bifactor.BifactorModel.omega_hierarchical>` computes it:
+        the squared sum of general loadings over the variance of the sum of
+        standardized latent responses, which adds every testlet's squared
+        loading sum and the uniquenesses ``1 - h2``. Testlet loadings are
+        scaled by the testlet standard deviations ``sigma_t``.
+
         Returns
         -------
         float
-            Proportion of reliable variance due to general factor.
+            Proportion of total-score variance due to the general factor.
         """
-        general = self._parameters["discrimination"]
-        testlet = self._parameters["testlet_loadings"]
-
-        sum_general = general.sum()
-        sum_testlet_sq = sum(
-            testlet[self._testlet_membership == t].sum() ** 2
-            for t in self._unique_testlets
-        )
-
-        numerator = sum_general**2
-        denominator = sum_general**2 + sum_testlet_sq + self.n_items
-
-        return numerator / denominator if denominator > 0 else 0.0
+        general, testlet, unique = self._score_variance_components()
+        return float(general / (general + testlet + unique))
 
     def copy(self) -> Self:
         """Create a deep copy of this model."""
@@ -1033,9 +1295,13 @@ class BifactorTestletModel(TestletModel):
 class RandomTestletEffectsModel(TestletModel):
     """Random effects approach to testlet dependence.
 
-    This model treats testlet effects as random draws from a
-    normal distribution with estimated variance. The model integrates
-    out the testlet effects in likelihood computations.
+    This model treats testlet effects as random draws from a normal
+    distribution and integrates them out in likelihood computations given
+    general abilities alone. As in :class:`TestletModel`, a testlet's
+    variance is estimated only when its loadings are held fixed, for example
+    at 1 for the random testlet-effect model of Wang and Wilson (2005);
+    otherwise it scales the loadings and stays at its value.
+    :meth:`estimate_testlet_variances` gives method-of-moments estimates.
 
     Parameters
     ----------
@@ -1381,19 +1647,40 @@ class RandomTestletEffectsModel(TestletModel):
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Estimate testlet variances using method of moments.
+        """Estimate testlet variances by the method of moments.
+
+        Given the general abilities, the responses to two items of a testlet
+        covary only through its effect. For each testlet the variance
+        ``sigma_t^2`` solves
+
+            sum_p sum_{j<k} (y_pj - m_pj) (y_pk - m_pk) = sum_p sum_{j<k} C_pjk,
+
+        over the pairs of the testlet's items that person ``p`` answered,
+        where ``m_pj`` is item ``j``'s testlet-marginal probability at
+        ``theta_p`` and ``C_pjk`` the model-implied covariance of the two
+        responses given ``theta_p``. Both use the model's discriminations,
+        loadings, difficulties and quadrature, with testlet slopes
+        ``d_j * sigma_t``. The marginal maximum-likelihood estimates of
+        ``EMEstimator`` with the loadings fixed are more efficient; this
+        estimate is a starting value or a check.
 
         Parameters
         ----------
         responses : NDArray
             Response matrix (n_persons, n_items).
         theta : NDArray
-            Estimated general ability values.
+            General ability values (n_persons,), ideally the true abilities
+            or precise estimates: estimation error makes the residuals of
+            all items covary and biases the estimates upward.
 
         Returns
         -------
         NDArray
-            Estimated variance for each testlet.
+            Estimated variance for each testlet in ``testlet_labels`` order:
+            zero when the residuals show no positive dependence, the upper
+            bound 25 when even that variance implies less, and NaN for a
+            testlet without two jointly observed items or with only zero
+            loadings.
         """
         response_codes, observed = _validate_binary_responses(responses, self.n_items)
         try:
@@ -1413,28 +1700,33 @@ class RandomTestletEffectsModel(TestletModel):
                 "theta must contain only finite values", parameter="theta"
             )
 
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        expected = sigmoid(theta_values[:, None] * a[None, :] - b[None, :])
-        residuals = np.where(observed, response_codes - expected, np.nan)
-        estimated_vars = np.zeros(self._n_testlets)
-
-        for position, t_idx in enumerate(self._unique_testlets):
-            items = self.get_testlet_items(t_idx)
-            n_items_t = len(items)
-
-            if n_items_t < 2:
+        nodes, weights = _normal_quadrature(self._n_quadpts)
+        upper = float(np.sqrt(self._parameter_boxes["testlet_variances"][1]))
+        estimated_vars = np.full(self._n_testlets, np.nan)
+        for position in range(self._n_testlets):
+            items = np.flatnonzero(self._testlet_positions == position)
+            answered = observed[:, items]
+            rows = np.flatnonzero(np.count_nonzero(answered, axis=1) >= 2)
+            loadings = self._parameters["testlet_loadings"][items]
+            if items.size < 2 or rows.size == 0 or not np.any(loadings != 0.0):
                 continue
-
-            correlations, _ = _pairwise_complete_correlations(
-                residuals[:, items],
-                observed[:, items],
+            moment = _TestletPairMoment(
+                theta_values[rows],
+                response_codes[np.ix_(rows, items)].astype(np.float64),
+                answered[rows].astype(np.float64),
+                self._parameters["discrimination"][items],
+                self._parameters["difficulty"][items],
+                loadings,
+                nodes,
+                weights,
             )
-            values = correlations[np.triu_indices(n_items_t, k=1)]
-            finite_values = values[np.isfinite(values)]
-            if finite_values.size:
-                estimated_vars[position] = max(0.0, float(np.mean(finite_values)))
+            if moment(0.0) <= 0.0:
+                estimated_vars[position] = 0.0
+            elif moment(upper) >= 0.0:
+                estimated_vars[position] = upper**2
+            else:
+                deviation = brentq(moment, 0.0, upper, xtol=1e-8, rtol=1e-10)
+                estimated_vars[position] = float(deviation) ** 2
 
         return estimated_vars
 

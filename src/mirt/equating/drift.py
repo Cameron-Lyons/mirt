@@ -10,11 +10,27 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import optimize, stats
+from scipy import stats
 
+from mirt._model_defaults import uses_builtin_model_hooks
+from mirt.equating._curves import _expected_item_score_curves
 from mirt.equating.linking import (
+    _LINKING_METHODS,
+    _fit_curve_link,
+    _link_form,
     _normalize_anchor_indices,
+    _robust_z_scores,
+    _validate_anchor_pairs,
+    _validate_curve_grid,
+    _validate_linking_constants,
+    _validate_theta_grid,
     _validate_transform_constants,
+    link,
+)
+from mirt.equating.polytomous import (
+    _linker_for,
+    _minimize_positive_scale,
+    _polytomous_model_type,
 )
 
 if TYPE_CHECKING:
@@ -140,7 +156,7 @@ def detect_drift(
     )
 
     if method == "area":
-        theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
+        theta_grid = _validate_theta_grid(theta_range, n_theta)
         drift_stats = _area_drift(
             model_old, model_new, items_old, items_new, theta_grid, A, B
         )
@@ -233,26 +249,9 @@ def _validate_drift_inputs(
     normalized = _normalize_anchor_indices(
         items_old, items_new, model_old.n_items, model_new.n_items
     )
+    # Population weights are validated only where constants are estimated.
     _validate_theta_grid(theta_range, n_theta)
     return normalized
-
-
-def _validate_theta_grid(
-    theta_range: tuple[float, float], n_theta: int
-) -> tuple[float, float]:
-    """Validate a one-dimensional integration grid."""
-    if not isinstance(theta_range, (tuple, list)) or len(theta_range) != 2:
-        raise ValueError("theta_range must contain exactly two values")
-    lower, upper = float(theta_range[0]), float(theta_range[1])
-    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
-        raise ValueError("theta_range must contain finite, increasing values")
-    if isinstance(n_theta, (bool, np.bool_)) or not isinstance(
-        n_theta, (int, np.integer)
-    ):
-        raise ValueError("n_theta must be an integer")
-    if n_theta < 2:
-        raise ValueError("n_theta must be at least 2")
-    return lower, upper
 
 
 def _validate_threshold(method: str, threshold: float | None) -> float:
@@ -303,74 +302,82 @@ def _estimate_curve_link(
     theta_range: tuple[float, float],
     n_theta: int,
 ) -> tuple[float, float]:
-    """Estimate positive linking constants from model-native expected scores."""
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
-    weights = stats.norm.pdf(theta_grid)
-    weights /= weights.sum()
-    old_tcc = _expected_item_score_curves(model_old, theta_grid, items_old).sum(axis=1)
+    """Estimate Stocking-Lord constants from model-native curves.
+
+    Dichotomous forms with slope and location parameters use the estimator
+    of ``link(method="stocking_lord")``. Built-in GRM, GPCM/PCM, and NRM
+    forms of one family whose anchors have matching category counts use
+    the same estimator of ``link_grm``, ``link_gpcm``, or ``link_nrm``.
+    Other forms match summed expected item scores of ``model.probability``
+    on the same grid.
+    """
+    theta_grid, weights = _validate_curve_grid(theta_range, n_theta, None)
+    if _has_shared_polytomous_linker(model_old, model_new, items_old, items_new):
+        linker = _linker_for(model_old)
+        constants = linker(
+            model_old,
+            model_new,
+            items_old,
+            items_new,
+            method="stocking_lord",
+            theta_range=theta_range,
+            n_theta=n_theta,
+            compute_diagnostics=False,
+        ).constants
+        return float(constants.A), float(constants.B)
+
+    forms = None
+    if not (model_old.is_polytomous or model_new.is_polytomous):
+        try:
+            forms = (
+                _link_form(model_old, items_old, "old"),
+                _link_form(model_new, items_new, "new"),
+            )
+        except ValueError:
+            forms = None
+    if forms is not None:
+        A, B, _ = _fit_curve_link(*forms, theta_grid, weights, "stocking_lord")
+        return _validate_linking_constants(A, B, "Drift")
+
+    old_tcc = _expected_item_score_curves(model_old, theta_grid, items_old)
+    target = old_tcc.expected.sum(axis=1)
 
     def criterion(params: NDArray[np.float64]) -> float:
-        scale = float(np.exp(params[0]))
-        shift = float(params[1])
-        theta_new = (theta_grid - shift) / scale
-        new_tcc = _expected_item_score_curves(model_new, theta_new, items_new).sum(
-            axis=1
-        )
-        return float(np.sum(weights * (old_tcc - new_tcc) ** 2))
+        log_scale, shift = float(params[0]), float(params[1])
+        if not np.isfinite(log_scale) or not np.isfinite(shift) or abs(log_scale) > 20:
+            return float("inf")
+        theta_new = (theta_grid - shift) / np.exp(log_scale)
+        new_tcc = _expected_item_score_curves(model_new, theta_new, items_new)
+        return float(np.sum(weights * (target - new_tcc.expected.sum(axis=1)) ** 2))
 
-    initial = np.array([0.0, 0.0])
-    if criterion(initial) <= np.finfo(np.float64).eps:
-        return 1.0, 0.0
-
-    result = optimize.minimize(
-        criterion,
-        initial,
-        method="Powell",
-        bounds=[(np.log(0.05), np.log(20.0)), (-20.0, 20.0)],
-        options={"xtol": 1e-8, "ftol": 1e-12, "maxiter": 500},
-    )
-    if not result.success or not np.all(np.isfinite(result.x)):
-        raise RuntimeError(f"Drift linking failed to converge: {result.message}")
-    return float(np.exp(result.x[0])), float(result.x[1])
+    A, B, _ = _minimize_positive_scale(criterion, 1.0, 0.0, "Drift")
+    return A, B
 
 
-def _expected_item_score_curves(
-    model: "BaseItemModel",
-    theta: NDArray[np.float64],
-    items: list[int],
-) -> NDArray[np.float64]:
-    """Evaluate expected item scores, batching dense selections."""
-    use_full_batch = len(items) * 4 >= model.n_items or model.n_items <= 256
-    if use_full_batch:
-        probabilities = np.asarray(model.probability(theta), dtype=np.float64)
-        if model.is_polytomous:
-            categories = np.arange(probabilities.shape[2], dtype=np.float64)
-            curves = np.sum(probabilities * categories[None, None, :], axis=2)
-        else:
-            curves = probabilities
-        selected = curves[:, items]
-    else:
-        columns = []
-        for item in items:
-            probabilities = np.asarray(
-                model.probability(theta, item_idx=item), dtype=np.float64
-            )
-            if model.is_polytomous:
-                categories = np.arange(probabilities.shape[1], dtype=np.float64)
-                columns.append(np.sum(probabilities * categories[None, :], axis=1))
-            else:
-                columns.append(probabilities)
-        selected = np.column_stack(columns)
+def _has_shared_polytomous_linker(
+    model_old: "BaseItemModel",
+    model_new: "BaseItemModel",
+    items_old: list[int],
+    items_new: list[int],
+) -> bool:
+    """Whether a polytomous pairwise linker reproduces both forms' curves.
 
-    expected_shape = (len(theta), len(items))
-    if selected.shape != expected_shape:
-        raise ValueError(
-            f"Model returned expected-score curves with shape {selected.shape}; "
-            f"expected {expected_shape}"
-        )
-    if not np.all(np.isfinite(selected)):
-        raise ValueError("Model returned non-finite expected-score curves")
-    return selected
+    The linkers evaluate closed-form category curves, so both models must
+    be unmodified built-ins of one family with the same category counts on
+    corresponding anchors.
+    """
+    if not (model_old.is_polytomous and model_new.is_polytomous):
+        return False
+    family = _polytomous_model_type(model_old)
+    if family is None or family != _polytomous_model_type(model_new):
+        return False
+    if not (
+        uses_builtin_model_hooks(model_old) and uses_builtin_model_hooks(model_new)
+    ):
+        return False
+    counts_old = np.asarray(model_old.n_categories)[items_old]
+    counts_new = np.asarray(model_new.n_categories)[items_new]
+    return bool(np.array_equal(counts_old, counts_new))
 
 
 def _extract_parameter_arrays(
@@ -406,20 +413,8 @@ def _robust_z_drift(
     diff_new: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Robust z-statistic for drift detection using MAD."""
-    diff_a = disc_old - disc_new
-    diff_b = diff_old - diff_new
-
-    combined = np.sqrt(diff_a**2 + diff_b**2)
-
-    median_diff = np.median(combined)
-    mad = np.median(np.abs(combined - median_diff)) * 1.4826
-
-    if mad < 1e-10:
-        matches_median = np.isclose(combined, median_diff, rtol=1e-8, atol=1e-10)
-        z_scores = np.where(matches_median, 0.0, np.inf)
-    else:
-        z_scores = (combined - median_diff) / mad
-
+    combined = np.sqrt((disc_old - disc_new) ** 2 + (diff_old - diff_new) ** 2)
+    z_scores = _robust_z_scores(combined)
     p_values = 2 * stats.norm.sf(np.abs(z_scores))
 
     return z_scores, p_values
@@ -456,9 +451,9 @@ def _area_drift(
     B: float,
 ) -> NDArray[np.float64]:
     """Unsigned area between model-native expected item-score curves."""
-    curves_old = _expected_item_score_curves(model_old, theta_grid, items_old)
+    curves_old = _expected_item_score_curves(model_old, theta_grid, items_old).expected
     theta_new = (theta_grid - B) / A
-    curves_new = _expected_item_score_curves(model_new, theta_new, items_new)
+    curves_new = _expected_item_score_curves(model_new, theta_new, items_new).expected
     return np.asarray(
         np.trapezoid(np.abs(curves_old - curves_new), theta_grid, axis=0),
         dtype=np.float64,
@@ -609,13 +604,6 @@ def purify_anchors(
     tuple[list[int], list[int], list[int]]
         Purified anchors (old, new) and list of removed indices.
     """
-    from mirt.equating.linking import (
-        _LINKING_METHODS,
-        _validate_anchor_pairs,
-        _validate_curve_grid,
-        link,
-    )
-
     if method not in _LINKING_METHODS:
         raise ValueError(f"Unknown linking method: {method}")
     current_old, current_new = _validate_anchor_pairs(
@@ -725,12 +713,12 @@ def signed_area_difference(
         theta_range,
         n_theta,
     )
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
-    curve_old = _expected_item_score_curves(model_old, theta_grid, items_old)[:, 0]
+    theta_grid = _validate_theta_grid(theta_range, n_theta)
+    curve_old = _expected_item_score_curves(model_old, theta_grid, items_old).expected
     curve_new = _expected_item_score_curves(
         model_new, (theta_grid - shift) / scale, items_new
-    )[:, 0]
-    difference = curve_old - curve_new
+    ).expected
+    difference = curve_old[:, 0] - curve_new[:, 0]
 
     signed_area = float(np.trapezoid(difference, theta_grid))
     unsigned_area = float(np.trapezoid(np.abs(difference), theta_grid))

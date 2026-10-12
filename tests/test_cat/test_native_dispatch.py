@@ -205,25 +205,15 @@ def test_custom_model_probability_controls_actual_simulation_and_diagnostics(
 @pytest.mark.parametrize(
     "n_quadpts", [1, 4, True, 5.0, np.float64(21), np.array(21), None]
 )
-def test_invalid_eap_controls_preserve_python_fallback(monkeypatch, n_quadpts):
-    monkeypatch.setattr("mirt.cat.engine.should_use_rust", lambda requested: True)
+def test_invalid_eap_controls_are_rejected_at_construction(n_quadpts):
+    # These used to fall back silently to a proportion-correct estimate.
+    with pytest.raises(ValueError, match="n_quadpts must be an integer"):
+        CATEngine(_model(), n_quadpts=n_quadpts, min_items=2, max_items=2)
 
-    def fail_native(*args):
-        pytest.fail("invalid EAP controls dispatched to a native kernel")
 
-    monkeypatch.setattr("mirt.cat.engine.rust_cat_simulate_batch_full", fail_native)
-    model = _model()
-    options = dict(n_quadpts=n_quadpts, min_items=2, max_items=2, seed=3)
-    native_requested = CATEngine(model, **options)
-    python_requested = CATEngine(model, **options)
-
-    actual = native_requested.run_batch_simulation([0.75], use_rust=True)[0]
-    expected = python_requested.run_batch_simulation([0.75], use_rust=False)[0]
-
-    assert_allclose(actual.theta, expected.theta)
-    assert_allclose(actual.standard_error, expected.standard_error)
-    assert actual.items_administered == expected.items_administered
-    assert_array_equal(actual.responses, expected.responses)
+def test_quadrature_count_is_only_required_for_eap():
+    engine = CATEngine(_model(), scoring_method="MAP", n_quadpts=None, max_items=2)
+    assert engine.run_simulation(0.75).n_items_administered == 2
 
 
 @pytest.mark.parametrize(

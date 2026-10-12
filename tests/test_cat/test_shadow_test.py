@@ -142,6 +142,24 @@ def test_infeasible_constraints_fail_at_first_selection(model):
         engine.select_next_item()
 
 
+def test_length_rule_sets_the_shadow_test_length(model, constraints):
+    """A MaxItemsStop stopping rule fixes the length like max_items does."""
+    from mirt.cat.stopping import MaxItemsStop
+
+    selection = ShadowTestSelection(**constraints)
+    engine = CATEngine(
+        model,
+        item_selection=selection,
+        stopping_rule=MaxItemsStop(LENGTH),
+        seed=3,
+    )
+
+    result = engine.run_simulation(0.5)
+
+    _assert_constraints(result.items_administered, constraints)
+    assert selection.last_shadow_test.n_items == LENGTH
+
+
 def test_unbounded_engine_reports_pool_length_shadow_test(model, constraints):
     # Without max_items the shadow test spans the pool, which the blueprint
     # maxima cannot allow; the error names the length to fix.
@@ -350,3 +368,72 @@ def test_empty_available_items():
 def test_rejects_invalid_configuration(kwargs, error, message):
     with pytest.raises(error, match=message):
         ShadowTestSelection(**kwargs)
+
+
+def _fail_milp(*args, **kwargs):
+    pytest.fail("a separable shadow test called the mixed-integer solver")
+
+
+@pytest.mark.parametrize("with_blueprint", [False, True])
+def test_separable_shadow_tests_are_optimal_without_the_solver(
+    model, constraints, monkeypatch, with_blueprint
+):
+    from mirt.cat import assemble_form
+
+    blueprint = constraints["blueprint"] if with_blueprint else None
+    rng = np.random.default_rng(2)
+    references = []
+    for _ in range(12):
+        theta = float(rng.normal())
+        given = {int(item) for item in rng.choice(N_ITEMS, 4, replace=False)}
+        eligible = set(range(N_ITEMS)) - given
+        reference = assemble_form(
+            model, LENGTH, [theta], blueprint=blueprint, required_items=given
+        )
+        references.append((theta, given, eligible, reference))
+
+    monkeypatch.setattr("mirt.cat.shadow.assemble_form", _fail_milp)
+    selection = ShadowTestSelection(LENGTH, blueprint=blueprint)
+    for theta, given, eligible, reference in references:
+        criteria = selection.get_item_criteria(model, theta, eligible, sorted(given))
+        shadow = selection.last_shadow_test
+        assert shadow.objective_value == pytest.approx(reference.objective_value)
+        assert given <= set(shadow.selected_items.tolist())
+        assert shadow.n_items == LENGTH
+        assert shadow.content_counts == reference.content_counts
+        assert set(criteria) == set(shadow.selected_items.tolist()) - given
+
+
+def test_unconstrained_shadow_test_matches_mfi_sessions(model, monkeypatch):
+    monkeypatch.setattr("mirt.cat.shadow.assemble_form", _fail_milp)
+    shadow = _fixed_length_engine(model, ShadowTestSelection())
+    reference = _fixed_length_engine(model, "MFI")
+
+    for theta in (-1.0, 0.0, 1.5):
+        expected = reference.run_simulation(theta).items_administered
+        assert shadow.run_simulation(theta).items_administered == expected
+
+
+def test_coupling_constraints_still_use_the_solver(model, constraints, monkeypatch):
+    import mirt.cat.shadow as shadow_module
+
+    calls = []
+    original = shadow_module.assemble_form
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(shadow_module, "assemble_form", spy)
+    selection = ShadowTestSelection(LENGTH, enemy_pairs=constraints["enemy_pairs"])
+    selection.get_item_criteria(model, 0.0, set(range(N_ITEMS)), [])
+    assert calls == [1]
+
+
+def test_infeasible_separable_blueprint_is_reported(model):
+    blueprint = ContentBlueprint(
+        [ContentArea("A", items=set(range(30)), min_items=10, max_items=10)]
+    )
+    selection = ShadowTestSelection(6, blueprint=blueprint)
+    with pytest.raises(RuntimeError, match="shadow test assembly"):
+        selection.get_item_criteria(model, 0.0, set(range(N_ITEMS)), [])

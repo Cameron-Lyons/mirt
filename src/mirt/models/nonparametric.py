@@ -38,17 +38,6 @@ def _positive_finite(value: float, name: str) -> float:
     return result
 
 
-def _item_index(item_idx: int, n_items: int) -> int:
-    if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
-        item_idx, (int, np.integer)
-    ):
-        raise TypeError("item_idx must be an integer")
-    result = int(item_idx)
-    if result < 0 or result >= n_items:
-        raise IndexError(f"item_idx {result} out of range [0, {n_items})")
-    return result
-
-
 def _theta_vector(
     model: DichotomousItemModel,
     theta: NDArray[np.float64],
@@ -88,8 +77,7 @@ def _item_parameter_update(
     param_name: str,
     value: float | NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Build a validated-shape single-item parameter update."""
-    item_idx = _item_index(item_idx, n_items)
+    """Build a validated-shape update of one validated item's parameter."""
     if param_name not in parameters:
         valid = ", ".join(parameters)
         raise ValueError(f"Unknown parameter: {param_name}. Valid parameters: {valid}")
@@ -151,11 +139,20 @@ class MonotonicSplineModel(DichotomousItemModel):
     ``[-4, 4]``. Positive item weights therefore produce nondecreasing curves.
     Values outside that interval use the corresponding saturated endpoint.
     The first log weight is stored as zero: only weight ratios are identified.
-    There are ``n_knots + degree + 2`` free parameters per item.
+    There are ``n_knots + degree + 2`` free parameters per item. EM keeps the
+    lower and upper asymptotes in ``[0, 0.45]`` and ``[0.55, 1]`` and the
+    log weights in ``[-10, 10]``.
     """
 
     model_name = "MonotonicSpline"
     supports_multidimensional = False
+    # Optimizer boxes that keep proposals valid: ordered asymptotes at least
+    # 0.1 apart, and log weights relative to the fixed first one.
+    _parameter_boxes = {
+        "log_weights": (-10.0, 10.0),
+        "lower": (0.0, 0.45),
+        "upper": (0.55, 1.0),
+    }
 
     def __init__(
         self,
@@ -253,7 +250,11 @@ class MonotonicSplineModel(DichotomousItemModel):
         value: float | NDArray[np.float64],
     ) -> None:
         values = _item_parameter_update(
-            self._parameters, self.n_items, item_idx, param_name, value
+            self._parameters,
+            self.n_items,
+            self._validate_item_index(item_idx),
+            param_name,
+            value,
         )
         self.set_parameters(**{param_name: values})
 
@@ -283,7 +284,8 @@ class MonotonicSplineModel(DichotomousItemModel):
         knot_idx: int,
     ) -> NDArray[np.float64]:
         """Compute one normalized I-spline basis function."""
-        knot_idx = _item_index(knot_idx, self._n_basis)
+        if not 0 <= knot_idx < self._n_basis:
+            raise IndexError(f"knot_idx {knot_idx} out of range [0, {self._n_basis})")
         return self._basis_matrix(theta)[:, knot_idx]
 
     def probability(
@@ -299,7 +301,7 @@ class MonotonicSplineModel(DichotomousItemModel):
         upper = self._parameters["upper"]
 
         if item_idx is not None:
-            item_idx = _item_index(item_idx, self.n_items)
+            item_idx = self._validate_item_index(item_idx)
             curve = basis @ normalized_weights[item_idx]
             return lower[item_idx] + (upper[item_idx] - lower[item_idx]) * curve
 
@@ -320,7 +322,7 @@ class MonotonicSplineModel(DichotomousItemModel):
         upper = self._parameters["upper"]
 
         if item_idx is not None:
-            item_idx = _item_index(item_idx, self.n_items)
+            item_idx = self._validate_item_index(item_idx)
             scale = upper[item_idx] - lower[item_idx]
             probability = lower[item_idx] + scale * (
                 basis @ normalized_weights[item_idx]
@@ -356,11 +358,21 @@ class MonotonicPolynomialModel(DichotomousItemModel):
     Setters preserve the supplied response curves while choosing identified
     storage: the first log increment and ``lower`` are zero. A nonzero supplied
     ``lower`` is absorbed into the Bernstein increments, which already specify
-    the lower endpoint. There are ``degree + 3`` free parameters per item.
+    the lower endpoint. There are ``degree + 3`` free parameters per item. EM
+    keeps the scale in ``[0.05, 10]``, the upper asymptote in ``[0.55, 1]``
+    and the log increments in ``[-10, 10]``.
     """
 
     model_name = "MonotonicPolynomial"
     supports_multidimensional = False
+    # Optimizer boxes that keep proposals valid: a positive scale, an upper
+    # asymptote of at least 0.55, and log increments relative to the fixed
+    # first one.
+    _parameter_boxes = {
+        "log_coefficients": (-10.0, 10.0),
+        "scale": (0.05, 10.0),
+        "upper": (0.55, 1.0),
+    }
 
     def __init__(
         self,
@@ -464,22 +476,13 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         value: float | NDArray[np.float64],
     ) -> None:
         values = _item_parameter_update(
-            self._parameters, self.n_items, item_idx, param_name, value
+            self._parameters,
+            self.n_items,
+            self._validate_item_index(item_idx),
+            param_name,
+            value,
         )
         self.set_parameters(**{param_name: values})
-
-    def _bernstein_basis(
-        self,
-        t: NDArray[np.float64],
-        k: int,
-        n: int,
-    ) -> NDArray[np.float64]:
-        """Compute one Bernstein basis polynomial."""
-        if n < 1:
-            raise ValueError("n must be positive")
-        k = _item_index(k, n + 1)
-        clipped = np.clip(np.asarray(t, dtype=np.float64), 0.0, 1.0)
-        return comb(n, k) * (clipped**k) * ((1.0 - clipped) ** (n - k))
 
     def _basis_matrix(
         self, transformed_theta: NDArray[np.float64]
@@ -585,7 +588,7 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         coefficients = self.coefficients
 
         if item_idx is not None:
-            item_idx = _item_index(item_idx, self.n_items)
+            item_idx = self._validate_item_index(item_idx)
             transformed = expit(scale[item_idx] * (theta_vector - location[item_idx]))
             curve = self._evaluate_bernstein(transformed, coefficients[item_idx])
             return lower[item_idx] + (upper[item_idx] - lower[item_idx]) * curve
@@ -609,7 +612,7 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         coefficients = self.coefficients
 
         if item_idx is not None:
-            item_idx = _item_index(item_idx, self.n_items)
+            item_idx = self._validate_item_index(item_idx)
             transformed = expit(scale[item_idx] * (theta_vector - location[item_idx]))
             curve = self._evaluate_bernstein(transformed, coefficients[item_idx])
             curve_derivative = self._evaluate_bernstein_derivative(
@@ -847,13 +850,14 @@ class KernelSmoothingModel(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
+        if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
         if not self._is_fitted:
             raise ValueError("Model must be calibrated before computing probabilities")
         theta_vector = _theta_vector(self, theta)
         left, right, fraction, _ = self._interpolation_components(theta_vector)
 
         if item_idx is not None:
-            item_idx = _item_index(item_idx, self.n_items)
             lower_values = self._irf_values[item_idx, left]
             upper_values = self._irf_values[item_idx, right]
             return lower_values + fraction * (upper_values - lower_values)
@@ -889,6 +893,8 @@ class KernelSmoothingModel(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
+        if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
         if not self._is_fitted:
             raise ValueError("Model must be calibrated before computing information")
         theta_vector = _theta_vector(self, theta)
@@ -896,7 +902,6 @@ class KernelSmoothingModel(DichotomousItemModel):
         interval_width = self._theta_grid[right] - self._theta_grid[left]
 
         if item_idx is not None:
-            item_idx = _item_index(item_idx, self.n_items)
             lower_values = self._irf_values[item_idx, left]
             value_difference = self._irf_values[item_idx, right] - lower_values
             probability = lower_values + fraction * value_difference

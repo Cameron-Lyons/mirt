@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from scipy.special import expit, logsumexp
+from scipy.special import expit
 
 from mirt._rust_backend import RUST_AVAILABLE
 from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -24,177 +24,6 @@ def _responses(n_persons: int, n_items: int, seed: int) -> np.ndarray:
     responses[rng.random(responses.shape) < 0.08] = -1
     responses[0] = -1
     return responses
-
-
-def _newton_2pl(
-    r_k: np.ndarray,
-    n_k: np.ndarray,
-    points: np.ndarray,
-    a: float,
-    b: float,
-    *,
-    max_iter: int = 10,
-    tol: float = 1e-4,
-    damping: float = 0.5,
-    regularization: float = 0.01,
-) -> tuple[float, float]:
-    keep = n_k >= EPSILON
-    r_k, n_k, points = r_k[keep], n_k[keep], points[keep]
-    for _ in range(max_iter):
-        p = np.clip(expit(a * (points - b)), EPSILON, 1 - EPSILON)
-        residual = r_k - n_k * p
-        info = n_k * p * (1 - p)
-        grad_a = np.sum(residual * (points - b))
-        grad_b = np.sum(-residual * a)
-        hess_aa = np.sum(-info * (points - b) ** 2) - regularization
-        hess_bb = np.sum(-info * a * a) - regularization
-        hess_ab = np.sum(info * a * (points - b))
-        det = hess_aa * hess_bb - hess_ab**2
-        if abs(det) < EPSILON:
-            break
-        delta_a = (hess_bb * grad_a - hess_ab * grad_b) / det
-        delta_b = (-hess_ab * grad_a + hess_aa * grad_b) / det
-        a = float(np.clip(a - damping * delta_a, 0.1, 5.0))
-        b = float(np.clip(b - damping * delta_b, -6.0, 6.0))
-        if abs(delta_a) < tol and abs(delta_b) < tol:
-            break
-    return a, b
-
-
-def _reference_em_fit_2pl(
-    responses: np.ndarray,
-    frequencies: np.ndarray,
-    n_quadpts: int,
-    n_iterations: int,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    quadrature = GaussHermiteQuadrature(n_points=n_quadpts)
-    points = quadrature.nodes.ravel()
-    log_weights = np.log(quadrature.weights.ravel())
-    correct = (responses == 1).astype(np.float64)
-    observed = (responses >= 0).astype(np.float64)
-    weights = frequencies[:, None]
-
-    proportion = np.clip(
-        (correct * weights).sum(axis=0) / (observed * weights).sum(axis=0), 0.01, 0.99
-    )
-    a = np.ones(responses.shape[1])
-    b = np.log((1 - proportion) / proportion)
-
-    def e_step(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        logits = a * (points[:, None] - b)
-        log_likelihood = (
-            correct @ -np.logaddexp(0.0, -logits).T
-            + (observed - correct) @ -np.logaddexp(0.0, logits).T
-        )
-        log_joint = log_likelihood + log_weights
-        log_marginal = logsumexp(log_joint, axis=1)
-        return np.exp(log_joint - log_marginal[:, None]), log_marginal
-
-    for _ in range(n_iterations):
-        posterior, _ = e_step(a, b)
-        posterior *= weights
-        r_k, n_k = correct.T @ posterior, observed.T @ posterior
-        a, b = map(
-            np.array,
-            zip(
-                *(
-                    _newton_2pl(r_k[j], n_k[j], points, a[j], b[j])
-                    for j in range(len(a))
-                ),
-                strict=True,
-            ),
-        )
-    _, log_marginal = e_step(a, b)
-    return a, b, float(frequencies @ log_marginal)
-
-
-def test_em_fit_2pl_matches_numpy_reference_with_weights_and_missing_data() -> None:
-    from mirt.backends.rust.estimation import em_fit_2pl
-
-    responses = _responses(400, 7, seed=31)
-    frequencies = np.random.default_rng(2).integers(1, 4, len(responses)).astype(float)
-
-    a, b, log_likelihood, iterations, converged = em_fit_2pl(
-        responses, n_quadpts=15, max_iter=6, tol=1e-300, frequencies=frequencies
-    )
-    expected_a, expected_b, expected_ll = _reference_em_fit_2pl(
-        responses, frequencies, n_quadpts=15, n_iterations=6
-    )
-
-    assert (iterations, converged) == (6, False)
-    np.testing.assert_allclose(a, expected_a, rtol=1e-9, atol=1e-10)
-    np.testing.assert_allclose(b, expected_b, rtol=1e-9, atol=1e-10)
-    assert log_likelihood == pytest.approx(expected_ll, rel=1e-12)
-
-
-def test_converged_em_fit_reports_likelihood_at_returned_parameters() -> None:
-    from mirt.backends.rust.estep import e_step_complete
-    from mirt.backends.rust.estimation import em_fit_2pl
-
-    responses = _responses(300, 6, seed=5)
-    frequencies = np.ones(len(responses))
-
-    a, b, log_likelihood, iterations, converged = em_fit_2pl(
-        responses, n_quadpts=15, max_iter=500, tol=1e-3, frequencies=frequencies
-    )
-    quadrature = GaussHermiteQuadrature(n_points=15)
-    _, marginal = e_step_complete(
-        responses, quadrature.nodes.ravel(), quadrature.weights.ravel(), a, b
-    )
-
-    assert converged and iterations < 500
-    assert log_likelihood == pytest.approx(np.log(marginal).sum(), abs=1e-10)
-
-
-def test_default_2pl_fit_starts_from_logit_difficulties() -> None:
-    import mirt
-
-    rng = np.random.default_rng(2)
-    discrimination = rng.uniform(0.8, 2.0, 15)
-    difficulty = np.concatenate(
-        [np.linspace(-3, -1.5, 5), np.linspace(-0.5, 0.5, 5), np.linspace(1.5, 3, 5)]
-    )
-    responses = mirt.simdata(
-        theta=rng.standard_normal(3000),
-        discrimination=discrimination,
-        difficulty=difficulty,
-        seed=4,
-    )
-    native, generic = (
-        mirt.fit_mirt(
-            responses, model="2PL", use_rust=use_rust, compute_standard_errors=False
-        )
-        for use_rust in (True, False)
-    )
-    # Starts of -ln(p) / |ln(1 - p)|, up to 115 for the hardest items, took
-    # the native fit 30 iterations against the NumPy fit's 18.
-    assert native.n_iterations <= generic.n_iterations + 2
-    assert native.log_likelihood == pytest.approx(generic.log_likelihood, abs=1e-3)
-
-
-def test_em_iteration_2pl_m_step_matches_numpy_counts_and_newton() -> None:
-    from mirt.backends.rust.estep import e_step_complete
-    from mirt.backends.rust.estimation import em_iteration_2pl
-
-    responses = _responses(350, 6, seed=9)
-    quadrature = GaussHermiteQuadrature(n_points=21)
-    points, weights = quadrature.nodes.ravel(), quadrature.weights.ravel()
-    a0 = np.linspace(0.8, 1.6, 6)
-    b0 = np.linspace(-1.0, 1.0, 6)
-
-    result = em_iteration_2pl(responses, points, weights, a0, b0, max_m_iter=7)
-    assert result is not None
-    a, b, posterior, log_likelihood = result
-    expected_posterior, marginal = e_step_complete(responses, points, weights, a0, b0)
-
-    np.testing.assert_allclose(posterior, expected_posterior, rtol=1e-12, atol=1e-14)
-    assert log_likelihood == pytest.approx(np.log(marginal).sum(), rel=1e-12)
-    correct = (responses == 1).astype(np.float64)
-    observed = (responses >= 0).astype(np.float64)
-    r_k, n_k = correct.T @ posterior, observed.T @ posterior
-    for j in range(6):
-        expected = _newton_2pl(r_k[j], n_k[j], points, a0[j], b0[j], max_iter=7)
-        np.testing.assert_allclose((a[j], b[j]), expected, rtol=1e-10, atol=1e-12)
 
 
 def test_em_iteration_3pl_frequencies_match_expanded_rows() -> None:
@@ -343,6 +172,8 @@ def test_polytomous_m_step_accepts_non_contiguous_posteriors(grm: bool) -> None:
             1e-10,
             1e-10,
             1,
+            (0.1, 5.0),
+            (-6.0, 6.0),
             None,
         )
 
@@ -352,3 +183,156 @@ def test_polytomous_m_step_accepts_non_contiguous_posteriors(grm: bool) -> None:
         fit(np.ascontiguousarray(posterior[:, ::-1])[:, ::-1]), contiguous
     )
     assert not np.array_equal(contiguous, parameters)
+
+
+def _bounded_reference_em(
+    responses: np.ndarray,
+    points: np.ndarray,
+    weights: np.ndarray,
+    disc_box: tuple[float, float],
+    diff_box: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """2PL EM whose M-steps maximize each item's expected counts in the box."""
+    from scipy.optimize import minimize
+    from scipy.special import log_expit, logsumexp
+
+    correct = (responses == 1).astype(np.float64)
+    observed = (responses >= 0).astype(np.float64)
+    n_items = responses.shape[1]
+    a, b = np.ones(n_items), np.zeros(n_items)
+    previous = -np.inf
+    for _ in range(2000):
+        logits = a * (points[:, None] - b)
+        joint = (
+            correct @ log_expit(logits).T
+            + (observed - correct) @ log_expit(-logits).T
+            + np.log(weights)
+        )
+        marginal = logsumexp(joint, axis=1, keepdims=True)
+        if abs(marginal.sum() - previous) < 1e-10:
+            break
+        previous = marginal.sum()
+        posterior = np.exp(joint - marginal)
+        r_k, n_k = correct.T @ posterior, observed.T @ posterior
+        for j in range(n_items):
+
+            def negative(x: np.ndarray, j: int = j) -> float:
+                z = x[0] * (points - x[1])
+                return -float(
+                    np.sum(r_k[j] * log_expit(z) + (n_k[j] - r_k[j]) * log_expit(-z))
+                )
+
+            a[j], b[j] = minimize(
+                negative,
+                [a[j], b[j]],
+                method="L-BFGS-B",
+                bounds=[disc_box, diff_box],
+                options={"ftol": 1e-15, "gtol": 1e-12},
+            ).x
+    return a, b
+
+
+def test_bootstrap_items_on_a_bound_reach_the_box_optimum() -> None:
+    # Regression (EMCORE-4): clamping each coordinate of the joint Newton step
+    # left items whose difficulty sits on its bound at non-stationary slopes;
+    # on these data item 1 ended at a = 0.1, 1600 log-likelihood units below
+    # the box optimum of the same EM.
+    from mirt.backends.rust.estimation import bootstrap_fit_2pl
+
+    rng = np.random.default_rng(5)
+    discrimination = np.r_[0.5, 0.45, rng.uniform(0.8, 2.0, 8)]
+    difficulty = np.r_[-7.5, 7.8, rng.uniform(-1.5, 1.5, 8)]
+    theta = rng.standard_normal(5000)
+    probability = expit(discrimination * (theta[:, None] - difficulty))
+    responses = (rng.random(probability.shape) < probability).astype(np.int32)
+    quadrature = GaussHermiteQuadrature(n_points=21)
+    points, weights = quadrature.nodes.ravel(), quadrature.weights
+    boxes = {"disc_bounds": (0.1, 5.0), "diff_bounds": (-6.0, 6.0)}
+
+    expected_a, expected_b = _bounded_reference_em(
+        responses, points, weights, *boxes.values()
+    )
+    a, b = bootstrap_fit_2pl(
+        responses,
+        n_bootstrap=16,
+        max_iter=500,
+        tol=1e-6,
+        seed=3,
+        quad_points=points,
+        quad_weights=weights,
+        **boxes,
+    )
+
+    assert expected_b[1] == 6.0 and np.all(b[:, 1] == 6.0)
+    # The replicate slopes scatter around the box optimum (sd 0.016).
+    assert abs(a[:, 1].mean() - expected_a[1]) < 0.01
+
+
+def test_bootstrap_replicates_of_neighbouring_seeds_are_unrelated() -> None:
+    from mirt.backends.rust.estimation import bootstrap_fit_2pl
+
+    responses = _responses(300, 5, seed=9)
+    options = {"n_bootstrap": 3, "max_iter": 50, "tol": 1e-4}
+    first, _ = bootstrap_fit_2pl(responses, seed=10, **options)
+    second, _ = bootstrap_fit_2pl(responses, seed=11, **options)
+    repeated, _ = bootstrap_fit_2pl(responses, seed=10, **options)
+
+    # Replicate b used seed + b, so seed 11 replayed seed 10's replicates.
+    assert not np.any(np.all(first[1:] == second[:-1], axis=1))
+    np.testing.assert_array_equal(first, repeated)
+
+
+def test_bootstrap_uses_the_given_grid_and_accurate_large_grids() -> None:
+    from mirt.backends.rust.estimation import bootstrap_fit_2pl
+
+    responses = _responses(400, 5, seed=13)
+    options = {"n_bootstrap": 2, "max_iter": 200, "tol": 1e-6, "seed": 4}
+    quadrature = GaussHermiteQuadrature(n_points=31)
+    default = bootstrap_fit_2pl(responses, n_quadpts=31, **options)
+    explicit = bootstrap_fit_2pl(
+        responses,
+        quad_points=quadrature.nodes.ravel(),
+        quad_weights=quadrature.weights,
+        **options,
+    )
+    for left, right in zip(default, explicit, strict=True):
+        np.testing.assert_array_equal(left, right)
+
+    # The native Gauss-Hermite rule collapsed to two distinct nodes for 199 or
+    # more points; the grid now comes from the package's quadrature.
+    large = bootstrap_fit_2pl(responses, n_quadpts=201, **options)
+    for coarse, fine in zip(default, large, strict=True):
+        np.testing.assert_allclose(fine, coarse, atol=0.02)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"disc_bounds": (5.0, 0.1)}, "disc_bounds must satisfy lower <= upper"),
+        ({"diff_bounds": (np.nan, 6.0)}, "diff_bounds must satisfy lower <= upper"),
+        ({"quad_weights": np.array([0.5, 0.5])}, "quad_weights must have shape"),
+        ({"quad_points": np.array([0.0, np.inf, 1.0])}, "quad_points must be finite"),
+        ({"quad_weights": np.array([0.0, 0.0, 0.0])}, "positive sum"),
+        ({"tol": 0.0}, "tol must be finite and positive"),
+        ({"max_iter": 0}, "max_iter must be at least 1"),
+    ],
+)
+def test_native_bootstrap_kernel_rejects_invalid_inputs(
+    changes: dict[str, object], message: str
+) -> None:
+    from mirt import mirt_rs
+
+    arguments: dict[str, object] = {
+        "responses": np.array([[0, 1], [1, 0]], dtype=np.int32),
+        "n_bootstrap": 1,
+        "quad_points": np.array([-1.0, 0.0, 1.0]),
+        "quad_weights": np.array([0.25, 0.5, 0.25]),
+        "max_iter": 5,
+        "tol": 1e-4,
+        "seed": 1,
+        "disc_bounds": (0.1, 5.0),
+        "diff_bounds": (-6.0, 6.0),
+    }
+    arguments.update(changes)
+    with pytest.raises(ValueError, match=message):
+        mirt_rs.bootstrap_fit_2pl(*arguments.values())

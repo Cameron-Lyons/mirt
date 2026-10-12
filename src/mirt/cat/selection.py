@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.cat._information import item_information, polytomous_item_information
+from mirt.cat._names import resolve_name
 from mirt.cat._native import register_native_defaults as _register_native_defaults
 from mirt.constants import PROB_EPSILON
 
@@ -24,6 +26,15 @@ def _validate_candidate_items(
     available_items: set[int],
 ) -> list[int]:
     """Return sorted candidate indices, rejecting invalid model access."""
+    if all(type(item_idx) is int for item_idx in available_items):
+        # Plain integers, the engines' case, need only a range check.
+        items = sorted(available_items)
+        if items and (items[0] < 0 or items[-1] >= model.n_items):
+            item = items[0] if items[0] < 0 else items[-1]
+            raise ValueError(
+                f"available item {item} is out of range [0, {model.n_items})"
+            )
+        return items
     normalized: list[int] = []
     for item_idx in available_items:
         if isinstance(item_idx, (bool, np.bool_)) or not isinstance(item_idx, Integral):
@@ -183,14 +194,17 @@ class MaxFisherInformation(ItemSelectionStrategy):
     ) -> dict[int, float]:
         """Get Fisher information with one model call when supported.
 
-        Items are returned in increasing index order, so the first maximum
-        does not depend on set iteration order.
+        Dichotomous models return every item's information from one bulk
+        call. Polytomous models define ``information(theta)`` as total test
+        information, so built-in polytomous models use their all-item
+        information kernel instead. Other models, and subclasses that replace
+        ``_compute_criterion``, are evaluated item by item. Items are
+        returned in increasing index order, so the first maximum does not
+        depend on set iteration order.
         """
         theta_arr = np.array([[theta]])
         items = sorted(available_items)
 
-        # Polytomous models define information(theta) as total test
-        # information rather than an item-wise array.
         if not model.is_polytomous:
             information = np.asarray(model.information(theta_arr))
             if information.size == model.n_items:
@@ -198,6 +212,13 @@ class MaxFisherInformation(ItemSelectionStrategy):
                 return {
                     item_idx: float(item_information[item_idx]) for item_idx in items
                 }
+        elif (
+            "_compute_criterion" not in vars(self)
+            and type(self)._compute_criterion is MaxFisherInformation._compute_criterion
+        ):
+            kernel = polytomous_item_information(model, theta_arr, items)
+            if kernel is not None:
+                return dict(zip(items, kernel[0].tolist(), strict=True))
 
         return {
             item_idx: self._compute_criterion(model, theta_arr, item_idx)
@@ -214,25 +235,16 @@ class MaxFisherInformation(ItemSelectionStrategy):
         return float(info.sum())
 
 
-class MaxExpectedInformation(ItemSelectionStrategy):
-    """Maximum Expected Information (MEI) item selection.
+class _PosteriorGridSelection(ItemSelectionStrategy):
+    """Base for criteria that integrate over the posterior given the history.
 
-    Selects the item that maximizes expected posterior information,
-    accounting for uncertainty in the ability estimate by integrating
-    over possible responses.
-
-    Parameters
-    ----------
-    n_quadpts : int, optional
-        Number of quadrature points for integration. Default is 21.
-    theta_bounds : tuple[float, float], optional
-        Bounds for posterior integration. Default is (-4.0, 4.0).
-
-    References
-    ----------
-    van der Linden, W. J. (1998). Bayesian item selection criteria
-    for adaptive testing. Psychometrika, 63(2), 201-216.
+    The posterior lives on ``n_quadpts`` Gauss-Legendre nodes over
+    ``theta_bounds``, under a standard normal prior (or a flat prior when
+    ``_flat_prior`` is set), and is recomputed from the administered items
+    and responses on every selection.
     """
+
+    _flat_prior = False
 
     def __init__(
         self,
@@ -265,74 +277,16 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         midpoint = (upper + lower) / 2.0
         self._theta_nodes = midpoint + half_width * raw_nodes
         integration_weights = half_width * raw_weights
+        log_weights = np.log(integration_weights)
         self._log_prior_mass = (
-            np.log(integration_weights)
-            - 0.5 * np.square(self._theta_nodes)
-            - 0.5 * np.log(2.0 * np.pi)
-        )
-
-    def select_item(
-        self,
-        model: BaseItemModel,
-        theta: float,
-        available_items: set[int],
-        administered_items: list[int] | None = None,
-        responses: list[int] | None = None,
-    ) -> int:
-        if not available_items:
-            raise ValueError("No available items to select from")
-
-        criteria = self.get_item_criteria(
-            model,
-            theta,
-            available_items,
-            administered_items=administered_items,
-            responses=responses,
-        )
-        return max(criteria, key=criteria.__getitem__)
-
-    def get_item_criteria(
-        self,
-        model: BaseItemModel,
-        theta: float,
-        available_items: set[int],
-        administered_items: list[int] | None = None,
-        responses: list[int] | None = None,
-    ) -> dict[int, float]:
-        """Compute history-aware expected information for available items.
-
-        Dichotomous item banks use a fixed number of model calls per
-        selection: response probabilities at the current ability and at the
-        posterior nodes, plus item information at every hypothetical posterior
-        mean in bounded row blocks. Polytomous banks evaluate each candidate's
-        own curves, but each administered item's information is evaluated once
-        for all hypothetical abilities.
-        """
-        if model.n_factors != 1:
-            raise ValueError("MEI only supports unidimensional models")
-        if not np.isfinite(theta):
-            raise ValueError("theta must be finite")
-
-        administered, observed_responses = self._validate_history(
-            model, administered_items, responses
-        )
-        items = _validate_candidate_items(model, available_items)
-        if not items:
-            return {}
-        history_log_mass = self._history_log_mass(
-            model, administered, observed_responses
-        )
-
-        values = None
-        if not model.is_polytomous:
-            values = self._binary_expected_information(
-                model, float(theta), items, administered, history_log_mass
+            log_weights
+            if self._flat_prior
+            else (
+                log_weights
+                - 0.5 * np.square(self._theta_nodes)
+                - 0.5 * np.log(2.0 * np.pi)
             )
-        if values is None:
-            values = self._itemwise_expected_information(
-                model, float(theta), items, administered, history_log_mass
-            )
-        return dict(zip(items, values.tolist(), strict=True))
+        )
 
     @staticmethod
     def _validate_history(
@@ -406,6 +360,112 @@ class MaxExpectedInformation(ItemSelectionStrategy):
             dtype=np.float64,
         ).ravel()
         return log_likelihood + self._log_prior_mass
+
+    def _posterior_weights(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        administered_items: list[int] | None,
+        responses: list[int] | None,
+    ) -> tuple[NDArray[np.float64], list[int]]:
+        """Return normalized node weights and the validated history items."""
+        if model.n_factors != 1:
+            raise ValueError(
+                f"{type(self).__name__} only supports unidimensional models"
+            )
+        if not np.isfinite(theta):
+            raise ValueError("theta must be finite")
+        administered, observed = self._validate_history(
+            model, administered_items, responses
+        )
+        log_mass = self._history_log_mass(model, administered, observed)
+        log_mass -= np.max(log_mass)
+        weights = np.exp(log_mass)
+        return weights / weights.sum(), administered
+
+
+class MaxExpectedInformation(_PosteriorGridSelection):
+    """Maximum Expected Information (MEI) item selection.
+
+    Selects the item that maximizes expected posterior information,
+    accounting for uncertainty in the ability estimate by integrating
+    over possible responses.
+
+    Parameters
+    ----------
+    n_quadpts : int, optional
+        Number of quadrature points for integration. Default is 21.
+    theta_bounds : tuple[float, float], optional
+        Bounds for posterior integration. Default is (-4.0, 4.0).
+
+    References
+    ----------
+    van der Linden, W. J. (1998). Bayesian item selection criteria
+    for adaptive testing. Psychometrika, 63(2), 201-216.
+    """
+
+    def select_item(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> int:
+        if not available_items:
+            raise ValueError("No available items to select from")
+
+        criteria = self.get_item_criteria(
+            model,
+            theta,
+            available_items,
+            administered_items=administered_items,
+            responses=responses,
+        )
+        return max(criteria, key=criteria.__getitem__)
+
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Compute history-aware expected information for available items.
+
+        Dichotomous item banks use a fixed number of model calls per
+        selection: response probabilities at the current ability and at the
+        posterior nodes, plus item information at every hypothetical posterior
+        mean in bounded row blocks. Polytomous banks evaluate each candidate's
+        own curves, but each administered item's information is evaluated once
+        for all hypothetical abilities.
+        """
+        if model.n_factors != 1:
+            raise ValueError("MEI only supports unidimensional models")
+        if not np.isfinite(theta):
+            raise ValueError("theta must be finite")
+
+        administered, observed_responses = self._validate_history(
+            model, administered_items, responses
+        )
+        items = _validate_candidate_items(model, available_items)
+        if not items:
+            return {}
+        history_log_mass = self._history_log_mass(
+            model, administered, observed_responses
+        )
+
+        values = None
+        if not model.is_polytomous:
+            values = self._binary_expected_information(
+                model, float(theta), items, administered, history_log_mass
+            )
+        if values is None:
+            values = self._itemwise_expected_information(
+                model, float(theta), items, administered, history_log_mass
+            )
+        return dict(zip(items, values.tolist(), strict=True))
 
     def _posterior_means(
         self,
@@ -568,12 +628,21 @@ class KullbackLeibler(ItemSelectionStrategy):
     between the response distributions at the current theta
     and neighboring theta values.
 
+    For a narrow interval the criterion is close to a rescaled Fisher
+    information (about ``I(theta) * delta**2 / 6``), so the default selects
+    the MFI items. Chang and Ying (1996) instead shrink a wide interval as
+    the test proceeds, ``delta / sqrt(n)`` after ``n`` items; pass
+    ``delta_scaling="sqrt_n"`` with a wide ``delta`` such as 3.
+
     Parameters
     ----------
     delta : float, optional
         Half-width of the interval for KL integration. Default is 0.1.
     n_points : int, optional
         Number of points for numerical integration. Default is 5.
+    delta_scaling : {"constant", "sqrt_n"}, optional
+        Keep the half-width at ``delta`` (default) or use
+        ``delta / sqrt(max(n, 1))`` for ``n`` administered items.
 
     References
     ----------
@@ -582,7 +651,12 @@ class KullbackLeibler(ItemSelectionStrategy):
     Measurement, 20(3), 213-229.
     """
 
-    def __init__(self, delta: float = 0.1, n_points: int = 5):
+    def __init__(
+        self,
+        delta: float = 0.1,
+        n_points: int = 5,
+        delta_scaling: Literal["constant", "sqrt_n"] = "constant",
+    ):
         if isinstance(delta, (bool, np.bool_)) or not isinstance(delta, Real):
             raise ValueError("delta must be a finite positive number")
         delta_value = float(delta)
@@ -595,10 +669,20 @@ class KullbackLeibler(ItemSelectionStrategy):
         ):
             raise ValueError("n_points must be an integer of at least 2")
 
+        scalings = {"constant": "constant", "sqrt_n": "sqrt_n"}
+        _, scaling = resolve_name(delta_scaling, scalings, kind="delta_scaling")
+
         self.delta = delta_value
         self.n_points = int(n_points)
+        self.delta_scaling: str = scaling
         offsets = np.linspace(-self.delta, self.delta, self.n_points)
-        self._neighbor_offsets = offsets[offsets != 0.0]
+        self._neighbor_offsets: NDArray[np.float64] = offsets[offsets != 0.0]
+
+    def _offsets(self, n_administered: int) -> NDArray[np.float64]:
+        """Return the nonzero grid offsets after ``n_administered`` items."""
+        if self.delta_scaling == "constant":
+            return self._neighbor_offsets
+        return self._neighbor_offsets / np.sqrt(max(n_administered, 1))
 
     def select_item(
         self,
@@ -611,7 +695,9 @@ class KullbackLeibler(ItemSelectionStrategy):
         if not available_items:
             raise ValueError("No available items to select from")
 
-        criteria = self.get_item_criteria(model, theta, available_items)
+        criteria = self.get_item_criteria(
+            model, theta, available_items, administered_items, responses
+        )
         return max(criteria, key=lambda item_idx: (criteria[item_idx], -item_idx))
 
     def get_item_criteria(
@@ -622,7 +708,11 @@ class KullbackLeibler(ItemSelectionStrategy):
         administered_items: list[int] | None = None,
         responses: list[int] | None = None,
     ) -> dict[int, float]:
-        """Evaluate the KL grid once for a dichotomous item bank."""
+        """Evaluate the KL grid once for a dichotomous item bank.
+
+        ``administered_items`` only sets the interval of
+        ``delta_scaling="sqrt_n"``.
+        """
         if model.n_factors != 1:
             raise ValueError("KL selection only supports unidimensional models")
 
@@ -630,7 +720,8 @@ class KullbackLeibler(ItemSelectionStrategy):
         if not item_indices:
             return {}
 
-        theta_values = self._evaluation_thetas(theta)
+        n_administered = len(administered_items) if administered_items else 0
+        theta_values = self._evaluation_thetas(theta, self._offsets(n_administered))
         if not model.is_polytomous:
             probabilities = np.asarray(
                 model.probability(theta_values),
@@ -657,7 +748,9 @@ class KullbackLeibler(ItemSelectionStrategy):
             for item_idx in item_indices
         }
 
-    def _evaluation_thetas(self, theta: float) -> NDArray[np.float64]:
+    def _evaluation_thetas(
+        self, theta: float, offsets: NDArray[np.float64] | None = None
+    ) -> NDArray[np.float64]:
         """Return the current theta followed by every nonzero grid neighbor."""
         if isinstance(theta, (bool, np.bool_)) or not isinstance(theta, Real):
             raise ValueError("theta must be finite")
@@ -666,7 +759,9 @@ class KullbackLeibler(ItemSelectionStrategy):
             raise ValueError("theta must be finite")
 
         with np.errstate(over="ignore", invalid="ignore"):
-            neighbors = theta_value + self._neighbor_offsets
+            neighbors = theta_value + (
+                self._neighbor_offsets if offsets is None else offsets
+            )
         if not np.all(np.isfinite(neighbors)):
             raise ValueError("theta neighborhood must be finite")
         return np.concatenate(([theta_value], neighbors))[:, None]
@@ -765,21 +860,312 @@ class KullbackLeibler(ItemSelectionStrategy):
         return self._compute_kl_info(model, float(theta[0, 0]), item_idx)
 
 
-def _item_location(model: BaseItemModel, item_idx: int) -> float:
-    """Return an item's difficulty, or its mean threshold, defaulting to 0."""
-    params = model.get_item_parameters(item_idx)
-    if "difficulty" in params:
-        return float(np.mean(params["difficulty"]))
-    if "thresholds" in params:
-        return float(np.mean(params["thresholds"]))
-    return 0.0
+def _category_probabilities(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    items: list[int],
+) -> NDArray[np.float64]:
+    """Return response probabilities with shape ``(n_theta, len(items), K)``.
+
+    Dichotomous items have the categories (incorrect, correct). Polytomous
+    items are padded with zero probabilities up to the widest item.
+    """
+    n_theta = theta.shape[0]
+    columns = np.asarray(items, dtype=np.intp)
+    bulk = np.asarray(model.probability(theta), dtype=np.float64)
+    if not model.is_polytomous:
+        if bulk.size == n_theta * model.n_items:
+            correct = bulk.reshape(n_theta, model.n_items)[:, columns]
+        else:
+            correct = np.column_stack(
+                [
+                    np.asarray(
+                        model.probability(theta, item_idx=item), dtype=np.float64
+                    ).reshape(n_theta)
+                    for item in items
+                ]
+            )
+        probabilities = np.stack((1.0 - correct, correct), axis=-1)
+    elif bulk.ndim == 3 and bulk.shape[:2] == (n_theta, model.n_items):
+        probabilities = bulk[:, columns]
+    else:
+        curves = [
+            np.asarray(model.probability(theta, item_idx=item), dtype=np.float64)
+            for item in items
+        ]
+        curves = [curve.reshape(n_theta, -1) for curve in curves]
+        probabilities = np.zeros((n_theta, len(items), max(c.shape[1] for c in curves)))
+        for position, curve in enumerate(curves):
+            probabilities[:, position, : curve.shape[1]] = curve
+    if (
+        not np.all(np.isfinite(probabilities))
+        or np.any(probabilities < 0.0)
+        or np.any(probabilities > 1.0)
+    ):
+        raise ValueError("model probabilities must be finite values in [0, 1]")
+    return probabilities
+
+
+class _PosteriorCriterion(_PosteriorGridSelection):
+    """Criteria that weight item statistics by the history posterior."""
+
+    def select_item(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> int:
+        if not available_items:
+            raise ValueError("No available items to select from")
+
+        criteria = self.get_item_criteria(
+            model, theta, available_items, administered_items, responses
+        )
+        return max(criteria, key=criteria.__getitem__)
+
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Return the criterion of every available item, in index order."""
+        weights, _ = self._posterior_weights(
+            model, float(theta), administered_items, responses
+        )
+        items = _validate_candidate_items(model, available_items)
+        if not items:
+            return {}
+        values = self._criteria(model, float(theta), items, weights)
+        return dict(zip(items, values.tolist(), strict=True))
+
+    @abstractmethod
+    def _criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        items: list[int],
+        weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return one criterion per candidate given node posterior weights."""
+
+    def _compute_criterion(
+        self,
+        model: BaseItemModel,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> float:
+        criteria = _PosteriorCriterion.get_item_criteria(
+            self, model, float(theta[0, 0]), {item_idx}
+        )
+        return criteria[item_idx]
+
+
+class MaxPosteriorWeightedInformation(_PosteriorCriterion):
+    """Maximum posterior-weighted information (MPWI) item selection.
+
+    Selects the item maximizing Fisher information averaged over the
+    posterior of ability given the responses so far,
+    ``sum_q pi(theta_q | x) I_j(theta_q)``, with a standard normal prior on
+    the Gauss-Legendre nodes of :class:`MaxExpectedInformation`. Unlike MFI,
+    it accounts for the uncertainty of early estimates.
+
+    Parameters
+    ----------
+    n_quadpts : int, optional
+        Number of quadrature nodes for the posterior. Default is 21.
+    theta_bounds : tuple[float, float], optional
+        Bounds of the posterior grid. Default is (-4.0, 4.0).
+
+    References
+    ----------
+    van der Linden, W. J. (1998). Bayesian item selection criteria
+    for adaptive testing. Psychometrika, 63(2), 201-216.
+    """
+
+    def _criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        items: list[int],
+        weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        information = item_information(model, self._theta_nodes[:, None], items)
+        return np.asarray(weights @ information, dtype=np.float64)
+
+
+class MaxLikelihoodWeightedInformation(MaxPosteriorWeightedInformation):
+    """Maximum likelihood-weighted information (MLWI) item selection.
+
+    Like :class:`MaxPosteriorWeightedInformation`, but information is
+    weighted by the likelihood of the responses so far (a flat prior over
+    ``theta_bounds``), as proposed by Veerkamp and Berger (1997).
+
+    Parameters
+    ----------
+    n_quadpts : int, optional
+        Number of quadrature nodes for the likelihood. Default is 21.
+    theta_bounds : tuple[float, float], optional
+        Bounds of the likelihood grid. Default is (-4.0, 4.0).
+
+    References
+    ----------
+    Veerkamp, W. J. J., & Berger, M. P. F. (1997). Some new item selection
+    criteria for adaptive testing. Journal of Educational and Behavioral
+    Statistics, 22(2), 203-226.
+    """
+
+    _flat_prior = True
+
+
+class PosteriorKullbackLeibler(_PosteriorCriterion):
+    """Posterior-weighted Kullback-Leibler (KLP) item selection.
+
+    Selects the item maximizing the KL divergence between its response
+    distribution at the current estimate and at other abilities, averaged
+    over the posterior given the responses so far:
+    ``sum_q pi(theta_q | x) KL_j(theta_hat || theta_q)``. The posterior,
+    rather than a fixed interval, sets how far from the estimate the
+    divergence is measured.
+
+    Parameters
+    ----------
+    n_quadpts : int, optional
+        Number of quadrature nodes for the posterior. Default is 21.
+    theta_bounds : tuple[float, float], optional
+        Bounds of the posterior grid. Default is (-4.0, 4.0).
+
+    References
+    ----------
+    Chang, H.-H., & Ying, Z. (1996). A global information approach
+    to computerized adaptive testing. Applied Psychological
+    Measurement, 20(3), 213-229.
+    """
+
+    def _criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        items: list[int],
+        weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        current = _category_probabilities(model, np.array([[theta]]), items)[0]
+        nodes = _category_probabilities(model, self._theta_nodes[:, None], items)
+        log_current = np.log(np.clip(current, PROB_EPSILON, 1.0))
+        log_nodes = np.log(np.clip(nodes, PROB_EPSILON, 1.0))
+        terms = np.where(current > 0.0, current * (log_current - log_nodes), 0.0)
+        divergences = np.maximum(terms.sum(axis=-1), 0.0)
+        return np.asarray(weights @ divergences, dtype=np.float64)
+
+
+class MinExpectedPosteriorVariance(_PosteriorCriterion):
+    """Minimum expected posterior variance (MEPV) item selection.
+
+    Selects the item whose response is expected to shrink the posterior
+    variance of ability most. For each candidate, the posterior variance
+    after each possible response is weighted by the response's probability
+    at the current estimate, ``sum_k P_jk(theta_hat) Var(theta | x, x_j=k)``.
+    The criterion is this expected variance with its sign reversed, so
+    larger values are better, as for every strategy.
+
+    Parameters
+    ----------
+    n_quadpts : int, optional
+        Number of quadrature nodes for the posterior. Default is 21.
+    theta_bounds : tuple[float, float], optional
+        Bounds of the posterior grid. Default is (-4.0, 4.0).
+
+    References
+    ----------
+    van der Linden, W. J. (1998). Bayesian item selection criteria
+    for adaptive testing. Psychometrika, 63(2), 201-216.
+    """
+
+    def _criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        items: list[int],
+        weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        current = _category_probabilities(model, np.array([[theta]]), items)[0]
+        nodes = self._theta_nodes
+        expected = np.zeros(len(items), dtype=np.float64)
+        # Bound the (node x candidate x category) scratch for large pools.
+        block = max(1, _MAX_INFORMATION_VALUES // (len(nodes) * current.shape[1]))
+        for start in range(0, len(items), block):
+            stop = min(start + block, len(items))
+            curves = _category_probabilities(model, nodes[:, None], items[start:stop])
+            mass = weights[:, None, None] * curves
+            total = mass.sum(axis=0)
+            observed = total > 0.0
+            safe_total = np.where(observed, total, 1.0)
+            mean = np.einsum("q,qjk->jk", nodes, mass) / safe_total
+            deviations = np.square(nodes[:, None, None] - mean[None])
+            variance = np.einsum("qjk,qjk->jk", mass, deviations) / safe_total
+            probability = np.where(observed, current[start:stop], 0.0)
+            expected[start:stop] = np.sum(probability * variance, axis=1)
+        return -expected
+
+
+_LOCATION_PARAMETERS = ("difficulty", "location", "thresholds", "steps")
+
+
+def _item_locations(model: BaseItemModel) -> NDArray[np.float64]:
+    """Return every item's location on the ability scale, shape ``(n_items,)``.
+
+    The location is the first of these parameters the model stores: the
+    ``difficulty`` of a dichotomous (or rating-scale) item, the ``location``
+    of an unfolding item (GGUM, ideal point), the mean ``thresholds`` of a
+    graded or sequential item, or the mean ``steps`` of a (generalized)
+    partial credit item. Means span each item's active categories only.
+
+    Raises
+    ------
+    ValueError
+        If the model stores none of these parameters, as for nominal
+        response items, or the locations are not finite.
+    """
+    params = model.parameters
+    n_items = model.n_items
+    name = next((key for key in _LOCATION_PARAMETERS if key in params), None)
+    if name is None:
+        raise ValueError(
+            f"{type(model).__name__} has no item locations: it stores none of "
+            "the parameters " + ", ".join(repr(key) for key in _LOCATION_PARAMETERS)
+        )
+    values = np.asarray(params[name], dtype=np.float64)
+    if values.ndim == 0 or values.shape[0] != n_items:
+        raise ValueError(f"{name} parameters must have one row per item")
+    values = values.reshape(n_items, -1)
+    active = np.isfinite(values)
+    counts = getattr(model, "n_categories", None)
+    if (
+        name in ("thresholds", "steps")
+        and isinstance(counts, (list, tuple))
+        and len(counts) == n_items
+    ):
+        # Items with fewer categories pad their trailing thresholds or steps.
+        active &= np.arange(values.shape[1]) < (np.asarray(counts) - 1)[:, None]
+    n_active = active.sum(axis=1)
+    if np.any(n_active == 0):
+        raise ValueError("item locations must be finite")
+    return np.where(active, values, 0.0).sum(axis=1) / n_active
 
 
 class UrryRule(ItemSelectionStrategy):
     """Urry's rule for item selection.
 
-    Selects the item with difficulty parameter closest to the
-    current ability estimate. Simple and computationally efficient.
+    Selects the item whose location is closest to the current ability
+    estimate, with ties going to the lowest item index. The location is the
+    difficulty of a dichotomous item, the location of an unfolding item
+    (GGUM, ideal point), the mean threshold of a graded item, or the mean
+    step of a (generalized) partial credit item. Models without item
+    locations, such as nominal response models, raise ``ValueError``.
 
     References
     ----------
@@ -799,16 +1185,24 @@ class UrryRule(ItemSelectionStrategy):
         if not available_items:
             raise ValueError("No available items to select from")
 
-        best_item = -1
-        min_diff = np.inf
+        items = _validate_candidate_items(model, available_items)
+        distance = np.abs(theta - _item_locations(model)[items])
+        return items[int(np.argmin(distance))]
 
-        for item_idx in available_items:
-            diff = abs(theta - _item_location(model, item_idx))
-            if diff < min_diff:
-                min_diff = diff
-                best_item = item_idx
-
-        return best_item
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Return the negative distance of each item's location to ``theta``."""
+        items = _validate_candidate_items(model, available_items)
+        if not items:
+            return {}
+        criteria = -np.abs(theta - _item_locations(model)[items])
+        return dict(zip(items, criteria.tolist(), strict=True))
 
     def _compute_criterion(
         self,
@@ -816,7 +1210,7 @@ class UrryRule(ItemSelectionStrategy):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> float:
-        return -abs(float(theta[0, 0]) - _item_location(model, item_idx))
+        return -abs(float(theta[0, 0]) - float(_item_locations(model)[item_idx]))
 
 
 class RandomSelection(ItemSelectionStrategy):
@@ -876,9 +1270,9 @@ class AStratified(ItemSelectionStrategy):
     accurate, spreads exposure across the pool.
 
     Within the current stratum, items are ranked by Fisher information at the
-    current ability (``within="MFI"``) or by the closeness of their
-    difficulty to the current ability (``within="b-matching"``, the rule of
-    the original paper). When the current stratum has no available items, the
+    current ability (``within="MFI"``) or by the closeness of their location
+    to the current ability (``within="b-matching"``, the rule of the original
+    paper), using the item locations of :class:`UrryRule`. When the current stratum has no available items, the
     next non-empty later stratum is used, then the whole available pool.
 
     Parameters
@@ -887,10 +1281,12 @@ class AStratified(ItemSelectionStrategy):
         Number of discrimination strata. Default is 3.
     test_length : int | None, optional
         Planned test length that schedules the strata, capped at the pool
-        size. When None, CATEngine supplies its ``max_items`` (or the pool
-        size without one) on every selection, and standalone calls use the
-        pool size. Variable-length tests should set ``max_items`` or this
-        value; otherwise later strata are reached only near pool exhaustion.
+        size. When None, CATEngine supplies the length its stopping rules
+        enforce (``max_items``, a ``MaxItemsStop`` in ``stopping_rule``, or
+        else the pool size) on every selection, and standalone calls use the
+        pool size. Variable-length tests should bound their length or set
+        this value; otherwise later strata are reached only near pool
+        exhaustion.
     within : {"MFI", "b-matching"}, optional
         Ranking rule within a stratum. Default is "MFI".
 
@@ -1034,10 +1430,9 @@ class AStratified(ItemSelectionStrategy):
         )
         if self.within == "MFI":
             return MaxFisherInformation().get_item_criteria(model, theta, candidates)
-        return {
-            item_idx: -abs(theta - _item_location(model, item_idx))
-            for item_idx in sorted(candidates)
-        }
+        items = sorted(candidates)
+        criteria = -np.abs(theta - _item_locations(model)[items])
+        return dict(zip(items, criteria.tolist(), strict=True))
 
     def select_item(
         self,
@@ -1063,7 +1458,11 @@ class AStratified(ItemSelectionStrategy):
 _SELECTION_STRATEGIES: dict[str, type[ItemSelectionStrategy]] = {
     "MFI": MaxFisherInformation,
     "MEI": MaxExpectedInformation,
+    "MPWI": MaxPosteriorWeightedInformation,
+    "MLWI": MaxLikelihoodWeightedInformation,
     "KL": KullbackLeibler,
+    "KLP": PosteriorKullbackLeibler,
+    "MEPV": MinExpectedPosteriorVariance,
     "Urry": UrryRule,
     "random": RandomSelection,
     "a-stratified": AStratified,
@@ -1072,12 +1471,7 @@ _SELECTION_STRATEGIES: dict[str, type[ItemSelectionStrategy]] = {
 
 def _selection_strategy_class(method: str) -> type[ItemSelectionStrategy]:
     """Resolve a strategy name, ignoring case, whitespace, and ``_`` vs ``-``."""
-    normalized = method.strip().lower().replace("_", "-")
-    for name, strategy_class in _SELECTION_STRATEGIES.items():
-        if name.lower() == normalized:
-            return strategy_class
-    valid = ", ".join(_SELECTION_STRATEGIES)
-    raise ValueError(f"Unknown selection method '{method}'. Valid options: {valid}")
+    return resolve_name(method, _SELECTION_STRATEGIES, kind="selection method")[1]
 
 
 def create_selection_strategy(
@@ -1089,10 +1483,11 @@ def create_selection_strategy(
     Parameters
     ----------
     method : str
-        Selection method name. One of: "MFI", "MEI", "KL", "Urry",
-        "random", "a-stratified". Names match regardless of case and
-        surrounding whitespace, and ``"_"`` is accepted for ``"-"``, so
-        ``"a_stratified"`` and ``"urry"`` also work.
+        Selection method name. One of: "MFI", "MEI", "MPWI", "MLWI", "KL",
+        "KLP", "MEPV", "Urry", "random", "a-stratified". Names match
+        regardless of case and surrounding whitespace, and ``"_"`` is
+        accepted for ``"-"``, so ``"a_stratified"`` and ``"urry"`` also
+        work.
     **kwargs
         Additional keyword arguments passed to the strategy constructor.
 

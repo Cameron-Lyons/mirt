@@ -5,6 +5,18 @@ Bayesian Estimation
 and the log-likelihood. The fitted model uses the posterior mean of each item
 parameter, while ``MCMCResult`` keeps the complete draws for uncertainty analysis.
 
+Each iteration updates every person's abilities by a random-walk Metropolis
+step against their standard normal prior, and then every item's free
+parameters by its own Metropolis step: given the abilities the items are
+independent, so each item is accepted or rejected on its own likelihood.
+Bounded parameters move on an unconstrained scale, with the Jacobian in the
+acceptance ratio: slopes as the log of their distance to the lower bound,
+guessing and upper asymptotes as logits within their boxes, and graded
+thresholds as the first threshold and the logs of the gaps between consecutive
+ones, so every draw is valid and ordered. Proposal scales and covariances
+adapt during burn-in and stay fixed afterwards. Coordinates fixed with
+``set_free_parameter_masks`` keep their values.
+
 Fitting a model
 ---------------
 
@@ -26,6 +38,32 @@ Pass a model instance and response matrix directly to the sampler:
    ).fit(model, responses)
 
    print(result.summary())
+
+Priors
+------
+
+Difficulties have ``N(0, 1)`` priors, positive discriminations
+``LogNormal(1, 1)`` priors (density proportional to ``exp(-log(a)**2 / 2)``),
+guessing parameters ``Beta(2, 8)`` and upper asymptotes ``Beta(8, 2)``; other
+item parameters are uniform on their family's estimation box, which for the
+unidimensional 1PL-4PL is ``[0.1, 5]`` for slopes and ``[-6, 6]`` for
+difficulties. These are the priors and boxes of the native unidimensional 2PL
+kernel, so both backends sample the same posterior. ``priors`` replaces them by
+parameter name and runs the NumPy sampler:
+
+.. code-block:: python
+
+   from mirt.estimation.priors import BetaPrior, NormalPrior
+
+   sampler = mirt.GibbsSampler(
+       priors={"difficulty": NormalPrior(0, 2), "guessing": BetaPrior(5, 17)},
+       seed=42,
+   )
+
+A ``PriorSpecification`` sets the priors of the parameters it names, with
+``LogNormal(0, 0.5)`` discrimination and ``N(0, 2)`` difficulty for omitted
+fields; its ``theta`` prior must remain standard normal. Other values, such as
+tuples or dictionaries of moments, raise ``MirtValidationError``.
 
 Posterior summaries
 -------------------
@@ -97,9 +135,43 @@ bound from the number of people and factors.
 Diagnostics
 -----------
 
-``rhat`` and ``ess`` contain convergence and effective-sample-size diagnostics for
-item parameters. Both are included in ``summary()``. Values of R-hat close to one
-and larger effective sample sizes indicate more reliable posterior estimates.
+Convergence is assessed for every free item coordinate with the
+rank-normalized split R-hat and the bulk and tail effective sample sizes of
+Vehtari et al. (2021), computed within the ``n_chains`` chains of the fit.
+``rhat`` holds the largest R-hat of each item parameter, ``ess`` its smallest
+bulk ESS and ``ess_tail`` its smallest tail ESS, and ``summary()`` prints all
+three. ``converged`` is true when every R-hat is below 1.01 and every bulk and
+tail ESS reaches 100 per chain, the thresholds the paper recommends.
+``convergence_diagnostics()`` returns the per-coordinate values, shaped like
+the parameters, with fixed coordinates as ``NaN``:
+
+.. code-block:: python
+
+   result = mirt.GibbsSampler(n_iter=4_000, burnin=1_000, n_chains=4, seed=1).fit(
+       mirt.TwoParameterLogistic(n_items=responses.shape[1]), responses
+   )
+   diagnostics = result.convergence_diagnostics()
+   print(result.converged, diagnostics["difficulty"]["rhat"])
+
+Several chains make R-hat sensitive to chains that have not forgotten their
+starts: chains start from the model's values jittered on the sampling scale.
+The abilities and the item locations and slopes drift slowly as a whole, so a few
+thousand iterations are typical; run longer chains when ``converged`` is
+false.
+
+Log-likelihood and information criteria
+---------------------------------------
+
+``MCMCResult.log_likelihood`` is the marginal log-likelihood at the posterior
+means of the item parameters, integrated over the abilities as EM integrates
+it: on EM's default grid for up to three factors, so it equals EM's
+log-likelihood at the same parameters, and by importance sampling from normal
+approximations of each person's posterior beyond. The AIC and BIC of
+``fit_mirt(estimation="MCMC")`` are built from it and compare with EM fits.
+``dic`` and ``waic`` are Bayesian criteria built from the conditional
+log-likelihood of the draws, which ``chains["log_likelihood"]`` stores; its
+posterior mean lies far above the marginal log-likelihood and is not a
+substitute for it.
 
 Pointwise predictive criteria
 -----------------------------

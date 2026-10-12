@@ -100,8 +100,11 @@ def generate_report(
     ----------
     fit_result : FitResult
         Fitted model result.
-    responses : ndarray
-        Response matrix (n_persons x n_items).
+    responses : array-like or DataFrame
+        Response matrix (n_persons x n_items). DataFrame columns are matched
+        to the model's item names, as in :func:`mirt.fscores`, and ``NaN``,
+        nullable-column nulls (``pd.NA``) and negative codes are missing
+        responses.
     report_type : str
         Type of report to generate:
         - 'item_analysis': Item parameters, fit statistics, ICC plots
@@ -109,7 +112,9 @@ def generate_report(
         - 'full_diagnostic': Comprehensive diagnostic report
     theta : ndarray, optional
         Ability estimates. Required for Wright map in item_analysis
-        and full_diagnostic reports.
+        and full_diagnostic reports, which draw one map per factor of a
+        multidimensional model and replace maps that do not apply, such as
+        those of nominal response models, with a note.
     output_path : str or Path, optional
         If provided, save report to this path.
     **kwargs

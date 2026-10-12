@@ -171,9 +171,10 @@ def test_native_eligibility_is_conservative(
     custom_epsilon._latent_density = GaussianDensity()
     assert custom_epsilon._can_use_rust_3pl(model, responses) is False
 
+    # The native M-step runs on a pool of n_jobs workers.
     parallel = EMEstimator(n_jobs=2, use_gpu=False)
     parallel._latent_density = GaussianDensity()
-    assert parallel._can_use_rust_3pl(model, responses) is False
+    assert parallel._can_use_rust_3pl(model, responses) is True
 
     nonbinary = responses.copy()
     nonbinary[0, 0] = 2
@@ -398,4 +399,105 @@ def test_native_fit_reaches_numpy_optimum_with_guessing_on_its_bound(
             fits["rust"].model.parameters[name],
             fits["numpy"].model.parameters[name],
             atol=5e-3,
+        )
+
+
+@pytest.mark.skipif(not mirt.is_rust_available(), reason="native backend unavailable")
+@pytest.mark.parametrize("n_jobs", [2, -1])
+def test_parallel_fits_keep_the_native_iteration(
+    monkeypatch: pytest.MonkeyPatch, n_jobs: int
+) -> None:
+    # Regression: n_jobs != 1 ran the per-item SciPy M-step, 6-9x slower.
+    pools = []
+    native = em_module.em_iteration_3pl
+
+    def record(*args: Any, **kwargs: Any) -> Any:
+        pools.append(kwargs["pool"])
+        return native(*args, **kwargs)
+
+    data = np.asarray(mirt.simdata(n_persons=400, n_items=6, model="3PL", seed=3))
+    options = {"compute_standard_errors": False, "use_gpu": False}
+    serial = EMEstimator(**options).fit(ThreeParameterLogistic(6), data)
+    monkeypatch.setattr(em_module, "em_iteration_3pl", record)
+    parallel = EMEstimator(n_jobs=n_jobs, **options).fit(
+        ThreeParameterLogistic(6), data
+    )
+
+    assert pools and all(pool is pools[0] and pool is not None for pool in pools)
+    assert parallel.n_iterations == serial.n_iterations
+    for name, values in serial.model.parameters.items():
+        np.testing.assert_array_equal(parallel.model.parameters[name], values)
+
+
+@pytest.mark.skipif(not mirt.is_rust_available(), reason="native backend unavailable")
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"quad_weights": np.array([1.0])}, "quad_weights must have shape"),
+        ({"discrimination": np.array([1.0])}, "discrimination must have shape"),
+        ({"prior_var": 0.0}, "prior_var finite and positive"),
+        ({"prior_mean": np.nan}, "prior_mean must be finite"),
+        ({"max_m_iter": 0}, "max_m_iter must be a positive integer"),
+        ({"disc_bounds": (5.0, 0.1)}, "disc_bounds must satisfy lower <= upper"),
+        ({"guess_bounds": (np.nan, 0.3)}, "guess_bounds must satisfy"),
+        ({"responses": np.array([[0, 2]], dtype=np.int32)}, "only 0 or 1"),
+        ({"n_jobs": 0}, "n_jobs must be positive"),
+    ],
+)
+def test_native_kernel_raises_value_errors_instead_of_panicking(
+    changes: dict[str, Any], message: str
+) -> None:
+    # Regression: these reached assert_eq!, an index panic or f64::clamp in
+    # the kernel, which the wrapper's callers could not catch.
+    from mirt import mirt_rs
+
+    arguments: dict[str, Any] = {
+        "responses": np.array([[0, 1]], dtype=np.int32),
+        "quad_points": np.array([0.0, 1.0]),
+        "quad_weights": np.array([0.5, 0.5]),
+        "discrimination": np.array([1.0, 1.0]),
+        "difficulty": np.array([0.0, 0.0]),
+        "guessing": np.array([0.1, 0.1]),
+        "prior_mean": 0.0,
+        "prior_var": 1.0,
+        "max_m_iter": 5,
+        "m_tol": 1e-4,
+        "disc_bounds": (0.1, 5.0),
+        "diff_bounds": (-6.0, 6.0),
+        "guess_bounds": (0.0, 0.35),
+        "regularization": 0.01,
+        "regularization_c": 0.1,
+        "frequencies": None,
+        "n_jobs": 1,
+    }
+    arguments.update(changes)
+    with pytest.raises(ValueError, match=message):
+        mirt_rs.em_iteration_3pl(*arguments.values())
+
+
+@pytest.mark.skipif(not mirt.is_rust_available(), reason="native backend unavailable")
+def test_native_kernel_rejects_a_pool_of_another_size() -> None:
+    from mirt import mirt_rs
+
+    pool = mirt_rs.EMThreadPool(3)
+    with pytest.raises(ValueError, match="pool size must match"):
+        mirt_rs.em_iteration_3pl(
+            np.array([[0, 1]], dtype=np.int32),
+            np.array([0.0, 1.0]),
+            np.array([0.5, 0.5]),
+            np.ones(2),
+            np.zeros(2),
+            np.full(2, 0.1),
+            0.0,
+            1.0,
+            5,
+            1e-4,
+            (0.1, 5.0),
+            (-6.0, 6.0),
+            (0.0, 0.35),
+            0.01,
+            0.1,
+            None,
+            2,
+            pool,
         )

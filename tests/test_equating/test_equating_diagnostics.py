@@ -1307,3 +1307,550 @@ class TestDiagnosticsWithRealModels:
 
         assert isinstance(summary, str)
         assert "Linking" in summary
+
+
+@pytest.fixture(scope="module")
+def fitted_form_pairs():
+    """Old and new calibrations whose ``vcov`` uses the free-parameter layout."""
+    from mirt import fit_mirt
+
+    rng = np.random.default_rng(0)
+    n_items, n_persons = 10, 600
+    slopes = rng.uniform(0.8, 1.8, n_items)
+    locations = rng.normal(0.0, 1.0, n_items)
+
+    def simulate(mean, guessing=0.0):
+        theta = rng.normal(mean, 1.0, n_persons)
+        logits = slopes * (theta[:, None] - locations)
+        probability = guessing + (1.0 - guessing) / (1.0 + np.exp(-logits))
+        return (rng.random((n_persons, n_items)) < probability).astype(int)
+
+    # The first item, which is not an anchor, keeps a fixed slope.
+    fixed = {"discrimination": np.arange(n_items) == 0}
+    settings = {
+        # The unit-slope Rasch model, whose fixed slopes vcov leaves out.
+        "1PL": ("1PL", {"fixed": {"discrimination": True}}, 0.0),
+        "2PL-fixed": ("2PL", {"fixed": fixed}, 0.0),
+        "3PL": ("3PL", {}, 0.15),
+    }
+    return {
+        name: tuple(
+            fit_mirt(simulate(mean, guessing), model=model, verbose=False, **options)
+            for mean in (0.0, 0.5)
+        )
+        for name, (model, options, guessing) in settings.items()
+    }
+
+
+def _stored_layout(fit):
+    """Scatter a fitted free-parameter covariance into every stored coordinate."""
+    masks = fit.model.free_parameter_masks
+    free = np.flatnonzero(
+        np.concatenate([np.ravel(masks[name]) for name in fit.model.parameters])
+    )
+    size = sum(values.size for values in fit.model.parameters.values())
+    stored = np.zeros((size, size))
+    stored[np.ix_(free, free)] = np.nan_to_num(fit.vcov, nan=0.0)
+    return stored
+
+
+class TestDeltaMethodFittedCovariance:
+    """``FitResult.vcov`` lists free parameters only, unlike stored arrays."""
+
+    anchors = [1, 2, 3, 4, 5, 6]
+
+    def _delta(self, old, new, vcov_old, vcov_new, **models):
+        result = link(old.model, new.model, self.anchors, self.anchors)
+        return delta_method_se(
+            result, vcov_old, vcov_new, self.anchors, self.anchors, **models
+        )
+
+    def test_one_parameter_free_layout_is_mapped(self, fitted_form_pairs):
+        """A 1PL covariance omits the fixed slopes instead of failing to index."""
+        old, new = fitted_form_pairs["1PL"]
+        assert old.vcov.shape[0] == old.model.n_parameters < 2 * old.model.n_items
+        models = {"model_old": old.model, "model_new": new.model}
+
+        actual = self._delta(old, new, old.vcov, new.vcov, **models)
+        expected = self._delta(
+            old, new, _stored_layout(old), _stored_layout(new), **models
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12)
+        assert actual[1] > 0.0
+
+    def test_fixed_coordinates_do_not_shift_rows(self, fitted_form_pairs):
+        """A fixed non-anchor slope must not misalign the anchors' rows."""
+        old, new = fitted_form_pairs["2PL-fixed"]
+        assert old.vcov_labels[0] == "discrimination[Item_2]"
+        models = {"model_old": old.model, "model_new": new.model}
+
+        actual = self._delta(old, new, old.vcov, new.vcov, **models)
+        expected = self._delta(
+            old, new, _stored_layout(old), _stored_layout(new), **models
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12)
+
+    def test_rows_at_a_bound_have_zero_variance(self, fitted_form_pairs):
+        """NaN rows of asymptotes on their bound are treated as known."""
+        old, new = fitted_form_pairs["3PL"]
+        assert np.any(np.isnan(np.diag(old.vcov)))
+        models = {"model_old": old.model, "model_new": new.model}
+
+        actual = self._delta(old, new, old.vcov, new.vcov, **models)
+        expected = self._delta(
+            old, new, _stored_layout(old), _stored_layout(new), **models
+        )
+
+        assert np.all(np.isfinite(actual)) and np.all(np.asarray(actual) > 0.0)
+        np.testing.assert_allclose(actual, expected, rtol=1e-12)
+
+    @pytest.mark.parametrize("name", ["1PL", "2PL-fixed", "3PL"])
+    def test_fit_results_supply_covariance_and_models(self, fitted_form_pairs, name):
+        old, new = fitted_form_pairs[name]
+
+        from_results = self._delta(old, new, old, new)
+        from_arrays = self._delta(
+            old,
+            new,
+            old.vcov,
+            new.vcov,
+            model_old=old.model,
+            model_new=new.model,
+        )
+
+        np.testing.assert_allclose(from_results, from_arrays, rtol=1e-12)
+
+    def test_unrecognized_size_names_both_layouts(self, fitted_form_pairs):
+        old, new = fitted_form_pairs["1PL"]
+        size = old.model.n_parameters + 1
+
+        with pytest.raises(ValueError, match=r"\(10, 10\).*\(20, 20\)"):
+            self._delta(
+                old,
+                new,
+                np.eye(size),
+                new.vcov,
+                model_old=old.model,
+                model_new=new.model,
+            )
+
+    def test_standard_errors_stand_in_for_a_missing_vcov(self):
+        """Results fitted without a covariance use their squared SEs."""
+        from mirt import fit_mirt
+
+        rng = np.random.default_rng(0)
+        n_items, n_persons = 8, 400
+        slopes = rng.uniform(0.8, 1.8, n_items)
+        locations = rng.normal(0.0, 1.0, n_items)
+
+        def simulate(mean):
+            theta = rng.normal(mean, 1.0, n_persons)
+            probability = 1.0 / (1.0 + np.exp(-slopes * (theta[:, None] - locations)))
+            return (rng.random((n_persons, n_items)) < probability).astype(int)
+
+        old, new = (
+            fit_mirt(
+                simulate(mean), model="2PL", verbose=False, se_method="complete_data"
+            )
+            for mean in (0.0, 0.5)
+        )
+        assert old.vcov is None and new.vcov is None
+
+        with pytest.warns(UserWarning, match="ignoring covariances"):
+            actual = self._delta(old, new, old, new)
+
+        def squared_errors(fit):
+            return np.diag(
+                np.concatenate(
+                    [fit.standard_errors[name] ** 2 for name in fit.model.parameters]
+                )
+            )
+
+        expected = self._delta(
+            old,
+            new,
+            squared_errors(old),
+            squared_errors(new),
+            model_old=old.model,
+            model_new=new.model,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-12)
+        assert np.all(np.asarray(actual) > 0.0)
+
+    @pytest.mark.parametrize("layout", ["stored", "free"])
+    def test_only_the_anchor_block_is_read(self, layout):
+        """Entries of non-anchor coordinates are neither read nor validated."""
+        from mirt.models.dichotomous import OneParameterLogistic
+
+        n_items, anchors = 10, [0, 1, 2, 3, 4]
+        old, new = OneParameterLogistic(n_items), OneParameterLogistic(n_items)
+        locations = np.linspace(-1.5, 1.5, n_items)
+        old.set_parameters(difficulty=locations)
+        new.set_parameters(difficulty=(locations - 0.3) + np.linspace(-0.1, 0.1, 10))
+        result = link(old, new, anchors, anchors)
+        # The free layout lists the difficulties only; the stored one adds the
+        # fixed slopes in front.
+        offset = n_items if layout == "stored" else 0
+        clean = np.eye(offset + n_items) * 0.01
+        dirty = clean.copy()
+        others = offset + np.arange(5, n_items)
+        dirty[others[0], others[0]] = -1.0
+        dirty[others[1], others[2]] = 0.5
+        dirty[others[3], others[4]] = np.nan
+
+        expected = delta_method_se(result, clean, clean, anchors, anchors, old, new)
+
+        assert expected[1] > 0.0
+        assert (
+            delta_method_se(result, dirty, dirty, anchors, anchors, old, new)
+            == expected
+        )
+
+    def test_partially_missing_rows_are_rejected(self, linked_models_pair):
+        model_old, model_new, anchors = linked_models_pair
+        result = link(model_old, model_new, anchors, anchors)
+        vcov = np.eye(model_old.n_parameters) * 0.01
+        vcov[0, 1] = vcov[1, 0] = np.nan
+
+        with pytest.raises(ValueError, match="finite apart from NaN"):
+            delta_method_se(
+                result,
+                vcov,
+                np.eye(model_new.n_parameters) * 0.01,
+                anchors,
+                anchors,
+                model_old=model_old,
+                model_new=model_new,
+            )
+
+
+class TestDeltaMethodNativeParameters:
+    """Native curve families propagate every per-item curve parameter."""
+
+    def test_zero_inflation_uncertainty_matches_relinking(self):
+        from mirt.models.zeroinflated import ZeroInflated2PL
+
+        rng = np.random.default_rng(3)
+        n_items = 8
+        anchors = list(range(5))
+        slopes = rng.uniform(0.8, 2.0, n_items)
+        locations = rng.normal(0.0, 1.0, n_items)
+        inflation = rng.uniform(0.05, 0.3, n_items)
+        old = ZeroInflated2PL(n_items)
+        old.set_parameters(
+            discrimination=slopes, difficulty=locations, zero_inflation=inflation
+        )
+        new = ZeroInflated2PL(n_items)
+        new.set_parameters(
+            discrimination=slopes * 1.2 + rng.normal(0.0, 0.1, n_items),
+            difficulty=(locations - 0.3) / 1.2 + rng.normal(0.0, 0.1, n_items),
+            zero_inflation=inflation,
+        )
+        result = link(old, new, anchors, anchors)
+        variance = 0.002
+        vcov = np.diag(
+            np.concatenate([np.zeros(2 * n_items), np.full(n_items, variance)])
+        )
+
+        se = delta_method_se(
+            result, vcov, vcov, anchors, anchors, model_old=old, model_new=new
+        )
+
+        def constants(form, item, step):
+            varied = [old.copy(), new.copy()]
+            values = varied[form].zero_inflation.copy()
+            values[item] += step
+            varied[form].set_parameters(zero_inflation=values)
+            relinked = link(*varied, anchors, anchors).constants
+            return np.array([relinked.A, relinked.B])
+
+        step = 1e-4
+        jacobian = np.column_stack(
+            [
+                (constants(form, item, step) - constants(form, item, -step))
+                / (2.0 * step)
+                for form in (0, 1)
+                for item in anchors
+            ]
+        )
+        expected = np.sqrt(variance * np.sum(jacobian**2, axis=1))
+
+        assert np.all(np.asarray(se) > 0.0)
+        np.testing.assert_allclose(se, expected, rtol=1e-3)
+
+
+def test_free_layout_covariance_of_a_common_slope_1pl_keeps_one_row_per_item():
+    """Tied coordinates keep their own vcov rows beyond ``n_parameters``."""
+    import mirt
+    from mirt.equating.diagnostics import delta_method_se
+
+    def fit(seed: int, shift: float):
+        rng = np.random.default_rng(seed)
+        responses = mirt.simdata(
+            theta=rng.normal(shift, 1.0, 800),
+            discrimination=np.full(6, 1.3),
+            difficulty=np.linspace(-1.5, 1.5, 6),
+            seed=seed,
+        )
+        return mirt.fit_mirt(responses, model="1PL")
+
+    old, new = fit(1, 0.0), fit(2, 0.4)
+    assert old.vcov.shape[0] > old.model.n_parameters
+    anchors = list(range(6))
+    linking = mirt.link(old.model, new.model, anchors, anchors)
+
+    expected = delta_method_se(
+        linking, old, new, anchors, anchors, old.model, new.model
+    )
+    actual = delta_method_se(
+        linking, old.vcov, new.vcov, anchors, anchors, old.model, new.model
+    )
+    assert actual == pytest.approx(expected)
+
+
+def _noisy_polytomous_pair(family, seed=11):
+    """Two noisy affine copies of one GRM, GPCM, or NRM calibration."""
+    from mirt.models.polytomous import (
+        GeneralizedPartialCredit,
+        GradedResponseModel,
+        NominalResponseModel,
+    )
+
+    rng = np.random.default_rng(seed)
+    categories = [3, 4, 3, 4, 3]
+    n_items = len(categories)
+    models = []
+    for scale, shift in ((1.0, 0.0), (1.2, 0.3)):
+        if family == "NRM":
+            model = NominalResponseModel(n_items, categories)
+            slopes = model.parameters["slopes"].copy()
+            intercepts = model.parameters["intercepts"].copy()
+            for item, count in enumerate(categories):
+                base = np.linspace(0.0, 1.2 + 0.1 * item, count)
+                slopes[item, :count] = base / scale + rng.normal(0.0, 0.03, count)
+                intercepts[item, :count] = (
+                    np.linspace(0.0, 0.4 * item - 0.5, count)
+                    - base * shift / scale
+                    + rng.normal(0.0, 0.03, count)
+                )
+            slopes[:, 0] = intercepts[:, 0] = 0.0
+            model.set_parameters(slopes=slopes, intercepts=intercepts)
+        else:
+            model_class = (
+                GradedResponseModel if family == "GRM" else GeneralizedPartialCredit
+            )
+            model = model_class(n_items, categories)
+            name = "thresholds" if family == "GRM" else "steps"
+            locations = np.array(model.parameters[name], copy=True)
+            for item, count in enumerate(categories):
+                base = np.linspace(-1.2, 1.0, count - 1) + 0.2 * item
+                locations[item, : count - 1] = (
+                    scale * base + shift + rng.normal(0.0, 0.04, count - 1)
+                )
+            model.set_parameters(
+                discrimination=np.linspace(0.8, 1.6, n_items)
+                / scale
+                * np.exp(rng.normal(0.0, 0.04, n_items)),
+                **{name: locations},
+            )
+        models.append(model)
+    return models
+
+
+def _stored_covariance(model, seed):
+    """A covariance over every stored coordinate, zero for fixed ones."""
+    rng = np.random.default_rng(seed)
+    free = np.concatenate(
+        [mask.ravel() for mask in model.free_parameter_masks.values()]
+    )
+    root = rng.normal(0.0, 0.03, (free.size, free.size))
+    covariance = root @ root.T + 1e-4 * np.eye(free.size)
+    covariance[~free, :] = covariance[:, ~free] = 0.0
+    return covariance
+
+
+class TestPolytomousLinkingUncertainty:
+    """Delta-method and bootstrap standard errors of polytomous links."""
+
+    @pytest.mark.parametrize(
+        ("family", "method"),
+        [
+            ("GRM", "stocking_lord"),
+            ("GRM", "haebara"),
+            ("GRM", "mean_sigma"),
+            ("GPCM", "haebara"),
+            ("GPCM", "mean_mean"),
+            ("NRM", "stocking_lord"),
+            ("NRM", "haebara"),
+        ],
+    )
+    def test_delta_method_matches_relinking(self, family, method):
+        """Implicit derivatives equal central differences of relinked constants."""
+        from mirt.equating import link_gpcm, link_grm, link_nrm
+
+        linker = {"GRM": link_grm, "GPCM": link_gpcm, "NRM": link_nrm}[family]
+        old, new = _noisy_polytomous_pair(family)
+        anchors = list(range(old.n_items))
+        vcovs = [_stored_covariance(old, 1), _stored_covariance(new, 2)]
+        result = linker(old, new, anchors, anchors, method=method)
+
+        se = delta_method_se(
+            result, *vcovs, anchors, anchors, model_old=old, model_new=new
+        )
+
+        columns = []
+        for side, model in enumerate((old, new)):
+            names = list(model.parameters)
+            stored = np.concatenate([model.parameters[name].ravel() for name in names])
+            free = np.concatenate(
+                [model.free_parameter_masks[name].ravel() for name in names]
+            )
+            for coordinate in range(stored.size):
+                # Fixed coordinates, such as NRM reference categories and
+                # category padding, have zero variance.
+                if not free[coordinate]:
+                    columns.append(np.zeros(2))
+                    continue
+                step = 1e-4 * max(1.0, abs(stored[coordinate]))
+                constants = []
+                for sign in (1.0, -1.0):
+                    values = stored.copy()
+                    values[coordinate] += sign * step
+                    varied = [old.copy(), new.copy()]
+                    offset, updates = 0, {}
+                    for name in names:
+                        size = model.parameters[name].size
+                        updates[name] = values[offset : offset + size].reshape(
+                            model.parameters[name].shape
+                        )
+                        offset += size
+                    varied[side].set_parameters(**updates)
+                    relinked = linker(
+                        *varied,
+                        anchors,
+                        anchors,
+                        method=method,
+                        compute_diagnostics=False,
+                    ).constants
+                    constants.append(np.array([relinked.A, relinked.B]))
+                columns.append((constants[0] - constants[1]) / (2.0 * step))
+        jacobian = np.column_stack(columns)
+        sizes = [vcov.shape[0] for vcov in vcovs]
+        covariance = np.zeros((sum(sizes), sum(sizes)))
+        covariance[: sizes[0], : sizes[0]] = vcovs[0]
+        covariance[sizes[0] :, sizes[0] :] = vcovs[1]
+        expected = np.sqrt(np.diag(jacobian @ covariance @ jacobian.T))
+
+        assert np.all(np.asarray(se) > 0.0)
+        # Relinked curve constants carry Nelder-Mead noise near 1e-8.
+        np.testing.assert_allclose(se, expected, rtol=2e-3)
+
+    def test_delta_method_accepts_polytomous_fit_results(self):
+        import mirt
+
+        rng = np.random.default_rng(5)
+        fits = []
+        for shift in (0.0, 0.4):
+            theta = rng.normal(shift, 1.0, 600)
+            thresholds = (
+                np.array([[-1.0, 0.0, 1.0]] * 5) + np.linspace(-0.5, 0.5, 5)[:, None]
+            )
+            cumulative = 1.0 / (
+                1.0 + np.exp(-1.3 * (theta[:, None, None] - thresholds[None]))
+            )
+            responses = (rng.random((600, 5, 1)) < cumulative).sum(axis=2)
+            fits.append(mirt.fit_mirt(responses, model="GRM"))
+        anchors = list(range(5))
+        result = mirt.equating.link_grm(fits[0].model, fits[1].model, anchors, anchors)
+
+        se = delta_method_se(result, fits[0], fits[1], anchors, anchors)
+        from_matrices = delta_method_se(
+            result,
+            fits[0].vcov,
+            fits[1].vcov,
+            anchors,
+            anchors,
+            model_old=fits[0].model,
+            model_new=fits[1].model,
+        )
+
+        assert np.all(np.isfinite(se)) and np.all(np.asarray(se) > 0.0)
+        np.testing.assert_allclose(se, from_matrices, rtol=1e-12)
+
+    def test_polytomous_methods_and_families_are_validated(self):
+        from mirt.equating import link_grm
+        from mirt.models.polytomous import GeneralizedPartialCredit
+
+        old, new = _noisy_polytomous_pair("GRM")
+        anchors = list(range(old.n_items))
+        result = link_grm(old, new, anchors, anchors)
+        vcov = _stored_covariance(old, 1)
+        tcc = LinkingResult(
+            constants=LinkingConstants(A=1.0, B=0.0, method="tcc"),
+            anchor_items=anchors,
+        )
+
+        with pytest.raises(ValueError, match="for GRM forms: tcc"):
+            delta_method_se(tcc, vcov, vcov, anchors, anchors, old, new)
+        gpcm = GeneralizedPartialCredit(old.n_items, old.n_categories)
+        with pytest.raises(ValueError, match="share one response family"):
+            delta_method_se(result, vcov, vcov, anchors, anchors, old, gpcm)
+        with pytest.raises(ValueError, match="dichotomous or both polytomous"):
+            delta_method_se(
+                result,
+                vcov,
+                vcov,
+                anchors,
+                anchors,
+                old,
+                TwoParameterLogistic(old.n_items),
+            )
+
+    @pytest.mark.parametrize("family", ["GRM", "NRM"])
+    def test_anchor_bootstrap_matches_linker_standard_errors(self, family):
+        from mirt.equating import link_grm, link_nrm
+
+        linker = link_grm if family == "GRM" else link_nrm
+        old, new = _noisy_polytomous_pair(family)
+        anchors = list(range(old.n_items))
+
+        se_a, se_b, a_samples, b_samples = bootstrap_linking_se(
+            old, new, None, None, anchors, anchors, n_bootstrap=20, seed=3
+        )
+        linked = linker(
+            old, new, anchors, anchors, compute_se=True, n_bootstrap=20, random_state=3
+        ).constants
+
+        assert se_a > 0.0 and se_b > 0.0
+        assert a_samples.shape == b_samples.shape == (20,)
+        assert (linked.A_se, linked.B_se) == pytest.approx((se_a, se_b), rel=1e-12)
+
+    def test_response_bootstrap_refits_polytomous_forms(self):
+        old, new = _noisy_polytomous_pair("GPCM")
+        anchors = list(range(old.n_items))
+        responses = np.random.default_rng(0).integers(0, 3, (30, old.n_items))
+        refits = []
+
+        def refit(model, sampled):
+            refits.append(sampled.shape)
+            return model
+
+        se_a, se_b, a_samples, _ = bootstrap_linking_se(
+            old,
+            new,
+            responses,
+            responses,
+            anchors,
+            anchors,
+            method="haebara",
+            n_bootstrap=3,
+            seed=1,
+            refit=refit,
+        )
+
+        assert refits == [(30, old.n_items)] * 6
+        # Unchanged refits reproduce the point estimate in every replicate.
+        assert (se_a, se_b) == pytest.approx((0.0, 0.0), abs=1e-12)
+        assert np.ptp(a_samples) == pytest.approx(0.0, abs=1e-12)

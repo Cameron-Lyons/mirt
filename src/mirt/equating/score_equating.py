@@ -24,9 +24,16 @@ if TYPE_CHECKING:
 _PROBABILITY_TOLERANCE = 1e-10
 _SMOOTHING_METHODS = ("none", "loglinear", "kernel")
 _RECURSION_CHUNK_ELEMENTS = 262_144
-# Doublings of max(1, half-width of theta_range) searched beyond each end.
-_TCC_SEARCH_DOUBLINGS = 60
+# Offsets of max(1, half-width of theta_range) times 2**k searched beyond each
+# end; the first few, below one half-width, keep near-tail brackets narrow.
+_TCC_SEARCH_POWERS = np.arange(-3.0, 61.0)
 _ROOT_MAX_ITERATIONS = 200
+# Residual of an equated score's old-form root before first-order correction.
+_ROOT_RELATIVE_TOLERANCE = 1e-10
+# Interpolation nodes per root on the evenly spaced reporting grid.
+_UNIFORM_NODES = 8
+# Relative agreement of slope-ratio estimates that permits relaxed roots.
+_RATIO_AGREEMENT = 1e-6
 
 
 @dataclass
@@ -99,7 +106,11 @@ def true_score_equating(
     -----
     Each old-form score strictly between the limits of the old test
     characteristic curve (TCC) is solved for its ability by bracketed root
-    finding, and the new TCC is evaluated there. The limits are the sums of
+    finding, and the new TCC is evaluated there. Both curves are validated
+    on a search grid that extends the reporting grid geometrically, and
+    local inverse interpolation of that grid seeds the roots, so equated
+    scores usually reach rounding accuracy with one further old-form curve
+    evaluation per score. The limits are the sums of
     the lower and upper item asymptotes (for example the 3PL guessing
     parameters), evaluated numerically far outside ``theta_range``. Both
     models must therefore return valid probabilities at extreme abilities;
@@ -152,20 +163,17 @@ def true_score_equating(
         new_scores[above] = max_score_new
 
     if np.any(interior):
-        targets = old_scores[interior]
-        bracket = np.searchsorted(expected_old, targets, side="left")
-        roots = _bracketed_root(
-            lambda theta: _extreme_expected_scores(model_old, theta, old_item_indices),
-            targets,
-            search_old[bracket - 1],
-            search_old[bracket],
-            expected_old[bracket - 1],
-            expected_old[bracket],
-        )
-        new_scores[interior] = _extreme_expected_scores(
+        new_scores[interior] = _interior_true_scores(
+            model_old,
             model_new,
-            _new_scale_theta(roots, linking_result),
+            old_item_indices,
             new_item_indices,
+            old_scores[interior],
+            theta_grid,
+            search_old,
+            expected_old,
+            expected_new,
+            linking_result,
         )
 
     return ScoreEquatingResult(
@@ -214,6 +222,10 @@ def observed_score_equating(
         Subset of items for new form.
     smoothing : {"none", "loglinear", "kernel"}
         Score-distribution smoothing applied before equipercentile inversion.
+        ``"loglinear"`` is the moment-preserving maximum-likelihood
+        log-linear presmoother of :func:`kernel_equating` (degree 4, lower
+        for short distributions); ``"kernel"`` is Gaussian smoothing of the
+        discrete distribution.
     linking_result : LinkingResult | None
         Constants mapping new abilities onto the old/reference scale as
         ``theta_old = A * theta_new + B``. The same reference population weights
@@ -386,6 +398,142 @@ def _numpy_score_distribution(
     return current @ weights
 
 
+def _interior_true_scores(
+    model_old: "BaseItemModel",
+    model_new: "BaseItemModel",
+    old_item_indices: NDArray[np.intp],
+    new_item_indices: NDArray[np.intp],
+    targets: NDArray[np.float64],
+    theta_grid: NDArray[np.float64],
+    search_old: NDArray[np.float64],
+    expected_old: NDArray[np.float64],
+    expected_new: NDArray[np.float64],
+    linking_result: LinkingResult | None,
+) -> NDArray[np.float64]:
+    """Equate old scores strictly inside the old curve's limits.
+
+    Local inverse interpolation of the validated search grid seeds each
+    ability: degree 7 on the evenly spaced reporting grid, where one curve
+    evaluation usually confirms the root, and cubic in the log distance to
+    the curve's limit on its geometric extension. Where the reporting grid
+    resolves the local new-to-old slope ratio, a root may keep a residual of
+    ``1e-10`` relative to its score, divided by that ratio when it exceeds
+    one, and the new score is corrected to first order by the residual times
+    the ratio, leaving an error at rounding level. Other roots are solved to
+    rounding level directly.
+    """
+    bracket = np.searchsorted(expected_old, targets, side="left")
+    first = int(np.searchsorted(search_old, theta_grid[0]))
+    last = first + len(theta_grid) - 1
+    uniform = (bracket - 1 >= first) & (bracket <= last)
+    uniform &= len(theta_grid) >= _UNIFORM_NODES
+    # Below and above the reporting grid the curve approaches its limits
+    # roughly exponentially, so ability is close to linear in the log gap.
+    lower_limit, upper_limit = expected_old[0], expected_old[-1]
+    lower_tail = ~uniform & (bracket <= first)
+    upper_tail = ~uniform & (bracket - 1 >= last)
+    middle = ~(uniform | lower_tail | upper_tail)
+    inner = (1, len(search_old) - 2)
+    groups = (
+        (uniform, _local_nodes(bracket, first, last, _UNIFORM_NODES), None),
+        (lower_tail, _local_nodes(bracket, *inner, 4), "lower"),
+        (upper_tail, _local_nodes(bracket, *inner, 4), "upper"),
+        (middle, _local_nodes(bracket, 0, len(search_old) - 1, 4), None),
+    )
+
+    def gap(values: NDArray[np.float64], tail: str | None) -> NDArray[np.float64]:
+        if tail == "lower":
+            return np.log(values - lower_limit)
+        if tail == "upper":
+            return -np.log(upper_limit - values)
+        return values
+
+    def inverse(
+        values: NDArray[np.float64], rows: NDArray[np.intp]
+    ) -> NDArray[np.float64]:
+        result = np.empty(len(rows), dtype=np.float64)
+        with np.errstate(all="ignore"):
+            for members, nodes, tail in groups:
+                selected = members[rows]
+                if not np.any(selected):
+                    continue
+                row_nodes = nodes[rows[selected]]
+                weights = _lagrange_weights(
+                    gap(expected_old[row_nodes], tail), gap(values[selected], tail)
+                )
+                result[selected] = np.sum(weights * search_old[row_nodes], axis=1)
+        return result
+
+    # Relaxed roots are corrected by the local new-to-old slope ratio, so
+    # they are allowed only where that ratio is well resolved: its degree-7
+    # and degree-5 estimates at the bracket agree to 1e-6.
+    fine_nodes = groups[0][1]
+    candidates = np.flatnonzero(uniform)
+    midpoints = 0.5 * (
+        search_old[bracket[candidates] - 1] + search_old[bracket[candidates]]
+    )
+    coarse_nodes = _local_nodes(bracket[candidates], first, last, _UNIFORM_NODES - 2)
+    with np.errstate(all="ignore"):
+        fine = _slope_ratio(
+            search_old, expected_old, expected_new, fine_nodes[candidates], midpoints
+        )
+        coarse = _slope_ratio(
+            search_old, expected_old, expected_new, coarse_nodes, midpoints
+        )
+        resolved = np.abs(fine - coarse) <= _RATIO_AGREEMENT * np.abs(fine)
+    relaxed = np.zeros(len(targets), dtype=bool)
+    relaxed[candidates[resolved]] = True
+    scale = np.maximum(np.abs(targets), 1.0)
+    tolerance = 4.0 * np.finfo(np.float64).eps * scale
+    tolerance[relaxed] = np.maximum(
+        tolerance[relaxed],
+        _ROOT_RELATIVE_TOLERANCE
+        * scale[relaxed]
+        / np.maximum(np.abs(fine[resolved]), 1.0),
+    )
+    roots, residuals = _solve_bracketed(
+        _expected_score_evaluator(model_old, old_item_indices),
+        targets,
+        search_old[bracket - 1],
+        search_old[bracket],
+        expected_old[bracket - 1],
+        expected_old[bracket],
+        inverse=inverse,
+        value_tolerance=tolerance,
+    )
+    scores = _expected_score_evaluator(model_new, new_item_indices)(
+        _new_scale_theta(roots, linking_result)
+    )
+    with np.errstate(all="ignore"):
+        ratio = _slope_ratio(
+            search_old,
+            expected_old,
+            expected_new,
+            fine_nodes[relaxed],
+            roots[relaxed],
+        )
+    finite = np.isfinite(ratio)
+    corrected = np.flatnonzero(relaxed)[finite]
+    scores[corrected] -= residuals[corrected] * ratio[finite]
+    return scores
+
+
+def _slope_ratio(
+    grid: NDArray[np.float64],
+    old_curve: NDArray[np.float64],
+    new_curve: NDArray[np.float64],
+    nodes: NDArray[np.intp],
+    points: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """New-to-old curve slope ratio from local interpolants at ``points``."""
+    weights = _lagrange_weights(grid[nodes], points, derivative=True)
+    return np.asarray(
+        np.sum(weights * new_curve[nodes], axis=1)
+        / np.sum(weights * old_curve[nodes], axis=1),
+        dtype=np.float64,
+    )
+
+
 def _new_scale_theta(
     theta: NDArray[np.float64], linking_result: LinkingResult | None
 ) -> NDArray[np.float64]:
@@ -431,7 +579,7 @@ def _true_score_search_abilities(
     lower, upper = float(theta_grid[0]), float(theta_grid[-1])
     half_width = max(0.5 * upper - 0.5 * lower, 1.0)
     with np.errstate(over="ignore", invalid="ignore"):
-        offsets = half_width * np.exp2(np.arange(1.0, _TCC_SEARCH_DOUBLINGS + 1.0))
+        offsets = half_width * np.exp2(_TCC_SEARCH_POWERS)
         theta_old = np.concatenate((lower - offsets[::-1], theta_grid, upper + offsets))
     theta_new = _unchecked_new_scale_theta(theta_old, linking_result)
     keep = np.isfinite(theta_old) & np.isfinite(theta_new)
@@ -453,6 +601,95 @@ def _extreme_expected_scores(
         return _compute_expected_scores(model, theta, item_indices)
 
 
+def _expected_score_evaluator(
+    model: "BaseItemModel", item_indices: NDArray[np.intp]
+) -> Callable[[NDArray[np.float64]], NDArray[np.float64]]:
+    """Return a lean expected-score function for repeated root-finding calls.
+
+    Like :func:`_compute_expected_scores`, it reads only the selected items
+    and the observed categories, so other items' curves cannot affect the
+    scores, and it rejects probabilities outside [0, 1]. The selection and
+    category scores are reused across calls, and the shape, clipping, and
+    category-sum checks are left to the caller's validation of the curves.
+    """
+    # A full selection in model order needs no gather.
+    selection = (
+        None if np.array_equal(item_indices, np.arange(model.n_items)) else item_indices
+    )
+    if model.is_polytomous:
+        counts = np.asarray(getattr(model, "n_categories"), dtype=np.intp)
+        counts = counts[item_indices]
+        width = int(np.max(counts))
+        observed = np.arange(width) < counts[:, None]
+        padded = not np.all(observed)
+        scores = np.where(observed, np.arange(width, dtype=np.float64), 0.0).ravel()
+    else:
+        scores = np.ones(len(item_indices), dtype=np.float64)
+
+    def evaluate(theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        with np.errstate(over="ignore"):
+            probabilities = np.asarray(
+                model.probability(theta[:, None]), dtype=np.float64
+            )
+        if selection is not None:
+            probabilities = probabilities[:, selection]
+        if model.is_polytomous:
+            if probabilities.shape[2] != width:
+                probabilities = probabilities[:, :, :width]
+            if padded:
+                probabilities = np.where(observed, probabilities, 0.0)
+            probabilities = probabilities.reshape(len(theta), -1)
+        _check_probability_range(probabilities)
+        return np.asarray(probabilities @ scores, dtype=np.float64)
+
+    return evaluate
+
+
+def _lagrange_weights(
+    nodes: NDArray[np.float64], points: NDArray[np.float64], derivative: bool = False
+) -> NDArray[np.float64]:
+    """Row-wise Lagrange basis values, or their derivatives, at ``points``.
+
+    The basis polynomial of node ``j`` is
+    ``L_j(x) = prod_{k != j} (x - x_k) / (x_j - x_k)``, with derivative
+    ``L_j(x) * sum_{k != j} 1 / (x - x_k)`` away from the nodes. At a node
+    the derivative sums the products that also leave out one ``m != j``.
+    Coincident nodes give non-finite weights, which callers reject.
+    """
+    diagonal = np.eye(nodes.shape[1], dtype=bool)
+    offsets = points[:, None] - nodes
+    with np.errstate(all="ignore"):
+        gaps = nodes[:, :, None] - nodes[:, None, :]
+        denominators = np.prod(np.where(diagonal, 1.0, gaps), axis=2)
+        numerators = np.prod(np.where(diagonal, 1.0, offsets[:, None, :]), axis=2)
+        values = numerators / denominators
+        if not derivative:
+            return np.asarray(values, dtype=np.float64)
+        reciprocal = 1.0 / offsets
+        slopes = values * (np.sum(reciprocal, axis=1, keepdims=True) - reciprocal)
+        at_node = np.flatnonzero(np.any(offsets == 0.0, axis=1))
+        if at_node.size:
+            # Axes (j, m, k): leave out k == j and k == m, then sum over m != j.
+            left_out = diagonal[:, None, :] | diagonal[None, :, :]
+            products = np.prod(
+                np.where(left_out, 1.0, offsets[at_node, None, None, :]), axis=3
+            )
+            slopes[at_node] = (
+                np.sum(np.where(diagonal, 0.0, products), axis=2)
+                / denominators[at_node]
+            )
+        return np.asarray(slopes, dtype=np.float64)
+
+
+def _local_nodes(
+    bracket: NDArray[np.intp], first: int, last: int, count: int
+) -> NDArray[np.intp]:
+    """``count`` indices in ``[first, last]`` centered on each bracket."""
+    width = min(last - first + 1, count)
+    start = np.clip(bracket - width // 2, first, last - width + 1)
+    return start[:, None] + np.arange(width)
+
+
 def _bracketed_root(
     function: Callable[[NDArray[np.float64]], NDArray[np.float64]],
     targets: NDArray[np.float64],
@@ -467,28 +704,81 @@ def _bracketed_root(
     false-position steps converge superlinearly. A bracket that has not halved
     within three steps is bisected, which bounds the worst case.
     """
+    roots, _ = _solve_bracketed(
+        function, targets, lower, upper, value_lower, value_upper
+    )
+    return roots
+
+
+def _solve_bracketed(
+    function: Callable[[NDArray[np.float64]], NDArray[np.float64]],
+    targets: NDArray[np.float64],
+    lower: NDArray[np.float64],
+    upper: NDArray[np.float64],
+    value_lower: NDArray[np.float64],
+    value_upper: NDArray[np.float64],
+    *,
+    inverse: Callable[[NDArray[np.float64], NDArray[np.intp]], NDArray[np.float64]]
+    | None = None,
+    value_tolerance: NDArray[np.float64] | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return bracketed roots and ``function(root) - target`` at them.
+
+    Without ``inverse`` this is :func:`_bracketed_root`. With an approximate
+    inverse ``inverse(values, rows)`` for the targets ``rows``, the first
+    step evaluates its estimate of each root, the second removes the
+    inverse's error at that point, and later steps are secants through the
+    last two points. Steps that leave the bracket fall back to false
+    position; every third step bisects when the residual (with an inverse)
+    or the bracket (without) has not halved. ``value_tolerance`` defaults to
+    four rounding units of each target.
+    """
     lower = np.array(lower, dtype=np.float64)
     upper = np.array(upper, dtype=np.float64)
     excess_lower = np.asarray(value_lower, dtype=np.float64) - targets
     excess_upper = np.asarray(value_upper, dtype=np.float64) - targets
     roots = upper.copy()
+    excess_at_roots = excess_upper.copy()
+    earlier_roots = np.full(len(targets), np.nan)
+    earlier_excess = np.full(len(targets), np.nan)
     replaced = np.zeros(len(targets), dtype=np.int8)
-    reference_width = upper - lower
-    value_tolerance = 4.0 * np.finfo(np.float64).eps * np.maximum(np.abs(targets), 1.0)
+    # One-sided secant steps shrink the residual while the bracket may not.
+    reference = np.full(len(targets), np.inf) if inverse is not None else upper - lower
+    if value_tolerance is None:
+        value_tolerance = (
+            4.0 * np.finfo(np.float64).eps * np.maximum(np.abs(targets), 1.0)
+        )
     active = np.flatnonzero(excess_upper > value_tolerance)
     for iteration in range(_ROOT_MAX_ITERATIONS):
         if active.size == 0:
             break
         a, b = lower[active], upper[active]
         fa, fb = excess_lower[active], excess_upper[active]
-        midpoint = 0.5 * a + 0.5 * b
         with np.errstate(all="ignore"):
-            candidate = a + fa / (fa - fb) * (b - a)
+            false_position = a + fa / (fa - fb) * (b - a)
+            if inverse is None:
+                candidate = false_position
+            elif iteration == 0:
+                candidate = inverse(targets[active], active)
+            elif iteration == 1:
+                # Newton-like step with the inverse's slope near the root.
+                candidate = roots[active] - (
+                    inverse(targets[active] + excess_at_roots[active], active)
+                    - inverse(targets[active], active)
+                )
+            else:
+                candidate = roots[active] - excess_at_roots[active] * (
+                    roots[active] - earlier_roots[active]
+                ) / (excess_at_roots[active] - earlier_excess[active])
+        candidate = np.where(
+            (candidate > a) & (candidate < b), candidate, false_position
+        )
         unusable = ~((candidate > a) & (candidate < b))
         if iteration % 3 == 2:
-            unusable |= b - a > 0.5 * reference_width[active]
-            reference_width[active] = b - a
-        candidate[unusable] = midpoint[unusable]
+            progress = np.abs(excess_at_roots[active]) if inverse is not None else b - a
+            unusable |= progress > 0.5 * reference[active]
+            reference[active] = progress
+        candidate[unusable] = 0.5 * a[unusable] + 0.5 * b[unusable]
         excess = function(candidate) - targets[active]
 
         rises = excess >= 0.0
@@ -503,7 +793,10 @@ def _bracketed_root(
         excess_lower[active[stale_lower]] *= 0.5
         excess_upper[active[stale_upper]] *= 0.5
         replaced[active] = side
+        earlier_roots[active] = roots[active]
+        earlier_excess[active] = excess_at_roots[active]
         roots[active] = candidate
+        excess_at_roots[active] = excess
 
         width = upper[active] - lower[active]
         scale = np.maximum(
@@ -515,7 +808,7 @@ def _bracketed_root(
         converged |= candidate == a
         converged |= candidate == b
         active = active[~converged]
-    return roots
+    return roots, excess_at_roots
 
 
 def _normalize_score_distribution(
@@ -584,7 +877,11 @@ def equipercentile_equating(
     score_dist_new : NDArray
         Score distribution for new form P(Y=y).
     smoothing : str
-        Smoothing method: "none", "loglinear", or "kernel".
+        Smoothing method: "none", "loglinear", or "kernel". ``"loglinear"``
+        fits the maximum-likelihood polynomial log-linear model of degree 4,
+        which preserves the first four moments. Distributions with fewer than
+        six scores, or fewer than five with positive probability, use the
+        highest degree they support.
 
     Returns
     -------
@@ -813,9 +1110,12 @@ def _polytomous_probabilities(
 
 def _check_probability_range(probabilities: NDArray[np.float64]) -> None:
     """Reject non-finite values or values outside [0, 1] beyond rounding."""
-    if not np.all(np.isfinite(probabilities)) or np.any(
-        (probabilities < -_PROBABILITY_TOLERANCE)
-        | (probabilities > 1.0 + _PROBABILITY_TOLERANCE)
+    if probabilities.size == 0:
+        return
+    # NaN propagates through min and max, and infinities fall outside.
+    if not (
+        np.min(probabilities) >= -_PROBABILITY_TOLERANCE
+        and np.max(probabilities) <= 1.0 + _PROBABILITY_TOLERANCE
     ):
         raise ValueError("model returned probabilities outside [0, 1]")
 
@@ -876,26 +1176,20 @@ def _invert_expected_scores(
 def _loglinear_smooth(
     dist: NDArray[np.float64], degree: int = 4
 ) -> NDArray[np.float64]:
-    """Apply log-linear smoothing to score distribution."""
-    n = len(dist)
-    if n == 1:
-        return dist.copy()
-    scores = np.linspace(-1.0, 1.0, n)
-    degree = min(degree, n - 1)
+    """Fit the maximum-likelihood polynomial log-linear model to a distribution.
 
-    dist = np.maximum(dist, 1e-10)
-    log_dist = np.log(dist)
+    This is the presmoother of kernel equating (Holland and Thayer, 2000):
+    the fit preserves the first ``degree`` moments. The degree is lowered
+    below the number of scores with positive probability and below
+    ``len(dist) - 1``; distributions too short to smooth are returned as
+    they are.
+    """
+    from mirt.equating.kernel import _fit_loglinear, _polynomial_design
 
-    design = np.vander(scores, N=degree + 1, increasing=True)
-
-    try:
-        coeffs = np.linalg.lstsq(design, log_dist, rcond=None)[0]
-        fitted = design @ coeffs
-        smoothed = np.exp(fitted - np.max(fitted))
-    except np.linalg.LinAlgError:
-        return dist
-
-    return np.asarray(smoothed / np.sum(smoothed), dtype=np.float64)
+    degree = min(degree, len(dist) - 2, int(np.count_nonzero(dist)) - 1)
+    if degree < 1:
+        return np.array(dist, dtype=np.float64, copy=True)
+    return _fit_loglinear(dist, _polynomial_design(dist, degree))
 
 
 def _kernel_smooth(

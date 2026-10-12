@@ -267,3 +267,99 @@ class TestLLTMRecovery:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _lltm_responses(seed, n_persons, features, weights, slope):
+    rng = np.random.default_rng(seed)
+    difficulty = features @ weights
+    theta = rng.standard_normal(n_persons)
+    probability = 1.0 / (1.0 + np.exp(-slope * (theta[:, None] - difficulty[None, :])))
+    return (rng.random(probability.shape) < probability).astype(int)
+
+
+class TestExplanatoryEstimation:
+    """EM estimates the shared feature weights and common slope."""
+
+    def test_em_reaches_the_marginal_maximum_of_the_rasch_lltm(self):
+        from scipy.optimize import minimize
+        from scipy.special import expit, logsumexp
+
+        from mirt.estimation.em import EMEstimator
+
+        rng = np.random.default_rng(0)
+        features = np.column_stack([np.ones(8), rng.integers(0, 3, 8)])
+        responses = _lltm_responses(1, 600, features, np.array([-0.5, 0.6]), 1.3)
+        estimator = EMEstimator(tol=1e-7)
+        model = LLTM(8, features)
+
+        result = estimator.fit(model, responses)
+
+        # Direct maximization of the marginal likelihood on EM's quadrature.
+        nodes = estimator._quadrature.nodes[:, 0]
+        log_mass = estimator._latent_density.log_quadrature_mass(
+            estimator._quadrature.nodes, estimator._quadrature.weights
+        )
+
+        def negative_log_likelihood(vector):
+            difficulty = features @ vector[1:]
+            probability = expit(np.exp(vector[0]) * (nodes[:, None] - difficulty))
+            probability = np.clip(probability, 1e-10, 1 - 1e-10)
+            joint = responses @ np.log(probability).T
+            joint += (1 - responses) @ np.log1p(-probability).T
+            return -logsumexp(joint + log_mass, axis=1).sum()
+
+        reference = minimize(negative_log_likelihood, np.zeros(3), method="BFGS")
+        assert result.converged
+        assert result.n_parameters == 3
+        np.testing.assert_allclose(result.log_likelihood, -reference.fun, atol=1e-3)
+        np.testing.assert_allclose(model.feature_weights, reference.x[1:], atol=5e-3)
+        np.testing.assert_allclose(
+            model.discrimination, np.exp(reference.x[0]), atol=5e-3
+        )
+        errors = result.standard_errors
+        assert np.all(errors["feature_weights"] > 0)
+        np.testing.assert_array_equal(
+            errors["discrimination"], errors["discrimination"][0]
+        )
+
+    @pytest.mark.parametrize("family", ["free-slope", "Rasch", "explanatory"])
+    def test_em_moves_the_feature_weights_of_every_family(self, family):
+        from mirt.estimation.em import EMEstimator
+
+        features = np.column_stack([np.ones(6), [0, 1, 2, 0, 1, 2]])
+        weights = np.array([-0.5, 0.6])
+        responses = _lltm_responses(2, 500, features, weights, 1.0)
+        model = {
+            "free-slope": lambda: LLTM(6, features, constrain_discrimination=False),
+            "Rasch": lambda: RaschLLTM(6, features),
+            "explanatory": lambda: ExplanatoryIRT(6, features, 1),
+        }[family]()
+
+        result = EMEstimator().fit(model, responses)
+
+        assert result.converged
+        np.testing.assert_allclose(model.feature_weights, weights, atol=0.25)
+
+    def test_estimators_without_a_shared_step_refuse_feature_weights(self):
+        from mirt.estimation.mcem import MCEMEstimator
+        from mirt.exceptions import MirtModelError
+
+        features = np.column_stack([np.ones(4), [0, 1, 2, 3]])
+        responses = np.random.default_rng(0).integers(0, 2, (30, 4))
+        with pytest.raises(MirtModelError, match="feature_weights"):
+            MCEMEstimator(max_iter=2).fit(LLTM(4, features), responses)
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("LLTMResult", 8),
+        ("LatentRegressionResult", 9),
+        ("ExplanatoryIRTResult", 12),
+    ],
+)
+def test_unused_result_classes_are_deprecated(name, arguments):
+    import mirt.models.explanatory as explanatory
+
+    with pytest.warns(DeprecationWarning, match=f"{name} is deprecated"):
+        getattr(explanatory, name)(*([0.0] * arguments))

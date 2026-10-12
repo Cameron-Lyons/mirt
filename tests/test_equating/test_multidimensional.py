@@ -279,6 +279,93 @@ class TestLinkMirt:
         )
         np.testing.assert_allclose(result.translation, KNOWN_SHIFT, atol=1e-12)
 
+    def test_default_oblique_link_recovers_exact_metric_difference(self):
+        """Error-free anchors need the unrestricted fit, not a ridge (was 0.134)."""
+        rng = np.random.default_rng(4)
+        slopes = np.abs(rng.normal(1.0, 0.4, (20, 2)))
+        slopes[:10, 1] *= 0.2
+        slopes[10:, 0] *= 0.2
+        intercepts = rng.normal(0.0, 1.0, 20)
+        metric = np.array([[1.3, 0.0], [0.5, 0.8]])
+        target = make_model(slopes, intercepts)
+        source = make_model(
+            slopes @ metric, intercepts + slopes @ np.array([0.4, -0.3])
+        )
+
+        result = link_mirt(
+            target, source, list(range(20)), list(range(20)), rotation="oblique"
+        )
+
+        assert result.rmse == pytest.approx(0.0, abs=1e-12)
+        assert result.intercept_rmse == pytest.approx(0.0, abs=1e-12)
+        np.testing.assert_allclose(
+            result.scaling * result.rotation_matrix, np.linalg.inv(metric), atol=1e-12
+        )
+        assert oblique_procrustes_rotation(slopes, slopes @ metric)[2] == (
+            pytest.approx(0.0, abs=1e-12)
+        )
+
+    @pytest.mark.parametrize(
+        ("family", "location_name"), [("GRM", "thresholds"), ("GPCM", "steps")]
+    )
+    @pytest.mark.parametrize("rotation", ["orthogonal", "oblique"])
+    def test_supports_multidimensional_polytomous_models(
+        self, family, location_name, rotation
+    ):
+        model_class = {
+            "GRM": mirt.GradedResponseModel,
+            "GPCM": mirt.GeneralizedPartialCredit,
+        }[family]
+        categories = [3, 4, 5, 2, 4, 3]
+        source = model_class(6, categories, n_factors=2)
+        locations = np.zeros((6, 4))
+        for item, count in enumerate(categories):
+            locations[item, : count - 1] = (
+                np.linspace(-1.0, 1.2, count - 1) + 0.1 * item
+            )
+        source.set_parameters(
+            discrimination=np.abs(SOURCE_SLOPES), **{location_name: locations}
+        )
+        rotation_matrix = (
+            KNOWN_ROTATION
+            if rotation == "orthogonal"
+            else np.array([[1.1, 0.3], [-0.2, 0.9]]) / KNOWN_SCALE
+        )
+        target = transform_mirt_parameters(
+            source, rotation_matrix, KNOWN_SHIFT, KNOWN_SCALE
+        )
+
+        result = link_mirt(
+            target, source, list(range(6)), list(range(6)), rotation=rotation
+        )
+
+        assert result.rmse == pytest.approx(0.0, abs=1e-12)
+        assert result.intercept_rmse == pytest.approx(0.0, abs=1e-12)
+        assert result.transformed_intercepts.shape == (6, 4)
+        linked = transform_mirt_parameters(
+            source, result.rotation_matrix, result.translation, result.scaling
+        )
+        theta = np.array([[-1.3, 0.7], [0.2, -1.2], [1.5, 0.6]])
+        np.testing.assert_allclose(
+            linked.probability(theta), target.probability(theta), atol=1e-12
+        )
+        np.testing.assert_allclose(
+            linked.parameters[location_name], target.parameters[location_name]
+        )
+        fit = compute_mirt_linking_fit(
+            target, source, list(range(6)), list(range(6)), result
+        )
+        assert fit["intercept_rmse"] == pytest.approx(0.0, abs=1e-12)
+
+    def test_polytomous_anchor_categories_must_match(self):
+        target = mirt.GradedResponseModel(6, [3, 4, 5, 2, 4, 3], n_factors=2)
+        source = mirt.GradedResponseModel(6, 4, n_factors=2)
+        for model in (target, source):
+            model.set_parameters(discrimination=np.abs(SOURCE_SLOPES))
+
+        with pytest.raises(ValueError, match="same number of categories"):
+            link_mirt(target, source, [0, 1, 2], [0, 1, 2])
+
     def test_supports_multidimensional_2pl_parameterization(self):
         source = TwoParameterLogistic(n_items=6, n_factors=2)
         source.set_parameters(
@@ -416,6 +503,34 @@ class TestParameterAndThetaTransforms:
             linked.probability(linked_theta), source.probability(theta), atol=1e-13
         )
 
+    @pytest.mark.parametrize("family", ["GRM", "GPCM"])
+    def test_polytomous_transform_round_trip_preserves_probabilities(self, family):
+        model_class = {
+            "GRM": mirt.GradedResponseModel,
+            "GPCM": mirt.GeneralizedPartialCredit,
+        }[family]
+        rng = np.random.default_rng(31)
+        source = model_class(8, [3, 4, 5, 4] * 2, n_factors=2)
+        locations = np.sort(rng.normal(0.0, 1.0, (8, 4)), axis=1)
+        source.set_parameters(
+            discrimination=rng.uniform(0.4, 1.6, (8, 2)),
+            **{"thresholds" if family == "GRM" else "steps": locations},
+        )
+        rotation = np.array([[0.9, 0.3], [-0.2, 1.1]])
+        theta = rng.normal(size=(7, 2))
+
+        linked = transform_mirt_parameters(source, rotation, KNOWN_SHIFT, 1.2)
+        linked_theta = transform_mirt_theta(theta, rotation, KNOWN_SHIFT, 1.2)
+        restored = transform_mirt_parameters(
+            linked, np.linalg.inv(rotation), -(rotation @ KNOWN_SHIFT) / 1.2, 1 / 1.2
+        )
+
+        np.testing.assert_allclose(
+            linked.probability(linked_theta), source.probability(theta), atol=1e-13
+        )
+        for name, values in source.parameters.items():
+            np.testing.assert_allclose(restored.parameters[name], values, atol=1e-12)
+
     def test_theta_vector_preserves_dimensionality(self):
         theta = np.array([0.2, -0.7])
         transformed = transform_mirt_theta(
@@ -544,22 +659,59 @@ class TestTargetRotation:
         assert target[0, 1] == pytest.approx(0.0, abs=1e-12)
         assert target[1, 0] == pytest.approx(0.0, abs=1e-12)
 
-    def test_oblique_rotation_recovers_general_transform(self):
-        transform = np.array([[1.1, 0.3], [-0.2, 0.8]])
+    def test_oblique_rotation_recovers_unit_variance_oblique_rotation(self):
+        # Unit-length columns of T_q define correlated unit-variance factors.
+        angles = np.array([0.3, 1.2])
+        factor_axes = np.vstack([np.cos(angles), np.sin(angles)])
+        transform = np.linalg.inv(factor_axes).T
         target = SOURCE_SLOPES @ transform
 
         rotated, rotation = target_rotation(
-            SOURCE_SLOPES, target, rotation_type="oblique"
+            SOURCE_SLOPES, target, rotation_type="oblique", tol=1e-12
         )
 
-        np.testing.assert_allclose(rotation, transform, atol=1e-12)
-        np.testing.assert_allclose(rotated, target, atol=1e-12)
+        np.testing.assert_allclose(rotation, transform, atol=1e-9)
+        np.testing.assert_allclose(rotated, target, atol=1e-9)
+
+    def test_oblique_rotation_matches_gparotation_target_q(self):
+        """Loadings and factor correlation of GPArotation::targetQ (2026.8-2)."""
+        rng = np.random.default_rng(0)
+        loadings = rng.normal(0.0, 0.6, (10, 2)) + np.array(
+            [[1.0, 0.2]] * 5 + [[0.3, 1.0]] * 5
+        )
+        target = np.array([[1.0, 0.0]] * 5 + [[0.0, 1.0]] * 5)
+        expected = np.array(
+            [
+                [1.0939241519, -0.1360813751],
+                [1.4176044348, -0.0694545039],
+                [0.7205476012, 0.2491064098],
+                [1.8635293174, 0.3329370360],
+                [0.5322245747, -0.6866031792],
+                [0.0165759767, 1.0248783882],
+                [-1.0257117160, 1.1133442524],
+                [-0.4009499569, 0.6571198927],
+                [0.0452577339, 0.8027232026],
+                [0.6953828235, 1.4682713991],
+            ]
+        )
+
+        rotated, rotation = target_rotation(
+            loadings, target, rotation_type="oblique", max_iter=10_000, tol=1e-10
+        )
+
+        np.testing.assert_allclose(rotated, expected, atol=1e-8)
+        inverse = np.linalg.inv(rotation)
+        np.testing.assert_allclose(
+            inverse @ inverse.T,
+            [[1.0, 0.147933531467], [0.147933531467, 1.0]],
+            atol=1e-9,
+        )
 
     @pytest.mark.parametrize(
         ("A", "T", "rotation_type", "match"),
         [
             (np.ones((4, 2)), np.ones((4, 2)), "orthogonal", "full column rank"),
-            (np.eye(2), np.ones((2, 2)), "oblique", "singular"),
+            (np.ones((4, 2)), np.ones((4, 2)), "oblique", "full column rank"),
             (np.eye(2), np.ones((3, 2)), "orthogonal", "same shape"),
             (np.eye(2), np.eye(2), "invalid", "rotation_type"),
         ],

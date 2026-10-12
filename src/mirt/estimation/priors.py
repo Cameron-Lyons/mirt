@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import special, stats
+from scipy import special
 
 _LOG_TWO_PI = float(np.log(2.0 * np.pi))
 _GRADIENT_STEP = 1e-6
@@ -234,6 +234,10 @@ class TruncatedNormalPrior(Prior):
 
         a = (lower_value - mu_value) / sigma_value
         b = (upper_value - mu_value) / sigma_value
+        # scipy.stats takes a tenth of a second to import, so only this
+        # prior loads it.
+        from scipy import stats
+
         self._dist = stats.truncnorm(a, b, loc=mu_value, scale=sigma_value)
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:

@@ -1,6 +1,13 @@
 """Sample datasets for IRT analysis.
 
-This module provides classic IRT datasets commonly used in psychometric research.
+``LSAT6`` and ``LSAT7`` are the published Law School Admission Test pattern
+tables of Bock and Lieberman (1970), identical to the datasets of R's ltm and
+mirt packages. Every other dataset is a simulated stand-in, not the R mirt
+data or the original study data of the same name: its size and coding differ
+(see each loader and ``describe_dataset``), and it carries ``"simulated":
+True`` and its generating parameters. Code ported from R, such as
+``key2binary(SAT12, key)``, does not apply to these stand-ins.
+
 Dataset prototypes are generated once per process and copied on demand so repeated
 loads remain fast without sharing mutable response matrices between callers.
 """
@@ -100,18 +107,30 @@ def load_dataset(name: str, *, copy: bool = True) -> dict[str, Any]:
     Parameters
     ----------
     name : str
-        Name of the dataset. Available datasets:
-        - 'LSAT6': Law School Admission Test, Section 6 (1000 x 5)
-        - 'LSAT7': Law School Admission Test, Section 7 (1000 x 5)
-        - 'SAT12': Scholastic Assessment Test items (500 x 12)
-        - 'Science': Science assessment (500 x 25)
-        - 'verbal_aggression': Verbal Aggression rating scale (316 x 24)
-        - 'fraction_subtraction': Fraction subtraction skills (536 x 20)
-        - 'ASVAB': Armed Services Vocational Aptitude Battery (1000 x 25)
-        - 'Attitude': Attitude scale (500 x 10)
-        - 'Bock1997': Bock (1997) nominal response data (1000 x 5)
-        - 'deAyala': de Ayala GPCM example data (500 x 10)
-        - 'SLF': Science Literacy Foundation data (500 x 15)
+        Name of the dataset. Two datasets are published data:
+
+        - 'LSAT6': Law School Admission Test, Section 6 (1000 x 5, binary)
+        - 'LSAT7': Law School Admission Test, Section 7 (1000 x 5, binary)
+
+        The others are simulated stand-ins, not the R mirt data (or the
+        original study data) of the same name, with different sizes and
+        coding:
+
+        - 'SAT12': 500 x 12 binary 2PL responses; R mirt's SAT12 is
+          600 x 32 unscored multiple-choice responses (1-5, 8 = missing)
+        - 'Science': 500 x 25 binary 2PL responses; R mirt's Science is
+          392 x 4 Likert responses (1-4)
+        - 'verbal_aggression': 316 x 24 graded responses (0-2)
+        - 'fraction_subtraction': 536 x 20 binary DINA responses with a
+          5-attribute Q-matrix
+        - 'ASVAB': 1000 x 25 binary responses from a 4-factor model
+        - 'Attitude': 500 x 10 graded responses (0-4)
+        - 'Bock1997': 1000 x 5 nominal responses (0-3); R mirt's Bock1997
+          is a 3-item nominal table (1-4) of 2000 respondents
+        - 'deAyala': 500 x 10 GPCM responses (0-2 to 0-4); R mirt's deAyala
+          is a 5-item binary table of 19601 respondents
+        - 'SLF': 500 x 15 binary bifactor responses; R mirt's SLF (Social
+          Life Feelings) is a 5-item binary table of 1490 respondents
     copy : bool, default=True
         Return independent, writable copies of array values. Set to False to share
         cached array storage through read-only views, which minimizes allocations
@@ -121,11 +140,14 @@ def load_dataset(name: str, *, copy: bool = True) -> dict[str, Any]:
     -------
     dict
         Dictionary containing:
+
         - 'data': Response matrix (NDArray)
         - 'description': Dataset description
         - 'n_persons': Number of respondents
         - 'n_items': Number of items
         - 'source': Citation/reference
+        - 'simulated': True for the simulated stand-ins, whose
+          'description' starts with "Simulated stand-in"
         - Additional metadata depending on dataset
     """
     canonical_name = _resolve_dataset_name(name)
@@ -165,7 +187,13 @@ def describe_dataset(name: str) -> dict[str, Any]:
 
 
 def list_datasets() -> list[str]:
-    """List available dataset names in stable display order."""
+    """List available dataset names in stable display order.
+
+    Only ``LSAT6`` and ``LSAT7`` are published data. The other names are
+    simulated stand-ins, not the R mirt data of the same name: their sizes
+    and coding differ, as ``describe_dataset(name)["description"]`` states,
+    and their metadata carry ``"simulated": True``.
+    """
     return list(_DATASET_LOADERS.keys())
 
 
@@ -181,9 +209,9 @@ def _inverse_cdf_sample(
 
 
 def _load_lsat6() -> dict[str, Any]:
-    """LSAT Section 6 data from Bock & Lieberman (1970).
+    """LSAT Section 6 data (Bock & Lieberman, 1970; Thissen, 1982).
 
-    5 binary items from the Law School Admission Test.
+    5 binary items from the Law School Admission Test, 1000 examinees.
     Classic dataset used in IRT literature.
     """
     patterns = np.array(
@@ -224,41 +252,12 @@ def _load_lsat6() -> dict[str, Any]:
         dtype=np.int_,
     )
 
+    # Bock & Lieberman (1970) LSAT Section 6 pattern counts (1000 examinees),
+    # as distributed with R's ltm and mirt packages. Patterns 01010 and 01100
+    # were not observed.
     frequencies = np.array(
-        [
-            3,
-            6,
-            2,
-            11,
-            1,
-            1,
-            3,
-            4,
-            1,
-            8,
-            0,
-            16,
-            3,
-            15,
-            10,
-            56,
-            0,
-            3,
-            0,
-            4,
-            1,
-            6,
-            2,
-            20,
-            3,
-            28,
-            15,
-            81,
-            16,
-            56,
-            21,
-            173,
-        ]
+        [3, 6, 2, 11, 1, 1, 3, 4, 1, 8, 0, 16, 0, 3, 2, 15]
+        + [10, 29, 14, 81, 3, 28, 15, 80, 16, 56, 21, 173, 11, 61, 28, 298]
     )
 
     data = np.repeat(patterns, frequencies, axis=0)
@@ -269,7 +268,8 @@ def _load_lsat6() -> dict[str, Any]:
         "n_persons": data.shape[0],
         "n_items": data.shape[1],
         "item_names": [f"Item{i + 1}" for i in range(5)],
-        "source": "Bock, R. D., & Lieberman, M. (1970). Fitting a response model for n dichotomously scored items. Psychometrika, 35, 179-197.",
+        "simulated": False,
+        "source": "Bock, R. D., & Lieberman, M. (1970). Fitting a response model for n dichotomously scored items. Psychometrika, 35, 179-197; Thissen, D. (1982). Marginal maximum likelihood estimation for the one-parameter logistic model. Psychometrika, 47, 175-186.",
     }
 
 
@@ -331,14 +331,18 @@ def _load_lsat7() -> dict[str, Any]:
         "n_persons": data.shape[0],
         "n_items": data.shape[1],
         "item_names": [f"Item{i + 1}" for i in range(5)],
+        "simulated": False,
         "source": "Bock, R. D., & Aitkin, M. (1981). Marginal maximum likelihood estimation of item parameters. Psychometrika, 46, 443-459.",
     }
 
 
 def _load_sat12() -> dict[str, Any]:
-    """SAT-like assessment data (simulated based on typical SAT characteristics).
+    """Simulated stand-in, not the R mirt SAT12 data.
 
-    12 binary items with varying difficulty and discrimination.
+    500 respondents by 12 binary (0/1) items drawn from a unidimensional 2PL
+    with varying difficulty and discrimination. R mirt's SAT12 holds 600
+    unscored multiple-choice responses to 32 items (options 1-5, 8 for
+    missing) that ``key2binary`` scores.
     """
     rng = np.random.default_rng(12345)
     n_persons = 500
@@ -359,21 +363,28 @@ def _load_sat12() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "SAT12: 12 binary items simulated with SAT-like characteristics",
+        "description": (
+            "Simulated stand-in, not the R mirt data: 500 x 12 binary (0/1) "
+            "responses from a 2PL. R mirt's SAT12 is 600 x 32 unscored "
+            "multiple-choice responses (1-5, 8 = missing)."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "item_names": [f"Item{i + 1}" for i in range(n_items)],
         "true_discrimination": discrimination,
         "true_difficulty": difficulty,
         "true_theta": theta,
-        "source": "Simulated data based on typical SAT item characteristics",
+        "source": "Simulated 2PL responses; not the TESTFACT SAT12 data of R mirt.",
     }
 
 
 def _load_science() -> dict[str, Any]:
-    """Science assessment data (simulated based on educational assessment).
+    """Simulated stand-in, not the R mirt Science data.
 
-    25 binary items covering various science topics.
+    500 respondents by 25 binary (0/1) items drawn from a unidimensional 2PL.
+    R mirt's Science holds 392 Likert responses (1-4) to 4 items from the
+    Euro-Barometer survey (the ltm ``Science`` data).
     """
     rng = np.random.default_rng(54321)
     n_persons = 500
@@ -390,22 +401,29 @@ def _load_science() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "Science: 25 binary items from science achievement assessment",
+        "description": (
+            "Simulated stand-in, not the R mirt data: 500 x 25 binary (0/1) "
+            "responses from a 2PL. R mirt's Science is 392 x 4 Likert "
+            "responses (1-4)."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "item_names": [f"Sci{i + 1}" for i in range(n_items)],
         "true_discrimination": discrimination,
         "true_difficulty": difficulty,
         "true_theta": theta,
-        "source": "Simulated educational assessment data",
+        "source": "Simulated 2PL responses; not the Euro-Barometer Science data of R mirt.",
     }
 
 
 def _load_verbal_aggression() -> dict[str, Any]:
-    """Verbal Aggression data based on De Boeck & Wilson (2004).
+    """Simulated stand-in for the verbal aggression data of De Boeck & Wilson (2004).
 
-    24 items measuring verbal aggression tendencies.
-    Polytomous responses: 0 = no, 1 = perhaps, 2 = yes
+    316 respondents by 24 graded items with responses 0 = no, 1 = perhaps,
+    2 = yes, drawn from a unidimensional graded response model. The sizes and
+    coding follow the original study, but the responses and the item design
+    labels are simulated and illustrative, not the original data.
     """
     rng = np.random.default_rng(98765)
     n_persons = 316
@@ -433,7 +451,12 @@ def _load_verbal_aggression() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "Verbal Aggression: 24 polytomous items (3 categories) measuring verbal aggression",
+        "description": (
+            "Simulated stand-in, not the original verbal aggression data: "
+            "316 x 24 graded responses (0 = no, 1 = perhaps, 2 = yes) from a "
+            "graded response model."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "n_categories": n_categories,
@@ -443,15 +466,17 @@ def _load_verbal_aggression() -> dict[str, Any]:
         "item_mode": modes,
         "response_labels": ["no", "perhaps", "yes"],
         "true_theta": theta,
-        "source": "Based on De Boeck, P., & Wilson, M. (2004). Explanatory Item Response Models. Springer.",
+        "source": "Simulated after De Boeck, P., & Wilson, M. (2004). Explanatory Item Response Models. Springer.",
     }
 
 
 def _load_fraction_subtraction() -> dict[str, Any]:
-    """Fraction subtraction data for cognitive diagnosis.
+    """Simulated stand-in for Tatsuoka's fraction subtraction data.
 
-    20 items testing fraction subtraction skills.
-    Includes Q-matrix for cognitive diagnosis models.
+    536 respondents by 20 binary items drawn from a DINA model with an
+    illustrative 5-attribute Q-matrix. The sizes follow Tatsuoka (1984), but
+    the responses and the Q-matrix are simulated, not the original data or
+    its 8-attribute Q-matrix.
     """
     rng = np.random.default_rng(11111)
     n_persons = 536
@@ -500,7 +525,12 @@ def _load_fraction_subtraction() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "Fraction Subtraction: 20 binary items for cognitive diagnosis",
+        "description": (
+            "Simulated stand-in, not the original fraction subtraction data: "
+            "536 x 20 binary (0/1) responses from a DINA model with a "
+            "5-attribute Q-matrix."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "n_attributes": n_attributes,
@@ -516,15 +546,15 @@ def _load_fraction_subtraction() -> dict[str, Any]:
         "true_alpha": alpha,
         "true_slip": slip,
         "true_guess": guess,
-        "source": "Based on Tatsuoka, K. K. (1984). Analysis of errors in fraction addition and subtraction problems.",
+        "source": "Simulated after Tatsuoka, K. K. (1984). Analysis of errors in fraction addition and subtraction problems.",
     }
 
 
 def _load_asvab() -> dict[str, Any]:
-    """Armed Services Vocational Aptitude Battery data.
+    """Simulated stand-in for Armed Services Vocational Aptitude Battery data.
 
-    25 binary items measuring general aptitude.
-    Classic multidimensional IRT dataset.
+    1000 respondents by 25 binary items drawn from a compensatory 4-factor
+    model with correlated factors. These are not ASVAB responses.
     """
     rng = np.random.default_rng(77777)
     n_persons = 1000
@@ -570,7 +600,11 @@ def _load_asvab() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "ASVAB: 25 binary items from Armed Services Vocational Aptitude Battery",
+        "description": (
+            "Simulated stand-in, not ASVAB data: 1000 x 25 binary (0/1) "
+            "responses from a compensatory 4-factor model."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "n_factors": n_factors,
@@ -584,9 +618,10 @@ def _load_asvab() -> dict[str, Any]:
 
 
 def _load_attitude() -> dict[str, Any]:
-    """Attitude scale data.
+    """Simulated attitude scale data.
 
-    10 items measuring general attitude with 5 response categories.
+    500 respondents by 10 graded items with 5 categories (0-4), drawn from a
+    graded response model.
     """
     rng = np.random.default_rng(88888)
     n_persons = 500
@@ -620,7 +655,11 @@ def _load_attitude() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "Attitude: 10 polytomous items (5 categories) measuring attitude",
+        "description": (
+            "Simulated stand-in: 500 x 10 graded responses (0-4) from a "
+            "graded response model."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "n_categories": n_categories,
@@ -640,10 +679,11 @@ def _load_attitude() -> dict[str, Any]:
 
 
 def _load_bock1997() -> dict[str, Any]:
-    """Bock (1997) nominal response model data.
+    """Simulated stand-in, not the R mirt Bock1997 data.
 
-    5 items with 4 nominal response categories.
-    Classic example for NRM.
+    1000 respondents by 5 items with 4 nominal categories (0-3), drawn from a
+    nominal response model. R mirt's Bock1997 is the 3-item table (categories
+    1-4, 2000 respondents) of Bock (1997, Table 3).
     """
     rng = np.random.default_rng(19970)
     n_persons = 1000
@@ -680,7 +720,12 @@ def _load_bock1997() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "Bock1997: 5 nominal response items (4 categories)",
+        "description": (
+            "Simulated stand-in, not the R mirt data: 1000 x 5 nominal "
+            "responses (0-3). R mirt's Bock1997 is a 3-item nominal table "
+            "(1-4) of 2000 respondents."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "n_categories": n_categories,
@@ -688,15 +733,16 @@ def _load_bock1997() -> dict[str, Any]:
         "true_a": a,
         "true_c": c,
         "true_theta": theta,
-        "source": "Based on Bock, R.D. (1997). The nominal categories model. In W.J. van der Linden & R.K. Hambleton (Eds.), Handbook of modern item response theory.",
+        "source": "Simulated after Bock, R.D. (1997). The nominal categories model. In W.J. van der Linden & R.K. Hambleton (Eds.), Handbook of modern item response theory.",
     }
 
 
 def _load_deayala() -> dict[str, Any]:
-    """de Ayala GPCM example data.
+    """Simulated stand-in, not the R mirt deAyala data.
 
-    10 items with varying numbers of categories (3-5).
-    Example for Generalized Partial Credit Model.
+    500 respondents by 10 items with 3 to 5 categories (coded from 0), drawn
+    from a generalized partial credit model. R mirt's deAyala is the 5-item
+    binary mathematics table of de Ayala (2009, p. 14), 19601 respondents.
     """
     rng = np.random.default_rng(99999)
     n_persons = 500
@@ -727,7 +773,12 @@ def _load_deayala() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "deAyala: 10 polytomous items for GPCM (3-5 categories)",
+        "description": (
+            "Simulated stand-in, not the R mirt data: 500 x 10 GPCM responses "
+            "with 3-5 categories (0-2 to 0-4). R mirt's deAyala is a 5-item "
+            "binary table of 19601 respondents."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "n_categories_per_item": n_cats,
@@ -740,10 +791,12 @@ def _load_deayala() -> dict[str, Any]:
 
 
 def _load_slf() -> dict[str, Any]:
-    """Science Literacy Foundation data.
+    """Simulated stand-in, not the R mirt SLF data.
 
-    15 binary items measuring scientific literacy.
-    Bifactor structure with general factor and specific factors.
+    500 respondents by 15 binary items drawn from a bifactor model with one
+    general and three specific factors; the content-area labels are
+    illustrative. R mirt's SLF is the Social Life Feelings table of
+    Bartholomew (1998): 5 binary items, 1490 respondents.
     """
     rng = np.random.default_rng(55555)
     n_persons = 500
@@ -777,7 +830,12 @@ def _load_slf() -> dict[str, Any]:
 
     return {
         "data": data,
-        "description": "SLF: 15 binary items measuring science literacy (bifactor structure)",
+        "description": (
+            "Simulated stand-in, not the R mirt data: 500 x 15 binary (0/1) "
+            "responses from a bifactor model. R mirt's SLF (Social Life "
+            "Feelings) is a 5-item binary table of 1490 respondents."
+        ),
+        "simulated": True,
         "n_persons": n_persons,
         "n_items": n_items,
         "n_specific_factors": n_specific,
@@ -788,7 +846,7 @@ def _load_slf() -> dict[str, Any]:
         "true_difficulty": difficulty,
         "true_general_theta": general,
         "true_specific_theta": specific,
-        "source": "Simulated bifactor data for science literacy assessment.",
+        "source": "Simulated bifactor responses; not the Social Life Feelings data of R mirt.",
     }
 
 

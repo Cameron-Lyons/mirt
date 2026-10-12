@@ -335,7 +335,7 @@ def test_weighted_standard_errors_match_likelihood_curvature(factory):
     model = factory(2, n_categories=[2, 4]) if poly else factory(2)
     if factory is mirt.FourParameterLogistic:
         model.set_parameters(upper=np.full(2, 0.9))
-    estimator = WeightedEMEstimator(n_quadpts=7)
+    estimator = WeightedEMEstimator(n_quadpts=7, se_method="complete_data")
     estimator._quadrature = GaussHermiteQuadrature(7)
     points = estimator._quadrature.nodes
     rng = np.random.default_rng(918)
@@ -442,9 +442,16 @@ def test_weighted_fit_reports_its_standard_error_method():
     result = WeightedEMEstimator(max_iter=50).fit(
         TwoParameterLogistic(4), responses, weights
     )
-    assert result.se_method == "complete_data"
-    assert result.vcov is None
+    assert result.se_method == "sandwich"
+    assert result.vcov.shape == (8, 8)
     assert np.all(result.standard_errors["discrimination"] > 0)
+    complete = WeightedEMEstimator(max_iter=50, se_method="complete_data").fit(
+        TwoParameterLogistic(4), responses, weights
+    )
+    assert complete.se_method == "complete_data"
+    assert complete.vcov is None
+    with pytest.raises(mirt.MirtValidationError, match="se_method"):
+        WeightedEMEstimator(se_method="louis")
 
     estimator = WeightedEMEstimator(
         max_iter=50, compute_standard_errors=False, item_optim_ftol=1e-9
@@ -455,3 +462,66 @@ def test_weighted_fit_reports_its_standard_error_method():
     assert plain.se_method is None
     with pytest.raises(mirt.MirtValidationError, match="compute_standard_errors"):
         WeightedEMEstimator(compute_standard_errors="yes")
+
+
+def _survey_sample(seed=11, n_persons=600, n_items=6):
+    rng = np.random.default_rng(seed)
+    responses = mirt.simdata("2PL", n_persons=n_persons, n_items=n_items, seed=seed)
+    return responses, rng.lognormal(0.0, 0.8, n_persons)
+
+
+def test_weighted_default_is_the_design_based_sandwich():
+    # Regression: survey-weighted fits reported complete-data errors, about
+    # half the design-based ones (Monte Carlo SD / mean error 2.1).
+    from mirt.estimation.standard_errors import (
+        _posterior_from_model,
+        compute_sandwich_se,
+    )
+
+    responses, weights = _survey_sample()
+    estimator = WeightedEMEstimator(tol=1e-8)
+    result = estimator.fit(TwoParameterLogistic(6), responses, weights)
+    quadrature = GaussHermiteQuadrature(21)
+    mass = quadrature.weights / quadrature.weights.sum()
+    posterior = _posterior_from_model(result.model, responses, quadrature)
+    expected = compute_sandwich_se(
+        result.model, responses, posterior, quadrature, weights, prior_mass=mass
+    )
+    assert result.se_method == "sandwich"
+    for name, values in expected.items():
+        np.testing.assert_allclose(result.standard_errors[name], values, rtol=1e-9)
+
+    # Weighted complete-data curvature understates the errors.
+    complete = WeightedEMEstimator(tol=1e-8, se_method="complete_data").fit(
+        TwoParameterLogistic(6), responses, weights
+    )
+    ratio = (
+        complete.standard_errors["difficulty"] / result.standard_errors["difficulty"]
+    )
+    assert np.median(ratio) < 0.8
+
+    # The sandwich does not depend on the scale of the weights.
+    unnormalized = WeightedEMEstimator(tol=1e-8, normalize_weights=False).fit(
+        TwoParameterLogistic(6), responses, 7.0 * weights
+    )
+    for name, values in result.standard_errors.items():
+        np.testing.assert_allclose(
+            unnormalized.standard_errors[name], values, rtol=1e-3
+        )
+
+
+def test_weighted_oakes_treats_integer_weights_as_frequencies():
+    from mirt.estimation.em import EMEstimator
+
+    responses = mirt.simdata("2PL", n_persons=300, n_items=5, seed=3)
+    counts = np.random.default_rng(2).integers(1, 4, size=300)
+    weighted = WeightedEMEstimator(
+        tol=1e-9, normalize_weights=False, se_method="oakes"
+    ).fit(TwoParameterLogistic(5), responses, counts.astype(float))
+    expanded = EMEstimator(
+        n_quadpts=21, quadrature="gauss-hermite", tol=1e-9, use_rust=False
+    ).fit(TwoParameterLogistic(5), np.repeat(responses, counts, axis=0))
+
+    assert weighted.se_method == "oakes"
+    for name, values in expanded.standard_errors.items():
+        np.testing.assert_allclose(weighted.standard_errors[name], values, rtol=2e-3)

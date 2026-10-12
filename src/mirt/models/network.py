@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Literal, Self
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.optimize import OptimizeResult, minimize
 
 from mirt.exceptions import MirtDataError, MirtValidationError
 
@@ -281,10 +283,25 @@ class IsingModel:
         node_idx: int,
         other_values: NDArray[np.int_],
     ) -> FloatArray:
-        """Compute ``P(X_i=1 | X_-i)`` for one node."""
+        """Compute ``P(X_i=1 | X_-i)`` for one node.
+
+        ``other_values`` may contain all nodes or only the ``n_nodes - 1``
+        conditioning nodes in their original order. A full row's value for
+        ``node_idx`` is ignored, and a single row may be given as a vector.
+        """
 
         node_idx = _validate_node_index(node_idx, self._n_nodes)
-        return self.conditional_probabilities(other_values)[:, node_idx]
+        values = np.asarray(other_values)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if values.ndim == 2 and values.shape[1] == self._n_nodes - 1:
+            # The node's own value has no weight in its linear predictor.
+            values = np.insert(values, node_idx, 0, axis=1)
+        elif values.ndim != 2 or values.shape[1] != self._n_nodes:
+            raise MirtDataError(
+                f"other_values must have {self._n_nodes} or {self._n_nodes - 1} columns"
+            )
+        return self.conditional_probabilities(values)[:, node_idx]
 
     def pseudo_likelihood(self, responses: NDArray[np.int_]) -> float:
         """Compute mean log-pseudolikelihood across observations."""
@@ -694,89 +711,196 @@ def _ising_objective(
     return float(log_pseudo_likelihood - penalty)
 
 
+def _ising_pseudo_likelihood_terms(
+    responses: FloatArray,
+    thresholds: FloatArray,
+    interactions: FloatArray,
+    upper: tuple[IntArray, IntArray],
+) -> tuple[float, FloatArray, FloatArray]:
+    """Return the mean log-pseudolikelihood and its threshold and edge gradients.
+
+    ``interactions`` must be symmetric with a zero diagonal, and ``upper``
+    indexes its unique edges.
+    """
+    n_samples = responses.shape[0]
+    linear = thresholds + responses @ interactions
+    log_pseudo_likelihood = float(
+        np.sum(responses * linear - np.logaddexp(0.0, linear)) / n_samples
+    )
+    residual = responses - _stable_sigmoid(linear)
+    node_gradient = residual.T @ responses / n_samples
+    # Edge (i, j) enters the full conditionals of both node i and node j.
+    edge_gradient = (node_gradient + node_gradient.T)[upper]
+    return log_pseudo_likelihood, residual.mean(axis=0), edge_gradient
+
+
+def _ising_optimality_residual(
+    threshold_gradient: FloatArray,
+    edge_gradient: FloatArray,
+    edges: FloatArray,
+    regularization: float,
+) -> float:
+    """Return the largest minimum-norm subgradient of the penalized objective.
+
+    It is zero exactly at the penalized pseudolikelihood maximum: thresholds
+    and nonzero edges have zero gradient, and every zero edge's gradient lies
+    within ``[-regularization, regularization]``.
+    """
+    edge_residual = np.where(
+        edges != 0.0,
+        np.abs(edge_gradient - regularization * np.sign(edges)),
+        np.maximum(np.abs(edge_gradient) - regularization, 0.0),
+    )
+    return float(
+        max(np.max(np.abs(threshold_gradient)), np.max(edge_residual, initial=0.0))
+    )
+
+
 def fit_ising(
     responses: NDArray[np.int_],
     regularization: float = 0.0,
-    max_iter: int = 100,
-    tol: float = 1e-4,
+    max_iter: int = 1000,
+    tol: float = 1e-6,
     verbose: bool = False,
     node_names: list[str] | None = None,
 ) -> tuple[IsingModel, float]:
     """Fit a symmetric Ising network by penalized pseudolikelihood.
 
-    A vectorized proximal-gradient update optimizes all thresholds and unique
-    symmetric edges together. L1 regularization is applied only to edges.
+    The thresholds and unique symmetric edges jointly maximize the mean
+    log-pseudolikelihood minus ``regularization`` times the sum of absolute
+    edge weights; thresholds are not penalized. L-BFGS-B solves the problem
+    with analytic gradients. With a penalty, each edge is split into
+    nonnegative positive and negative parts, which makes the L1 term linear;
+    an edge whose parts both stop at their zero bound is exactly zero.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Binary ``(n_observations, n_nodes)`` matrix with at least two rows.
+    regularization : float
+        Non-negative L1 penalty on the edge weights.
+    max_iter : int
+        Maximum number of L-BFGS-B iterations.
+    tol : float
+        Convergence tolerance on the optimality residual: the largest
+        absolute gradient of the penalized objective with respect to the
+        thresholds and nonzero edges, and the largest amount by which a zero
+        edge's gradient exceeds ``regularization`` in magnitude.
+    verbose : bool
+        Print the penalized objective after every iteration.
+    node_names : list of str, optional
+        Node names.
+
+    Returns
+    -------
+    tuple
+        The fitted :class:`IsingModel` and its mean log-pseudolikelihood.
+        ``model.converged`` reports whether the optimality residual reached
+        ``tol``, and ``model.objective_history`` holds the penalized objective
+        at the starting values and after every iteration.
+
+    Warns
+    -----
+    RuntimeWarning
+        If the optimality residual still exceeds ``tol`` when the solver
+        stops, for example after ``max_iter`` iterations or when a node or
+        node pair has no finite pseudolikelihood maximum.
     """
 
     values = _validate_binary_responses(responses, minimum_observations=2)
     regularization, max_iter, tol = _validate_optimizer_options(
         regularization, max_iter, tol
     )
-    n_samples, n_nodes = values.shape
+    n_nodes = values.shape[1]
     model = IsingModel(n_nodes, node_names)
+    observations = values.astype(np.float64)
+    upper = np.triu_indices(n_nodes, k=1)
+    n_edges = upper[0].size
+    penalized = regularization > 0.0
+
+    def unpack(
+        parameters: FloatArray,
+    ) -> tuple[FloatArray, FloatArray, FloatArray]:
+        edges = parameters[n_nodes : n_nodes + n_edges]
+        if penalized:
+            edges = edges - parameters[n_nodes + n_edges :]
+        interactions = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+        interactions[upper] = edges
+        return parameters[:n_nodes], interactions + interactions.T, edges
+
+    def negative_objective(parameters: FloatArray) -> tuple[float, FloatArray]:
+        thresholds, interactions, _ = unpack(parameters)
+        log_pseudo_likelihood, threshold_gradient, edge_gradient = (
+            _ising_pseudo_likelihood_terms(
+                observations, thresholds, interactions, upper
+            )
+        )
+        if not penalized:
+            return -log_pseudo_likelihood, -np.concatenate(
+                (threshold_gradient, edge_gradient)
+            )
+        # With edges = positive - negative parts, both parts >= 0, the penalty
+        # is linear and the solver only needs simple bounds.
+        penalty = regularization * float(np.sum(parameters[n_nodes:]))
+        return -log_pseudo_likelihood + penalty, np.concatenate(
+            (
+                -threshold_gradient,
+                regularization - edge_gradient,
+                regularization + edge_gradient,
+            )
+        )
 
     probabilities = np.clip(values.mean(axis=0), 1e-6, 1.0 - 1e-6)
-    thresholds = np.log(probabilities / (1.0 - probabilities))
-    interactions = np.zeros((n_nodes, n_nodes), dtype=np.float64)
-    objective = _ising_objective(values, thresholds, interactions, regularization)
-    history = [objective]
-    step_size = 1.0 / (n_nodes + 1.0)
-    converged = False
+    initial = np.zeros(n_nodes + (2 if penalized else 1) * n_edges)
+    initial[:n_nodes] = np.log(probabilities / (1.0 - probabilities))
+    history = [-negative_objective(initial)[0]]
 
-    for iteration in range(1, max_iter + 1):
-        linear = thresholds + values @ interactions.T
-        residual = values - _stable_sigmoid(linear)
-        threshold_gradient = residual.mean(axis=0)
-        raw_gradient = residual.T @ values / n_samples
-        interaction_gradient = raw_gradient + raw_gradient.T
-        np.fill_diagonal(interaction_gradient, 0.0)
-
-        accepted = False
-        trial_step = step_size
-        for _ in range(40):
-            candidate_thresholds = thresholds + trial_step * threshold_gradient
-            candidate_interactions = _soft_threshold(
-                interactions + trial_step * interaction_gradient,
-                trial_step * regularization,
-            )
-            candidate_interactions = (
-                candidate_interactions + candidate_interactions.T
-            ) / 2.0
-            np.fill_diagonal(candidate_interactions, 0.0)
-            candidate_objective = _ising_objective(
-                values,
-                candidate_thresholds,
-                candidate_interactions,
-                regularization,
-            )
-            if candidate_objective >= objective - 1e-12:
-                accepted = True
-                break
-            trial_step *= 0.5
-
-        if not accepted:
-            break
-
-        parameter_change = max(
-            float(np.max(np.abs(candidate_thresholds - thresholds))),
-            float(np.max(np.abs(candidate_interactions - interactions))),
-        )
-        thresholds = candidate_thresholds
-        interactions = candidate_interactions
-        objective = candidate_objective
-        history.append(objective)
-        step_size = min(trial_step * 1.05, 1.0)
-
+    def record(intermediate_result: OptimizeResult) -> None:
+        history.append(-float(intermediate_result.fun))
         if verbose:
-            print(f"Iteration {iteration}: objective = {objective:.6f}")
-        if parameter_change < tol:
-            converged = True
-            break
+            print(f"Iteration {len(history) - 1}: objective = {history[-1]:.6f}")
+
+    bounds = (
+        [(None, None)] * n_nodes + [(0.0, None)] * (2 * n_edges) if penalized else None
+    )
+    result = minimize(
+        negative_objective,
+        initial,
+        jac=True,
+        method="L-BFGS-B",
+        bounds=bounds,
+        callback=record,
+        options={
+            "maxiter": max_iter,
+            "maxfun": max(15_000, 20 * max_iter),
+            "gtol": tol,
+            # Stop on the optimality residual rather than on slow progress.
+            "ftol": np.finfo(np.float64).eps,
+        },
+    )
+
+    thresholds, interactions, edges = unpack(np.asarray(result.x, dtype=np.float64))
+    _, threshold_gradient, edge_gradient = _ising_pseudo_likelihood_terms(
+        observations, thresholds, interactions, upper
+    )
+    residual = _ising_optimality_residual(
+        threshold_gradient, edge_gradient, edges, regularization
+    )
+    converged = residual <= tol
+    if not converged:
+        warnings.warn(
+            f"fit_ising stopped after {result.nit} iterations with optimality "
+            f"residual {residual:.2e} above tol={tol:.2e}; increase max_iter, "
+            "or add regularization if a node or node pair is perfectly "
+            "predictable",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     model.set_thresholds(thresholds)
     model.set_interactions(interactions)
     model._is_fitted = True
-    model._n_iterations = len(history) - 1
+    model._n_iterations = int(result.nit)
     model._converged = converged
     model._objective_history = history
     return model, model.pseudo_likelihood(values)

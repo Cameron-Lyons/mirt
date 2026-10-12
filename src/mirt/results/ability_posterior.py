@@ -15,6 +15,7 @@ from mirt.results._common import (
     broadcast_cut_scores,
     classify_from_probabilities,
     validate_classification_confidence,
+    validate_person_ids,
 )
 from mirt.results.score_result import ScoreResult
 
@@ -44,24 +45,7 @@ class AbilityPosteriorResult:
         n_persons: int,
     ) -> list[Any] | None:
         """Copy and validate optional respondent identifiers."""
-        if person_ids is None:
-            return None
-        if isinstance(person_ids, np.ndarray) and person_ids.ndim != 1:
-            raise MirtValidationError(
-                "person_ids must be one-dimensional",
-                parameter="person_ids",
-                value=person_ids.shape,
-                expected=f"({n_persons},)",
-            )
-        resolved = list(person_ids)
-        if len(resolved) != n_persons:
-            raise MirtValidationError(
-                "person_ids must contain one identifier per posterior row",
-                parameter="person_ids",
-                value=len(resolved),
-                expected=str(n_persons),
-            )
-        return resolved
+        return validate_person_ids(person_ids, n_persons, row_label="posterior")
 
     def __post_init__(self) -> None:
         points = np.asarray(self.points, dtype=np.float64)

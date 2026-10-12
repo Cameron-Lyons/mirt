@@ -342,9 +342,12 @@ def test_from_dict_checks_family_fixed_parameters(
     responses: dict[str, np.ndarray],
 ) -> None:
     payload = _fit("1PL", 1, responses).to_dict()
-    assert payload["parameters"]["discrimination"] == [1.0] * 6
+    # fit_mirt estimates the common 1PL slope, which the payload records.
+    assert payload["model"]["estimate_discrimination"] is True
+    assert len(set(payload["parameters"]["discrimination"])) == 1
 
-    payload["parameters"]["discrimination"][0] = 2.0
+    # Without the flag the family fixes the slope at one.
+    del payload["model"]["estimate_discrimination"]
     with pytest.raises(MirtValidationError, match="fixed by the 1PL family"):
         FitResult.from_dict(payload)
 

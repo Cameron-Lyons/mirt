@@ -10,7 +10,6 @@ from mirt import (
     get_backend,
     set_backend,
 )
-from mirt._rust_backend import lord_wingersky_recursion
 from mirt.scoring import EAPSumScorer
 
 
@@ -35,7 +34,7 @@ def test_eapsum_all_missing_responses_return_prior_moments():
 
 
 @pytest.mark.skipif(not RUST_AVAILABLE, reason="requires Rust extension")
-def test_eapsum_native_distribution_matches_numpy_distribution():
+def test_eapsum_distribution_does_not_depend_on_the_backend():
     model = _fitted_model()
     responses = np.array([[1, 1, 0, 0]])
     previous_backend = get_backend()
@@ -54,15 +53,6 @@ def test_eapsum_native_distribution_matches_numpy_distribution():
         expected.standard_error,
         atol=1e-12,
     )
-
-
-def test_native_distribution_wrapper_rejects_mismatched_item_parameters():
-    with pytest.raises(ValueError, match="equal lengths"):
-        lord_wingersky_recursion(
-            np.array([-1.0, 0.0, 1.0]),
-            np.ones(2),
-            np.zeros(3),
-        )
 
 
 def test_eapsum_missing_items_match_equivalent_short_form():

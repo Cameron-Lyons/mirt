@@ -9,9 +9,11 @@ from scipy import stats
 
 import mirt
 from mirt._core import sigmoid
+from mirt.estimation.em import EMEstimator
 from mirt.exceptions import MirtValidationError
 from mirt.models.dichotomous import (
     FourParameterLogistic,
+    OneParameterLogistic,
     ThreeParameterLogistic,
     TwoParameterLogistic,
 )
@@ -125,7 +127,7 @@ def test_wald_reads_the_covariance_of_a_fit_result() -> None:
 
 def test_wald_rejects_fixed_parameters_and_warns_without_covariance() -> None:
     data = mirt.simdata(model="2PL", n_persons=300, n_items=3, seed=6)
-    rasch = mirt.fit_mirt(data, model="1PL")
+    rasch = mirt.fit_mirt(data, model="1PL", fixed={"discrimination": True})
     with pytest.raises(MirtValidationError, match="fixed"):
         wald(rasch, param_indices=[0], constraint_values=[1.0])
 
@@ -297,7 +299,8 @@ def test_lagrange_validates_fit_result_hypotheses() -> None:
         lagrange(constrained, data, np.zeros(data.shape[0]), [0])
     with pytest.raises(MirtValidationError, match="must name fixed parameters"):
         lagrange(constrained, data, param_indices=[1])
-    rasch = mirt.fit_mirt(data, model="1PL", max_iter=50)
+    # The slopes of the classical Rasch model, held at 1 by the family.
+    rasch = EMEstimator(max_iter=50).fit(OneParameterLogistic(data.shape[1]), data)
     with pytest.raises(MirtValidationError, match="model family fixes"):
         lagrange(rasch, data, param_indices=[0])
     with pytest.raises(ValueError, match="theta is required"):

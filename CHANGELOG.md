@@ -7,6 +7,812 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `EMEstimator(latent_density="ehw")` no longer diverges. Before, the mass ran
+  to the top node (mean +7.3) and the log-likelihood fell by 5,220 over 317
+  decreasing iterations while the fit reported `converged=True`. Each cycle now
+  standardizes the posterior histogram by Woods' (2007)
+  interpolation-extrapolation, as R's `dentype="EHW"` does, so the
+  log-likelihood never decreases; after R's 56 cycles the estimates match R's to
+  0.014.
+- Davidian-curve and Gaussian-mixture latent densities are held at mean 0 and
+  variance 1 every cycle. Before, their location and scale drifted into the
+  items (Davidian b +0.18, a x0.90). The Davidian update maximizes the expected
+  log-likelihood under the moment constraints, replacing a least-squares fit
+  that treated masses as densities.
+- `se_method="auto"` gives exact Oakes/Louis standard errors and `vcov` for
+  every model whose likelihood is a product of item curves: NRM,
+  multidimensional and `spec` fits, bifactor, custom and mixed-format models.
+  Before, these got complete-data SEs of 0.2-0.8x the correct values.
+  Exploratory multi-factor fits hold the upper triangle of the first F-1 items'
+  slopes at their estimates (NaN SE) to identify the rotation, as R does.
+- `WeightedEMEstimator` defaults to design-based sandwich standard errors
+  (Binder 1983), so the Monte Carlo SD/SE ratio goes from 2.08 to 1.00. The new
+  `se_method` selects the estimator, and `"oakes"` treats the weights as
+  frequencies.
+- `BLEstimator`'s `tol` is an absolute log-likelihood tolerance, followed by
+  projected Newton polishing on the exact information, so `converged` is
+  certified. Before, a 3PL fit stopped 2.3 log-likelihood units short with
+  parameters off by as much as 4. Unbounded SciPy methods (BFGS, CG, `trust-*`)
+  raise, and TNC gets `maxfun`.
+- EM's itemwise M-step, which also takes over from unconverged Newton steps,
+  no longer stalls on items whose expected responses saturate the probability
+  clip. A 2PL or multidimensional item with 6 of 356 correct responses stopped
+  at an objective of 138.2 from a saturated start, where the optimum is 29.4,
+  because clipped nodes had zero gradient. Built-in 1PL, 2PL, slope-intercept
+  and bifactor objectives, and 3PL items near their upper asymptote, now use
+  the exact likelihood and gradient beyond the clip; fits that never saturate
+  are unchanged to rounding.
+- `CustomItemModel` honours its item type's `par_bounds`, including when
+  differencing custom curves. Polytomous custom models expose per-item
+  `n_categories` (plus `max_categories`) and can be fitted by EM.
+- `fit_mirt` validates `max_iter`, `tol`, `n_quadpts` and `quadrature` on every
+  estimation path, and item priors whose support is narrower than the optimizer
+  box narrow the box instead of raising.
+- `fit_mirt` raises `MirtDataError` for an item with only one observed category,
+  as R does, and warns about unused interior categories with the
+  `recode_responses` call that removes them.
+- Every estimator (EM, Gibbs, MHRM, MCEM, BL, sparse Bayesian, weighted EM,
+  GVEM) and `bootstrap_se`, `bootstrap_ci` and `bootstrap_lr` reject response
+  codes outside the model's categories with `MirtDataError`. Before, a code of 2
+  for a 2PL item gave EM a slope of 20.
+- EM and the other itemwise estimators refuse `MixtureIRT` and `HigherOrderCDM`
+  with a `MirtModelError` naming the function that fits them, and refuse free
+  model-level parameters that the item M-steps would leave at their starting
+  values.
+- Model-level parameters of `LLTM`, `RaschLLTM`, `ExplanatoryIRT`, `MixtureIRT`,
+  the testlet models and `HigherOrderCDM` are never treated as per-item values
+  by `get_item_parameters`, `set_item_parameter`, `FitResult` labels,
+  `extract_item` or delta-method linking, even when their length equals the
+  number of items. Complete-data SEs of testlet models no longer raise "does not
+  have per-item values"; model-level parameters held fixed by the item M-steps
+  report SE 0.
+- Testlet variances are free only when every loading of their testlet is fixed,
+  which identifies them, and EM then estimates them. Full-theta testlet curves
+  apply the stored variances.
+  `RandomTestletEffectsModel.estimate_testlet_variances` uses the method of
+  moments (it was 5-10x too small), and
+  `BifactorTestletModel(constrain_testlet_loadings=True)` can be fitted by EM.
+- `LLTM`, `RaschLLTM` and `ExplanatoryIRT` can be fitted by `EMEstimator`, and
+  the LLTM log-likelihood matches R. EM also fits `IdealPointModel`,
+  `MonotonicSplineModel` and `MonotonicPolynomialModel`, which now declare their
+  parameter boxes.
+- Standardized loadings and communalities use R's `summary()` scaling (slopes
+  divided by D = 1.702) and accept `latent_covariance`. Bifactor
+  `omega_hierarchical`, `omega_total`, `omega_subscale` and
+  `explained_common_variance`, and testlet `omega_hierarchical`,
+  `explained_variance` and `testlet_reliability`, use standardized loadings
+  (McDonald), matching R. With correlated factors the communality is the full
+  `a'Phi a`, whereas R's `Lambdas()` ignores the correlations; this is
+  documented.
+- Multidimensional information for items with a lower or upper asymptote no
+  longer drops the slope-norm factor (it gave 0.540 where the information is
+  1.080). NRM and adjacent-category information are never negative in the tails,
+  and `testinfo` works at extreme abilities.
+- GRM and GPCM `set_parameters` reject NaN and infinite values atomically;
+  disordered thresholds are still accepted because estimators start from them
+  and project. Polytomous constructors accept NumPy-integer `n_categories`,
+  non-integer `n_factors` raises `MirtValidationError`, and category and
+  threshold indices are validated.
+- Model syntax keeps R's meaning of `d` for one-factor "2PL" specs, which are
+  fitted in slope-intercept form as a confirmatory one-factor
+  `MultidimensionalModel`, and the guide's PRIOR and FIXED examples run. Slopes
+  of fixed-slope families and intercept names of difficulty-form families raise
+  line-numbered errors, GRM/GPCM `d1`, `d2`, ... raise a clear error, and a
+  slope PRIOR on a 1PL is no longer silently ignored.
+- MCEM, QMCEM and stochastic EM keep GRM thresholds ordered, with an SLSQP
+  ordered fallback as in EM. Before, a rare middle category could give
+  thresholds [6, -6, 0.91], with category probabilities near -1, while the fit
+  reported `converged=True`.
+- `QMCEMEstimator(seed=None)` uses one scramble per fit, so it converges (in 29
+  iterations where it never converged before).
+- `StochasticEMEstimator` averages its post-burn-in iterates and stops on their
+  batch-means Monte Carlo SE: the new `burnin` defaults to 100, and `tol` is now
+  an MCSE in parameter units with default 0.01 (was 1e-4). It warns at
+  `max_iter`. Its posterior Metropolis-Hastings chains continue across
+  iterations, which removes a 0.04-0.18 slope bias.
+- The log-likelihood, AIC and BIC of MCEM, QMCEM, stochastic EM, MHRM and Gibbs
+  fits are the marginal log-likelihood at the estimates. Before, MHRM and Gibbs
+  reported a conditional log-likelihood 900-1340 units too high.
+- `GibbsSampler` R-hat and ESS are rank-normalized split R-hat and bulk/tail ESS
+  (Vehtari et al. 2021) per free coordinate within chains. Before, they were
+  computed on item-averaged draws and reported 1.02 while individual parameters
+  reached 1.36 or even 5.1. `MCMCResult` adds `n_chains`, `ess_tail`,
+  `converged` (R-hat below 1.01 and bulk and tail ESS of at least 100 per chain)
+  and `convergence_diagnostics()`; `fit_mirt(estimation="MCMC")` reports this
+  `converged`, and the summary flags R-hat of 1.01 or more.
+- `GibbsSampler` updates each item with its own Metropolis-Hastings step on log,
+  logit and ordered-gap scales, with Jacobians and adaptive burn-in. Before,
+  acceptance was 1.7% with an ESS of about 5, GRM thresholds were off by up to 3
+  and guessing could go negative.
+- `MHRMEstimator` stops once the largest parameter change has stayed below `tol`
+  (new, default 1e-3 as in R) for three cycles, and otherwise reports
+  `converged=False` with a warning.
+- `GibbsSampler(priors=)`, `MHRMEstimator(n_chains=)` and
+  `MHRMEstimator.fit(prior_mean=, prior_cov=)` now take effect, and unknown
+  `fit()` keywords raise `TypeError`.
+- The `RegularizedMIRTEstimator` default grids of `fit_path`,
+  `information_criteria_path` and `cv_select_lambda` span the null model to a
+  nearly unpenalized fit; `lambda_max` is the exact KKT threshold of the rotated
+  unpenalized solution (309 instead of 7e-15). Before, the selectors always
+  chose lambda = 0.
+- Regularized MIRT starts from a varimax-rotated unpenalized EM solution
+  (before, one factor was duplicated, 388 penalized log-likelihood units worse
+  at lambda = 20), and `fit_path` and each CV fold warm-start from the smallest
+  lambda up. EBIC adds Chen & Chen's log C(P, k) term. The NumPy
+  coordinate-descent M-step no longer diverges (it stepped from the gradient at
+  zero), and the native M-step no longer runs the lasso for `penalty="ridge"`;
+  the two paths agree.
+- `SparseBayesianResult.model` is a slope-intercept `MultidimensionalModel` that
+  keeps every intercept, and its log-likelihood, BIC and EBIC are marginal.
+- GVEM reports the marginal log-likelihood; the ELBO moves to `GVEMResult.elbo`.
+  Unidimensional GVEM standard errors are Oakes observed-information errors with
+  `vcov`, and multidimensional ones are labelled `"variational_curvature"`. GVEM
+  1PL fits on the GPU path update the intercepts with unit slopes, so every
+  backend agrees to 1e-15.
+- `fit_mixture_irt` stopped on a relative rule, `tol * (1 + |LL|)`, so default
+  fits ended after 3-36 iterations, 455-793 log-likelihood units short and with
+  51-58% classification accuracy, while reporting `converged=True`. It now uses
+  the absolute change, `max_iter` defaults to 500, and `converged=False` when
+  the limit is hit.
+- The `mirt.LLTM` likelihood-ratio test compared a marginal log-likelihood with
+  a conditional one (negative chi-square, p = 1). Both models are now fitted by
+  marginal ML with a common slope, with df = J minus rank(Q): Q = I gives a
+  chi-square of 0, and the log-likelihood matches R to 0.003. The result gains a
+  `converged` key, and the function takes `n_quadpts`.
+- `IRTreeEMEstimator` identifies the trait scale (means 0, variances 1,
+  correlations by an exact M-step), so it converges instead of drifting, and its
+  `n_parameters` equals `IRTreeModel.n_parameters`.
+- `MixedEffectsIRT` estimates the latent regression jointly with the items by
+  marginal EM, as R's `mirt(covdata=, formula=)` does: the slope is 0.812, as in
+  R, instead of an attenuated 0.587, with observed-information SEs and the
+  marginal log-likelihood.
+- `ResponseTimeGibbsSampler(accuracy_model="3PL")` samples a and b from the 3PL
+  likelihood (before, the mean a was 0.41 for a true 1.36). Its guessing update
+  is a valid logit-scale Metropolis-Hastings step under a Beta(`guess_alpha`,
+  `guess_beta`) prior on (0, `guess_upper`); clipped proposals used to put 24%
+  of the draws on the bound.
+- The van der Linden response-time model is identified (mu_theta = mu_tau = 0,
+  Var(theta) = 1), and these constants are excluded from R-hat and ESS. Before,
+  chains drifted and the time-intensity bias reached -0.9. DIC, WAIC and
+  `log_likelihood` pair each draw with the same iteration's item parameters (DIC
+  was off by about 350). Seeded chains differ.
+- `LongitudinalGibbsSampler` fixes the intercept factor at N(0, 1), starts from
+  data-driven trajectories and adds parameter-expanded location and scale moves,
+  so chains no longer drift with their length. AIC and BIC count only free
+  parameters.
+- `fit_ising` uses L-BFGS-B with analytic gradients and an exact-zero penalized
+  split, with defaults `max_iter=1000` and `tol=1e-6` (optimality residual), and
+  warns when it stops early. Before, the defaults left thresholds up to 0.78 off
+  and reported `converged=False` without a warning.
+  `IsingModel.conditional_probability` accepts n-1 conditioning values or a
+  single-row vector.
+- `GrowthMixtureModel.fit` and `fit_em` estimate the shared variance components
+  (ECM; new `estimate_variances=True`), so BIC picks the true number of classes
+  (it chose 3 for one-class data), and `n_fitted_parameters` grows by 3 by
+  default. `PiecewiseGrowthModel.detect_changepoints` uses BIC over continuous
+  hinge fits, finds slope changes in trending trajectories, treats NaN as
+  missing and validates its inputs. `NonlinearGrowthModel.growth_velocity` is
+  stable in the tails, and the `NonlinearGrowthModel` and `GrowthMixtureModel`
+  constructors validate their inputs.
+- `HigherOrderCDM` `log_likelihood`, `estimate_theta` and `information`
+  marginalize over the shared mastery patterns, and `information` is the Fisher
+  information.
+- `fit_cdm` and `fit_gdina` store the class probabilities, which MAP
+  classification and posteriors use as the default prior (MAP accuracy from
+  0.697 to 0.872). GDINA setters are validated and atomic, `log_likelihood`
+  validates response codes, and the default ACDM coefficients no longer imply
+  probabilities above 1.
+- Multidimensional and bifactor WLE maximize log L + 0.5 log det I(theta), as R
+  does, instead of using the trace of the information; estimates match R, and
+  SEs come from the inverse information matrix.
+- Unidimensional WLE returns the global maximum; before, 19% of patterns on
+  mixed banks stopped at a local maximum. 2PL WLE honours instance-level method
+  overrides, which the native kernel ignored.
+- ML scores of extreme patterns (all lowest or all highest categories) are the
+  bound with SE = inf for every family, including polytomous, mixed-format and
+  multidimensional models, where per-factor unbounded coordinates are handled
+  the same way.
+- `ScoreResult.to_json` writes standard JSON, with non-finite values as "Inf",
+  "-Inf" and "NaN", which jsonlite reads, and empty multi-factor results
+  round-trip.
+- `generate_plausible_values` defaults to the `fscores` EAP grid (49 nodes for
+  1-2 factors), so the draws reproduce the posterior variance: the 10th-90th
+  percentile range of the variance ratio goes from 0.45-1.59 to 0.86-1.13.
+- `mirt.scoring` and `mirt.reports` resolve lazily from the top-level package
+  like the other subpackages. Before, `import mirt; mirt.scoring.fscores` failed
+  unless something had already imported `mirt.scoring`.
+- `compute_m2`, `compute_fit_indices`, `itemfit` and `compute_itemfit` (S-X2,
+  X2, G2, PV-Q1) count a `FitResult`'s equality constraints (`constraints=` or
+  `CONSTRAIN`) automatically, so M2 of 39.8 on 35 df becomes 47.0 on 44 df. Pass
+  `constraints=[]` to opt out.
+- `compute_s_x2` and the S-X2 of `itemfit` no longer raise for models with four
+  or more factors.
+- `compute_ld_chi2` gives NaN p-values for the diagonal and undefined pairs
+  instead of 0, and `LD_X2` gives NaN instead of 0 with p = 1; every LD function
+  needs at least 10 joint responses for a pair. `compute_ld_statistics`
+  validates `alpha` and `q3_threshold`.
+- `compute_grdif` and `compute_pairwise_rdif` no longer flag 70-90% of DIF-free
+  items under group impact. Squared residuals are centred at their model
+  variance (Lim et al.; irtQ's `grdif`), pooling is precision-weighted, and
+  GRDIF_RS uses the joint covariance. With a focal mean of -1, false positives
+  fall from 0.89 to 0.04 (GRDIF_S) and from 0.86 to 0.04 (GRDIF_RS).
+- `compute_dtf(method="unsigned")` and `method="expected_score"` return
+  `p_value=NaN`, as R's `DTF` tests only signed DTF; the old z test rejected 20%
+  of DTF-free analyses.
+- ETS A/B/C classes in `mirt.dif` and `compute_dif` use the model-implied MH
+  D-DIF for binary items (cut-offs 1.0 and 1.5) or SMD/SD for GRM and GPCM items
+  (0.17 and 0.25). Before, the classes ignored discrimination.
+- Delta-method SEs for native-curve linking (ZI-2PL, ZI-3PL, hurdle, CLL)
+  include the zero-inflation and engagement parameters; before, these SEs were 0
+  or 30-60% too low.
+- `link()` uses its closed-form 1PL-5PL curves only for families that keep their
+  built-in response function, so subclasses that override `probability` are
+  linked with their own curves, while subclasses that keep the family's response
+  function still use the closed form.
+- `detect_drift(method="area")` and `signed_area_difference` with explicit `A`
+  and `B` accept ability ranges where the normal population weights underflow.
+- `concurrent_link` recovers exactly linkable forms to rounding error, using
+  trust-region least squares with chain-rule Jacobians; before, Haebara was off
+  by about 2.5e-3.
+- `target_rotation(rotation_type="oblique")` is Browne's oblique target rotation
+  with unit-variance factors and matches GPArotation's `targetQ`.
+- Multigroup EM (`fit_multigroup`, `MultigroupEMEstimator`,
+  `compare_invariance`, `multigroup_dif`, `compute_dif`, `vertical_scale`) uses
+  `fit_mirt`'s R-like grid with group-specific normal weights (new
+  `quadrature=`), and the rectangular grid grows to cover distant groups.
+  Before, distant groups got 3-6 effective nodes: a focal mean of 2.5 came out
+  2.373 (R 2.409), and a 4-grade vertical scale's top grade was 0.26 low.
+  Configural fits equal separate `fit_mirt` fits.
+- Confirmatory multidimensional multigroup models estimate the reference factor
+  correlations (`free_correlations=`, or `COV` in `spec`), matching R. Before,
+  the factors were orthogonal, so the configural log-likelihood was 200 below
+  R's and the scalar fit could exceed the configural one.
+- Group-specific parameters of items that a group never answered are excluded
+  from estimation and `n_parameters`, reported as NaN and warned about, and an
+  unused category with group-specific thresholds raises, as in R. Rows with a
+  missing group label are dropped with a warning, as in R.
+- `compare_invariance` reuses the scalar fit when strict invariance adds no
+  constraint, and the hierarchy reports a df = 0 row with a note; failed
+  comparisons warn instead of disappearing.
+- `mirt.coef()` accepts a `FitResult` (it raised `AttributeError`) and a
+  `MultigroupFitResult`, returning a dict per group label as R does.
+- A `MaxItemsStop` given as `stopping_rule`, or nested in a `CombinedStop` ("or"
+  takes the minimum, "and" the maximum when all parts are bounded, and
+  `min_items` raises it), sets the selection horizon of a-stratified,
+  shadow-test and progressive exposure in `CATEngine` and `MCATEngine`. Before,
+  shadow tests were infeasible and a-stratified selection never advanced. The
+  horizon is recomputed at each selection, so rules changed after construction
+  count, and a `MaxItemsStop` whose `should_stop` is overridden is not trusted.
+  Seeded sequences change whenever the horizon does.
+- `ClassificationStop` rejects a confidence of 0.5 or less (and NaN or bool), as
+  `CompositeClassificationStop` does. The string stopping rule "max_items" works
+  (it needs `max_items`), and "classification", "min_items" and "combined" raise
+  a clear `ValueError` instead of a `TypeError`, in both engines.
+- `CATEngine` and `MCATEngine` validate `scoring_method` case-insensitively at
+  construction, and unknown names, EAP `n_quadpts` below 5 and invalid
+  `theta_bounds` raise. Before, "eap" or "bogus" silently gave logit(p) (CAT) or
+  a frozen prior (MCAT), and MCAT accepted "ML". Only numerical failures fall
+  back, with a warning, and MCAT MAP respects `theta_bounds`.
+- `UrryRule` and `AStratified` b-matching use family-specific item locations
+  (mean steps for GPCM/PCM, GGUM and ideal-point locations).
+- Native batch CAT simulation gives every session an independent stream mixed
+  from (seed, theta, replication), so neighbouring seeds no longer replay
+  sessions, and seeded engines advance between calls.
+- MCAT scores every update under the prior (`initial_covariance`, `prior_cov` or
+  the `FitResult`'s `latent_covariance`).
+- `ProgressiveRestricted` implements Revuelta & Ponsoda's restricted maximum
+  exposure (`max_exposure=0.25`): the observed maximum exposure falls from 1.00
+  to 0.25.
+- `min_items` above `max_items` and negative `min_items` are rejected, and
+  `CATEngine` rejects multidimensional models at construction.
+- `SympsonHetter.calibrate` resets the counts each round (`reset_counts=True`,
+  and a new `reset_counts()` method), so iterative calibration converges.
+- `CATResult.summary()` and `MCATResult.summary()` report the mean response and
+  category counts for polytomous items (new `polytomous` flag).
+- Rotation criteria other than promax, equamax included, are minimized by
+  gradient projection with a monotone line search and match GPArotation; equamax
+  was suboptimal in 54-98% of cases. The promax target uses de-normalized
+  varimax loadings, so Phi matches R.
+- `get_rotated_loadings` and `apply_rotation_to_model` accept exploratory
+  `fit_mirt` 2PL, GRM, GPCM and NRM models and `FitResult`s.
+  `apply_rotation_to_model` keeps the model equivalent: oblique rotations record
+  Phi in `latent_covariance` and rotate `latent_mean`, and slope-sum locations
+  are rescaled, so the log-likelihood is invariant (oblimin used to lower it by
+  90). Oblique rotation of a bare model raises.
+- `empirical_rxx` accepts a `ScoreResult` and matches R: EAP 0.674 to 0.732
+  (true 0.732) and ML 0.780 to 0.717 (true 0.715). The default method is
+  `"posterior_variance"` when standard errors are available, the new
+  `scores_include_error` is R's `T_as_X`, and bare arrays without SEs warn.
+- `traditional()` no longer counts missing responses as 0. `missing="complete"`
+  (the default) reproduces R's `itemstats`, and `missing="pairwise"` uses the
+  pairwise covariance. Polytomous items are supported, with `item_sd`,
+  `std_alpha`, `sem_alpha` and `n_complete`.
+- `RCI(method="hageman")` implements Hageman & Arrindell's RC_ID (it needs
+  `reliability`), and `"jacobson"` warns when it would ignore `sem_post` or the
+  new `reliability_post`.
+- `empirical_rxx`, `sem`, `testinfo`, `iteminfo`, `areainfo`,
+  `information_intervals`, `probtrace`, `expected_score`, `gen_difficulty` and
+  `theta_for_score` accept a `FitResult`.
+- `fixed_calib` estimates new 2PL items by MML with a standard normal population
+  held fixed, as R's `fixedCalib(PAU="NWU")`. It used a WLS line through clipped
+  node logits, which was biased for extreme items (an item estimated at (1.41,
+  -2.83) is now (0.87, -4.40)). It matches
+  `fixed_item_calibration(estimate_mean=False, estimate_cov=False)` and R to
+  2e-3.
+- `empirical_ES` follows Meade (2010) and R, matching R to 1e-10: the new
+  `theta_focal` sets the population for SIDS, UIDS, ESSD and max D, and
+  SIDN/UIDN use N(mean(`theta_focal`), 1). Before, the effects were 3.6x too
+  large for a low-ability focal group.
+- `reverse_score` keeps missing codes missing and uses each item's own maximum.
+  `key2binary` keeps missing answers missing, as R does (`score_missing=True`
+  restores the old scoring). `poly2dich(method="adjacent")` builds true adjacent
+  splits, and negative codes are missing in every method.
+- `parametric_bootstrap(FitResult)` simulates `n_observations` persons. It
+  always simulated 500, which made SEs 2.6x too large at N=3000. A bare model
+  without `n_persons` warns.
+- `load_dataset("LSAT6")` is the real Bock & Lieberman table of 1000 examinees;
+  it had 569 rows with misaligned counts. The 2PL log-likelihood is now
+  -2466.654, as in R.
+- The item-analysis and full-diagnostic reports work for GPCM, PCM, NRM,
+  confirmatory and mixed-format fits. Wright maps locate items per family and
+  draw one map per factor; where a map does not apply (NRM), it becomes a note.
+- Reports accept nullable pandas frames (pd.NA), and the model-fit and
+  full-diagnostic reports name the statistic (M2, `M2*` or C2).
+- `plot_information` and `plot_se` show the information along the selected
+  factor of multidimensional models (SE 1.35 instead of 0.65).
+- `plot_itemfit` and `plot_dif` accept the DataFrames returned by `mirt.itemfit`
+  and `mirt.dif`. `plot_dif` draws `|ets_effect|` against the ETS cut-offs of
+  its scale (new `ets_scale=`) instead of fixed 0.426/0.638 lines over
+  `|effect_size|`.
+- `set_backend("numpy")` and `set_backend("rust")` keep EM and GVEM on the CPU;
+  before, an available GPU was always used. An explicit `use_gpu` wins, and
+  `fit_mirt` gains `use_gpu="auto"`.
+- The NumPy fallback of the GRM/GPCM batch likelihoods no longer drops items
+  with NaN missing codes (-2.000 instead of -4.579). Both backends treat NaN as
+  missing, reject codes of 2^31 or more, and return NaN for non-finite
+  parameters; native GRM/GPCM probabilities used to floor them to 1e-10.
+- `mirt.backends.rust` wrappers and the native 3PL, bootstrap, MHRM, CAT, BKT
+  and response-time kernels raise `ValueError` for inconsistent shapes and codes
+  instead of a Rust `PanicException`. Any remaining panic surfaces as
+  `RuntimeError`, so the NumPy fallbacks recover.
+- Native 2PL bootstrap replicates (`bootstrap_se`, `bootstrap_ci`) reach the
+  box-constrained optimum by projected Newton; an item with its difficulty on a
+  bound used to stop at a non-stationary slope, up to 1600 log-likelihood units
+  short. They integrate on the fit's grid (the native Gauss-Hermite rule
+  collapsed at 199 or more nodes), and replicate seeds are mixed, where seed + b
+  made seed s + 1 replay seed s.
+- Native bootstrap fits, the native MHRM burn-in and the native polytomous
+  M-step take EM's parameter boxes from Python instead of hardcoded ones.
+
+### Added
+
+- `fit_mirt(model="Rasch")`, also per item, as an alias of the common-slope
+  "1PL" (R's itemtype name).
+- `fit_mirt(seed=)` makes MHRM, MCMC and Gibbs fits reproducible, and
+  `fit_mirt(estimation="MCMC", priors=)` (or "Gibbs") passes item priors to the
+  sampler; MHRM still rejects priors. MHRM and Gibbs honour
+  `set_free_parameter_masks`, so confirmatory patterns and `fit_mirt(fixed=)`
+  work with them.
+- `mirt.bfactor()` fits graded and mixed dichotomous/graded items, as R's
+  `bfactor(itemtype="graded")`. `model="graded"` (or "GRM") builds the new
+  `GradedBifactorModel`, and by default data with a code above 1 is fitted as
+  graded, as in R. Dimension-reduction EM gives exact Oakes SEs, reduced-grid
+  EAP and `FitResult` serialization; it matches R's log-likelihood, estimates
+  and SEs on R's grid and is about 50x faster than R for 12 five-category items
+  with 3 specific factors. `bfactor(quadrature=)` and
+  `BifactorEMEstimator(quadrature=)` select the rule ("rectangular" with
+  `n_quadpts=31` is R's grid), and `EMEstimator` hands graded bifactor models to
+  the reduction when its settings allow. `fit_mirt(spec=...)` with a "2PL" or
+  "GRM" bifactor structure emits a `RuntimeWarning` that recommends `bfactor()`.
+- `fit_lca()` (alias `mdirt()`, after R) fits unconstrained latent class models
+  of binary and nominal items by EM, with missing responses, seeded multiple
+  starts (R's start first), optional Dirichlet smoothing and an honest
+  `converged`; classes are ordered by decreasing proportion. It matches R's
+  `mdirt` on LSAT7 and on polytomous data with missing responses
+  (log-likelihood, AIC/BIC/SABIC, proportions, item probabilities, posteriors
+  and SEs). `LCAResult` adds relative entropy, `classify()`, `posterior()`,
+  `summary()` and exact observed-information SEs and works with
+  `compare_models`, and `LatentClassModel` scores and simulates. New guide:
+  Latent Class Analysis.
+- `fit_higher_order_cdm()` (MML EM for higher-order G-DINA) and the public
+  `HigherOrderCDM.base_model`. CDM models gain `pattern_log_likelihoods`,
+  `attribute_posteriors`, `attribute_marginals`, `classify_respondents` (also
+  `method="EAP"`), `simulate()` and `sample_attribute_patterns()`; `fit_cdm` and
+  `fit_gdina` take `hierarchy=`; GDINA gains `item_probabilities()` and
+  `gdina_deltas()`. `fit_gdina`, `fit_higher_order_cdm`, `AttributeHierarchy`
+  and `CDMResult` are exported.
+- `fit_mixture_irt(n_starts=, seed=)`, with
+  `convergence_info["start_log_likelihoods"]`.
+- `CustomItemModel.simulate()`, and `simdata(model=...)` with a custom model.
+- `BifactorModel.get_factor_loadings()` and `communalities()`.
+- `DavidianCurve.mean` and `variance`, and an "Estimated latent densities"
+  section in the estimation guide.
+- `RegularizedMIRTEstimator.fit(start=)`, the `ebic_penalty` helper and
+  `GVEMResult`.
+- `RTModelPriors.guess_alpha`, `guess_beta` and `guess_upper`.
+- `compute_m2(type="C2")` and `compute_fit_indices(type="C2")` (Cai & Monroe
+  2014), matching R's `M2(type="C2")`. By default C2 replaces an `M2*` that has
+  no degrees of freedom, with a warning.
+- Item-level Zh in `itemfit`, as R's `itemfit(fit_stats="Zh")`, matching R to
+  1e-13.
+- `mirt.diagnostics.loo_compare` for PSIS-LOO and WAIC results: a DataFrame of
+  elpd differences with standard errors on the elpd scale (the old WAIC table's
+  SE was on the deviance scale, twice as large).
+- `LDResult.chi2_df_matrix` and `cramers_v_matrix` (R's signed Cramer's V), and
+  `prior_mean`/`prior_cov` for `compute_ld_chi2` and `LD_X2`.
+- `ets_effect` and `ets_scale` in `compute_dif` and `mirt.dif`, also shown by
+  the DIF report. `compute_dtf` returns `item_dif` (sDIF, uDIF and dDIF with
+  bootstrap SE/CI and sDIF p-values), checked against R's `DRF(DIF=TRUE)`.
+- `sibtest` and `sibtest_items` accept polytomous items (Poly-SIBTEST; Chang,
+  Mazzeo & Roussos 1996), with bundles of several suspect items and a
+  coefficient-alpha correction, matching R.
+- SIBTEST for more than two groups (GSIBTEST; Chalmers & Zheng 2023) with
+  `contrasts` (R's default), per-contrast `beta`, `beta_se` and
+  `beta_covariance` and a Wald chi-square; `pairwise=True` runs R's pairwise
+  comparisons. `n_permutations` and `random_state` give the crossing-SIBTEST
+  randomization p-value (Li & Stout 1996), as R's `randomize=TRUE`. `na_rm=True`
+  drops persons with a missing response, as R's `na.rm`; otherwise missing data
+  raise a clear error. `convention="mirt"` reproduces R's stratum and crossing
+  rules (with `min_cell_size` = Jmin + 1 it matches R to about 1e-15). Defaults
+  are unchanged, and binary two-group results are bit-identical. Unlike R,
+  multi-group GSIBTEST drops unobserved neighbouring score means instead of
+  zero-filling them (documented).
+- `delta_method_se` accepts a `FitResult` or its free-parameter `vcov`,
+  including NaN rows for bound coordinates and the tied slope of common-slope
+  1PL/PCM fits. A `FitResult` without `vcov`, as with
+  `se_method="complete_data"`, falls back to squared SEs, ignoring covariances,
+  with a `UserWarning`.
+- `delta_method_se` and `bootstrap_linking_se` accept GRM, GPCM, PCM and NRM
+  forms, and `link_grm`, `link_gpcm` and `link_nrm` take `compute_se`,
+  `n_bootstrap` and `random_state`.
+- `chain_link(vcovs=)` gives delta-method SEs of the pairwise and cumulative
+  constants (`cumulative_A_se`, `cumulative_B_se`, `cumulative_covariance`),
+  including the covariance from shared forms.
+- `vertical_scale(method="concurrent")` supports polytomous grades.
+- `link_mirt` and `transform_mirt_parameters` support multidimensional GRM and
+  GPCM models.
+- `fit_multigroup(free_means=, free_variances=)` (R's `free_means`/`free_var`),
+  with matching `InvarianceSpec` fields, and `latent_pars()` shows the free
+  moments. `fit_multigroup`, `compare_invariance`, `test_invariance_hierarchy`,
+  `multigroup_dif` and `select_dif_anchors` take `n_factors=` and `spec=`.
+- `MultigroupEMEstimator(accelerate="squarem")` and
+  `fit_multigroup(accelerate=)`, monotone-safeguarded, need 6-10x fewer E-steps
+  for weakly anchored or distant groups. Floating-anchor `vertical_scale`
+  calibration uses SQUAREM, and its ordered-mean update tolerates SLSQP
+  line-search stops, so default calibrations converge (251 E-steps, 2.9 s).
+- Multigroup observed-information SEs, computed by default
+  (`compute_standard_errors=True`), with `latent_standard_errors`, `vcov`,
+  `vcov_labels` and `latent_pars(include_standard_errors=)`. They match R's
+  `multipleGroup(SE=TRUE)`.
+- `MultigroupFitResult.fscores()` and `mirt.fscores()` with `groups=` score a
+  multigroup fit under each group's prior, and `MultigroupFitResult` round-trips
+  through `to_dict`/`from_dict` and `to_json`/`from_json`.
+- MPWI, MLWI, KLP and MEPV CAT selection criteria, and
+  `KullbackLeibler(delta_scaling="sqrt_n")`.
+- Rotations `targetT`, `targetQ`, `pstT` and `pstQ` (with `target` and
+  `target_weights`), `bifactorT`, `bifactorQ`, `geominT`, `geominQ` and
+  `quartimin`; `random_starts`, `seed` and `reflect` options;
+  `apply_rotation_to_model(result, "oblimin")`; and
+  `get_rotated_loadings(standardized=)`.
+- `testinfo(degrees=)` and `iteminfo(degrees=)` (R's directional information)
+  and `return_matrix=True`; `areainfo(return_details=True)` with R's TotalInfo,
+  Proportion and nitems; `MIResult.t_statistic` and `p_value`; and
+  `averageMI(df_complete=)` for Barnard-Rubin degrees of freedom.
+- `DIFEffectSize` fields `sidn`, `uidn`, `essd`, `theta_max_d`, `max_d`,
+  `mean_es_focal` and `mean_es_ref`; `theta_focal` for `RMSD_DIF` and
+  `weighted_RMSD_DIF`; `poly2dich` methods "cumulative" and "dummy";
+  `key2binary(score_missing=)`; and per-item `max_score` in `reverse_score`.
+- `draw_parameters` supports GRM, GPCM and NRM fits: a joint draw from `vcov`
+  with bound and threshold-order redraws, as R does. The new
+  `ParameterSamples.parameters` holds the draws, and `difficulty` is None for
+  these models.
+- `parametric_bootstrap(responses=)` reproduces the observed missing-data
+  pattern.
+- `PLCI` accepts a `FitResult`, and `PLCIResult.method` records the method.
+- `mirt.utils` exports `PluginLogLikelihoodScorer` ("plugin_log_likelihood") and
+  `AbilityRMSEScorer`.
+- `coef(irt_pars=False)` converts GRM, GPCM and PCM (and mixed-format
+  components) to slope-intercept form, as R does; slope-intercept models are
+  returned unchanged instead of raising.
+
+### Changed
+
+- `fit_mirt(model="1PL")` and `model="PCM"` estimate one common discrimination
+  under EM (`n_items + 1` parameters for a 1PL). This is the likelihood of R's
+  `itemtype="Rasch"`, which R parameterizes through the latent variance: the
+  log-likelihood, M2 and the likelihood-ratio test against the 2PL match R
+  (log-likelihood -8138.931 and M2 44.986 on 44 df in a 10-item example).
+  `OneParameterLogistic` and `PartialCreditModel` take
+  `estimate_discrimination=True`, and `fixed={"discrimination": True}` keeps the
+  unit-slope model. `spec` fits and the 1PL/PCM items of mixed-format tests
+  still hold the slope at 1. "1PL" and "PCM" with MHRM, MCMC or Gibbs raise
+  `MirtValidationError`, and `GibbsSampler`, `MHRMEstimator`, GVEM and sparse
+  Bayesian estimation refuse common-slope models.
+- The EM default quadrature follows R: `n_quadpts=None` gives 61, 31, 15, 9, 7
+  and 5 points for 1-6 factors (was 21 Gauss-Hermite points), rectangular on
+  [-6, 6] for 15 or more points and Gauss-Hermite for coarser grids (new
+  `quadrature="auto"|"rectangular"|"gauss-hermite"` in `fit_mirt` and
+  `EMEstimator`). Seven or more factors raise without an explicit `n_quadpts`,
+  recommending MHRM or QMCEM, and grids above 1M nodes or 1 GiB of EM arrays
+  warn. Four-factor default fits become feasible (they ran out of memory), and
+  long, discriminating tests integrate accurately: with 21 Gauss-Hermite points,
+  40-item GRM slopes came out 0.78x the truth. On its own the finer grid made a
+  2PL fit (N=5000, J=30) take 0.22 s instead of 0.10 s; see guarded PX-EM below.
+- Wider optimizer boxes for the logistic families, which R leaves unbounded:
+  one-factor 1PL, 2PL and MIRT slopes (0.1, 20), multi-factor 2PL/MIRT loadings
+  (-20, 20), and 1PL-4PL difficulties and MIRT intercepts (-30, 30). `fit_mirt`
+  warns when a unidimensional slope ends on its lower bound, typically a
+  reverse-keyed item. 3PL/4PL slopes and the GRM, GPCM and other polytomous
+  boxes are unchanged.
+- EM takes guarded parameter-expanded steps (PX-EM; Liu, Rubin & Wu 1998) by
+  default: `EMEstimator(px_em=True)`, recorded in refit recipes, and
+  `px_em=False` gives plain EM. They apply to 2PL, GRM, GPCM, NRM, common-slope
+  1PL/PCM and `MultidimensionalModel` fits with the fixed standard normal
+  density on rectangular grids of at least 31 points per dimension (the 1- and
+  2-factor defaults); Gauss-Hermite or coarser grids, item priors, constraints,
+  mixed-format, testlet and multigroup fits and estimated densities still run
+  plain EM. `n_iterations` and `convergence_history` differ from 1.2.0; the
+  log-likelihood is equal or higher, estimates agree within tolerance and SEs
+  within 0.1%.
+- Local-dependence X2/G2 (`compute_ld_statistics`, `compute_ld_chi2`,
+  `mirt.utils.LD_X2`) compare each pair's observed table with the model-implied
+  marginal table over the fitted latent population (Chen & Thissen), as R's
+  `residuals(type="LD")`. EAP plug-in counts gave false positives that grew with
+  N (52% of pairs at N=2000, 84% at N=8000); now about 2%. Polytomous pairs use
+  full K_i x K_j tables on (K_i - 1)(K_j - 1) df instead of tables collapsed to
+  0 versus 1 or more on 1 df. `MixtureIRT` and `HigherOrderCDM` are rejected for
+  LD X2.
+- Q3 (`compute_q3`, `mirt.utils.Q3`) correlates raw residuals `x - E[x|theta]`
+  (Yen 1984), matching R to 1e-15; it used standardized residuals, up to 0.03
+  off.
+- `n_parameters`, and with it AIC, BIC and likelihood-ratio df, of exploratory
+  multi-factor 2PL, GRM, GPCM, NRM and MIRT models leaves out the F(F-1)/2
+  rotation angles, as R does (29 instead of 30 for 10 items and 2 factors).
+  Exploratory multigroup models do the same (configural 2-factor npar 70, as in
+  R).
+- Scoring, fit and residual functions match DataFrame columns to the model's
+  item names: `fscores`, the scorers, `ability_posterior`, EAPsum, plausible
+  values, `personfit`, `vuong_test`, `itemfit`/`compute_itemfit`,
+  `compute_residuals`, `analyze_residuals`, `compute_outfit_infit`,
+  `identify_misfitting_patterns`, `compute_q3`, `compute_ld_chi2`,
+  `compute_ld_statistics`, `compute_m2`, `compute_fit_indices` and the reports.
+  Reordered or extra columns (such as IDs) are allowed, missing named items
+  raise `MirtDataError`, and arrays and frames with default labels stay
+  positional, as R's `fscores` always is. The new helper is
+  `mirt.utils.data.align_response_columns`.
+- `PLCI` defaults to a true profile likelihood that refits the other parameters
+  (warm-started), matching R's `PLCI.mirt`: (0.7099, 1.4656) against R's
+  (0.7101, 1.4655), where the old method gave (0.839, 1.296). The old interval
+  is `method="conditional"`.
+- `cross_validate`'s default `LogLikelihoodScorer` scores the held-out marginal
+  log-likelihood, integrated over the training fit's latent population on its
+  grid. Before, it scored at EAPs from the test persons' own responses and
+  favoured overfitted models (it picked 2 factors on 1-factor data). The old
+  score is `PluginLogLikelihoodScorer` ("plugin_log_likelihood").
+- MAP and ML standard errors from a second finite difference use a step of
+  1e-4 instead of 1e-5 on both backends, which cuts their rounding noise from
+  about 1e-6 to about 1e-8 relative to the analytic value.
+- MHRM returns the final iterate (Cai 2010) instead of the mean of the
+  post-burn-in iterates that 1.2.0 introduced, and lands closer to EM in 9 of 10
+  seeds. The native kernel runs only the burn-in cycles; the decreasing-gain
+  cycles run in NumPy.
+- Latent-density parameter counts follow R: EHW counts n_bins - 3, a Davidian
+  curve degree - 2 and a K-component mixture 3K - 3, so AIC and BIC change.
+  `DavidianCurve` and `MixtureDensity` take `standardize=True` (with `False`
+  they report `latent_mean` and `latent_covariance`), `MixtureDensity()` starts
+  standardized, and EHW starts from normal masses.
+- Testlet `n_parameters`, AIC and BIC exclude non-identified testlet variances,
+  full-theta testlet columns are standardized effects, and EM testlet fits
+  default to 21 Gauss-Hermite points per 2-D grid.
+- Unidimensional MCEM, QMCEM and stochastic EM fits report Oakes SEs and `vcov`;
+  other Monte Carlo EM fits are labelled `"complete_data"`.
+- `GibbsSampler` and `MHRMEstimator` refuse models with free shared parameters,
+  such as RSM thresholds, with `MirtModelError`.
+- GVEM records a fixed prior as `latent_mean` and `latent_covariance`, and its
+  slope shrinkage is documented.
+- `UnipolarLogLogistic` ("ULL") implements Lucke's (2015) model as R's itemtype
+  "ULL": theta = log tau, discrimination = eta and difficulty =
+  -log(lambda)/eta, with new `eta` and `log_lambda` properties, matching R to
+  1e-10. The old class evaluated a bell-shaped curve capped at 0.25.
+- Invalid item indices raise `MirtIndexError` (both an `IndexError` and a
+  `MirtValidationError`) in the LLTM, RaschLLTM, ExplanatoryIRT, spline,
+  polynomial, kernel-smoothing, custom, IRTree, response-time and longitudinal
+  models and in `extract_item`. Non-integer indices used to raise `TypeError`
+  for some of them.
+- `fit_cdm` and `fit_gdina` return a `CDMResult` (log-likelihood, AIC, BIC,
+  `n_parameters`, `n_iterations`, `converged`, `summary()`) that still unpacks
+  as `(model, class_probabilities)`. `fit_cdm` accepts GDINA, ACDM, LLM and
+  RRUM, both functions validate inputs the same way, and
+  `HigherOrderCDM.n_parameters` counts the item coefficients.
+- The "bockenholt" IRTree spec labels its first node and trait as the midpoint
+  (Bockenholt 2012) and is named "Bockenholt MDI"; the new
+  `IRTreeSpec.bockenholt_mdi` is also available under its former name
+  `bockenholt_adi`. `IRTreeResult.trait_means` are 0.
+- `MixedEffectsIRT` reports person effects on the total-variance-1 scale
+  (`residual_variance = 1 - R^2`), `max_iter` defaults to 500, item-covariate
+  effects no longer count in AIC/BIC, and person covariates need a 1PL, 2PL or
+  3PL base model.
+- `mirt.typing.AllModelType` lists only names that can be fitted, and
+  `AdvancedModelType` is documented.
+- The scoring functions share one response validator, which raises
+  `MirtDataError` and rejects fractional missing codes, and `fscores`,
+  `AbilityPosteriorResult` and `ScoreResult` share one person-ID validator.
+- `mirt.diagnostics.compare_models` compares `FitResult`s by information
+  criteria, as `mirt.compare_models` does. It used to compare PSIS-LOO and WAIC
+  results, which still work but are deprecated (see below).
+- `compute_m2`, `compute_fit_indices`, `compute_itemfit`, `compute_s_x2` and
+  `itemfit` default to `n_quadpts=None`, a dimension-aware grid, and oversized
+  grids raise `MirtValidationError`.
+- Default item names of `mirt.dif`, `compute_dif`, `multigroup_dif` and
+  `select_dif_anchors` are `Item_1`, ..., `Item_J`, matching `fit_mirt` and
+  `itemfit`, and `mirt.dif` rows are labelled by item name (the pandas index, or
+  the polars `item` column).
+- `compute_grdif` and `compute_pairwise_rdif` default to `scoring_method="ML"`,
+  as irtQ does. The `delta_msr` of `grdif_effect_size` is net of the model
+  expectation, which the new `msr_expected` key holds.
+- The DIF, DTF and DRF functions, including multigroup DIF, validate `n_jobs`
+  with the shared validator and raise `MirtValidationError` (a `ValueError`) for
+  invalid values.
+- `observed_score_equating` and `equipercentile_equating` with
+  `smoothing="loglinear"` use the moment-preserving maximum-likelihood
+  log-linear presmoother of `kernel_equating`; the old smoother's relative
+  moment error reached 4.9. Results change.
+- `concurrent_link`'s `tol` is the relative tolerance on (log A, B), default
+  1e-10, and `max_iter` counts criterion evaluations, default 100.
+- `link_mirt` and `oblique_procrustes_rotation` default to `gamma=1`
+  (unrestricted least squares; Li & Lissitz 2000), which recovers exact oblique
+  differences. The old ridge of 0.5 left a slope RMSE of 0.134 and remains
+  available.
+- NRM metric invariance constrains every category slope, where R constrains only
+  a1; this is now documented.
+- CAT and MCAT factories and options resolve names the same way. The engines
+  accept a `FitResult` and `prior_mean`/`prior_sd` (CAT) or
+  `prior_mean`/`prior_cov` (MCAT), `initial_theta` defaults to the prior mean,
+  and `ProgressiveRestricted` defaults to no window.
+- Rotation defaults follow R mirt: no Kaiser normalization except in promax's
+  varimax step, each column is reflected so its largest loading is positive, and
+  `tol` is the projected-gradient norm. `get_rotated_loadings` defaults to
+  oblimin (was varimax), computed on standardized loadings as R's
+  `summary(rotate=)` does.
+- `empirical_ES` defaults to `theta_range=(-6, 6)` and `n_points=61`, as R, and
+  its `classification` is Cohen's benchmark for `|ESSD|`. The `RMSD_DIF` and
+  `weighted_RMSD_DIF` docs state that they are not R's pooled `RMSD_DIF`.
+- In `fixed_calib`, `use_rust` no longer selects the estimator, and `n_quadpts`
+  must be at least 5.
+- Datasets other than LSAT6 and LSAT7 are documented as simulated stand-ins and
+  carry "simulated" metadata.
+- Wright maps place a multidimensional item at sum(a)/a_k times b.
+- The `likelihood_2pl` benchmark is renamed `likelihood_2pl_numpy`, since it
+  times the NumPy path.
+
+### Deprecated
+
+- The `theta` argument of `compute_ld_chi2` and `LD_X2` is ignored and emits a
+  `DeprecationWarning`: the statistics integrate over the latent population (see
+  `prior_mean`/`prior_cov`).
+- `mirt.diagnostics.compare_models` with `PSISResult` or `WAICResult` objects,
+  and `mirt.diagnostics.bayesian.compare_models`, still return the formatted
+  table but emit a `DeprecationWarning`; use `loo_compare`.
+- `EmpiricalHistogramWoods(extrapolation_factor=)` is ignored and emits a
+  `DeprecationWarning`.
+- `RTModelPriors.mu_mean` and `mu_cov` are ignored, as the ability-speed mean is
+  fixed at zero for identification; values other than the former defaults emit a
+  `DeprecationWarning`.
+- `empirical_ES(focal_weight=)` is ignored (use `theta_focal`) and emits a
+  `DeprecationWarning`.
+- `fixed_calib`'s `prob_clamp`, `min_count` and `min_valid_points` are ignored
+  and emit a `DeprecationWarning`.
+- `item_fit_chisq` emits a `DeprecationWarning`; use `itemfit` with
+  `statistics=["X2"]`.
+- `LLTMResult`, `LatentRegressionResult`, `ExplanatoryIRTResult` and
+  `MultilevelIRTResult`, which no estimator returns, emit a `DeprecationWarning`
+  when created.
+- The inert `CrossedRandomEffectsModel` options `include_item_effects`,
+  `set_variance_components`, `variance_components` and `variance_partition` emit
+  a `DeprecationWarning`.
+
+### Performance
+
+- Guarded PX-EM cuts EM iterations: 2PL 60 to 7 (0.35 s to 0.09 s with SEs),
+  GPCM 141 to 9, NRM 119 to 8 and 50-item PCM 120 to 22; `bootstrap_se` is 4-6x
+  faster.
+- `accelerate="squarem"` extrapolates the fused native 3PL iteration (3PL 0.53 s
+  to 0.15 s). The E-step makes two fewer passes, and expected counts skip a GEMM
+  when there is no missing data.
+- Item priors keep the batched M-steps (prior-aware 1PL/2PL/MIRT Newton, new
+  batched Fisher-scoring steps for 3PL and GRM/GPCM/PCM, and the common-slope
+  step): 4-9x faster with typical priors, with the same posterior mode
+  (log-posterior within 4e-9 at `tol=1e-8`).
+- NRM items use one batched multinomial Newton M-step (a default N=5000, J=30
+  fit is 2.9x faster), and `category_counts` caches one-hot indicators (4.6 ms
+  to 1.1 ms).
+- GPCM and NRM M-steps use `ftol` of at most 1e-10: GPCM needs 25-35 instead of
+  58-86 iterations and NRM 33-36 instead of 56-63, with estimates 10-20x closer
+  to the optimum.
+- Fixed coordinates and confirmatory patterns keep 1PL, 2PL and MIRT items in
+  the batched Newton M-step (one fixed b: 20.8 ms to 1.9 ms per iteration; a
+  2-factor `spec` fit 27.5 ms to 8.6 ms).
+- `EMEstimator(n_jobs>1)` keeps the fused native 3PL iteration (4-7x faster,
+  identical to `n_jobs=1`), and 3PL fits with normal, log-normal or beta item
+  priors use it too (1.4-1.55x). Native in-place posterior normalization speeds
+  each E-step 1.5-1.7x.
+- `EMEstimator` fits testlet models by Gibbons-Hedeker reduction (4 testlets at
+  N=2000: out of memory before, 0.14 s now), and `BifactorEMEstimator` accepts
+  testlet models, with exact SEs.
+- The first fit no longer imports torch (when CPU-only or missing) or
+  `scipy.stats`: 1.45 s and 314 MB become 0.19 s and 99 MB.
+- A default MHRM fit of a 1000x20 2PL takes 1.4 s natively (was 2.9 s) and 3.4 s
+  in NumPy (was 11.3 s).
+- Gibbs sampling (1.9x), GVEM (1.5x) and EAPsum with missing data (2.6x) are
+  faster now that they run in NumPy.
+- Response-time Gibbs updates are vectorized (about 2.5x), and the longitudinal
+  sampler uses a logit-based likelihood with reuse (about 2.3x).
+- GGUM threshold validation is vectorized (a 10-iteration EM fit 18.3 s to
+  3.5 s, identical results), and `fit_ising` takes 0.1-0.8 s for 10-30 nodes.
+- `fit_gdina` is 4.6-6.8x faster (GEMM counts, max-shift log-sum-exp,
+  warm-started reduced M-steps).
+- `BKTModel.forward_backward_batch` with person-specific layouts is much faster
+  for few learners or long sequences (P=2, T=1000: 17.1 ms to 0.20 ms; P=5,
+  T=5000: 73.9 ms to 0.97 ms), never slower, with identical results.
+- Multidimensional ML and WLE scoring use batched projected Newton, about 50x
+  faster (2-factor, N=3000: ML 5.9 s to 0.11 s, WLE 10 s to 0.23 s).
+- Diagnostics use a dimension-aware quadrature: a 4-factor
+  `compute_ld_statistics` takes 0.10 s instead of 15 s, and the default M2 of a
+  16-item 2PL takes 0.5 s instead of 60 s at 5 factors and 0.7 s at 6 factors,
+  where it ran out of memory.
+- `true_score_equating` is faster with identical results (150 five-category GRM
+  items: 104 ms to 37 ms; 300 3PL items: 7.0 ms to 4.2 ms).
+- Drift detection reuses the linking machinery (3-5x faster), and automatic
+  constants for built-in GRM, GPCM, PCM and NRM drift use the shared polytomous
+  linkers (about 3x faster; results agree to about 1e-8).
+- `delta_method_se` reads and validates only the anchors' covariance block: a
+  1000-item 3PL takes 0.02 s instead of 2.3 s, with no extra memory. Invalid
+  entries outside the anchor block are no longer rejected. For plain 3PL/5PL
+  subclasses, `link()` is about 2x and `delta_method_se` 15-25x faster.
+- Multigroup GRM, GPCM, PCM and NRM items are solved jointly with analytic
+  gradients (2-5.5x faster; NRM stops at a higher log-likelihood), and
+  metric-invariance 2PL fits use batched Newton (4.9x).
+- Polytomous CAT selection, exposure, stopping and assembly use all-item
+  information kernels (GRM randomesque 88 ms to 15 ms per examinee); Urry
+  selection takes 10 ms instead of 38 ms, and shadow tests use exact greedy
+  allocation when the constraints are separable (109 ms to 15 ms). Native CAT
+  batch simulation and conditional MSE release the GIL.
+
+### Removed
+
+- The unused `mirt.diagnostics.personfit.flag_aberrant_persons`, the duplicate
+  `mirt.utils.data.expand_table` (use `mirt.utils.expand_table`), the
+  `_validate_n_jobs` alias in `mirt.utils.bootstrap`, and the private
+  `_compute_expected_margins`, `_pareto_smooth_weights`, `_cronbach_alpha` and
+  `FitResult._compute_z_stats`.
+- `ProgressiveRestricted.max_information_seen`.
+- Native kernels that were no faster than NumPy, with their `mirt.backends.rust`
+  wrappers; their callers run in NumPy. `gibbs_sample_2pl` was 2-2.6x slower
+  with 3.3x fewer effective samples per second and clipped its proposals
+  (`GibbsSampler(use_rust=)` is now ignored). `em_fit_2pl` was reached only on
+  Gauss-Hermite grids, where `EMEstimator` now fits the 2PL (a tiny `fit_mirt`
+  2PL fit on 21 Gauss-Hermite points takes 31 ms instead of 13 ms). The EAPsum
+  Lord-Wingersky kernels were 2.5-3.5x slower with missing data, `gvem_e_step`,
+  `gvem_m_step` and `gvem_compute_elbo` were no faster, held the GIL and summed
+  the ELBO nondeterministically, and `compute_wle_scores` was no faster.
+- The native `compute_q3_matrix` and `compute_standardized_residuals` kernels
+  and their wrappers, which were no faster than NumPy (Q3 was 1.5x slower on
+  complete data and standardized residuals 1.4x slower). Q3 and residuals always
+  run in NumPy.
+- The uncalled native kernels `compute_ld_chi2_matrix` and `fixed_calib_em`,
+  with their wrappers and the `mirt.backends.rust.calibration` module, and the
+  native Gauss-Hermite rule.
+- Experimental native kernels that no library code reached, with their
+  `mirt.backends.rust` exports and the modules `mirt.backends.rust.estep`,
+  `likelihood`, `mstep` and `plausible`, plus the GPU helpers
+  `e_step_complete_gpu` and `compute_log_likelihoods_mirt_gpu`. The public
+  replacements are `fscores`, `sibtest_items`, `generate_plausible_values`,
+  `impute_responses`, `link(method="stocking_lord")`, `CATEngine`, `FitResult`
+  standard errors and `itemfit`/`personfit`. In all, `mirt.backends.rust` now
+  exports 27 names instead of 77.
+
 ## [1.2.0] - 2026-10-11
 
 ### Security

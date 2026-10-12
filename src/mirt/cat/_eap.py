@@ -19,9 +19,10 @@ def score_binary_eap(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
     """Score only administered curves; preserve customized likelihood paths.
 
-    Cache the parameter-independent quadrature grid, but reevaluate response
-    history against the current model every time. Parameter and structural
-    changes between responses therefore cannot leave stale posterior evidence.
+    Cache the parameter-independent quadrature grid of the engine's scoring
+    prior, but reevaluate response history against the current model every
+    time. Parameter and structural changes between responses therefore
+    cannot leave stale posterior evidence.
     """
     from mirt.models.base import DichotomousItemModel
     from mirt.scoring._common import build_quadrature
@@ -42,14 +43,20 @@ def score_binary_eap(
     from mirt.scoring.eap import EAPScorer
 
     EAPScorer(n_quadpts=engine.n_quadpts)
-    key = (engine.n_quadpts, model.n_factors)
+    prior_mean, prior_cov = engine._scoring_prior()
+    key = (
+        engine.n_quadpts,
+        model.n_factors,
+        None if prior_mean is None else tuple(np.ravel(prior_mean).tolist()),
+        None if prior_cov is None else tuple(np.ravel(prior_cov).tolist()),
+    )
     cached = getattr(engine, "_eap_quadrature", None)
     if cached is None or cached[0] != key:
         points, weights = build_quadrature(
             n_quadpts=engine.n_quadpts,
             n_factors=model.n_factors,
-            prior_mean=None,
-            prior_cov=None,
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
         )
         cached = (key, points, np.log(weights + 1e-300))
         engine._eap_quadrature = cached

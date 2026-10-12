@@ -39,7 +39,7 @@ def try_polytomous_m_step(
         GradedResponseModel,
         PartialCreditModel,
     )
-    from mirt.scoring._common import resolve_n_jobs
+    from mirt.utils._parallel import resolve_n_jobs
 
     if (
         not rust_enabled()
@@ -66,11 +66,13 @@ def try_polytomous_m_step(
     params, masks = model.parameters, model.free_parameter_masks
     packed = np.column_stack((params["discrimination"], params[name]))
     free = np.column_stack((masks["discrimination"], masks[name]))
-    # Free starting values must lie inside the generic optimizer's boxes.
-    low, high = _parameter_bounds(model, name)
-    lower = np.full(packed.shape[1], low)
-    upper = np.full(packed.shape[1], high)
-    lower[0], upper[0] = _parameter_bounds(model, "discrimination")
+    # The native optimizer keeps the generic optimizer's boxes, and free
+    # starting values must lie inside them.
+    location_box = _parameter_bounds(model, name)
+    slope_box = _parameter_bounds(model, "discrimination")
+    lower = np.full(packed.shape[1], location_box[0])
+    upper = np.full(packed.shape[1], location_box[1])
+    lower[0], upper[0] = slope_box
     if not np.all(np.isfinite(packed)) or np.any(
         free & ((packed < lower) | (packed > upper))
     ):
@@ -88,6 +90,8 @@ def try_polytomous_m_step(
         float(ftol),
         float(epsilon),
         workers,
+        slope_box,
+        location_box,
         None if context is None else context.native_pool(workers),
     )
     updated = {name: optimized[:, 1:]}

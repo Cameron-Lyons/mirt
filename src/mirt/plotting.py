@@ -9,7 +9,7 @@ Callers may also supply an existing axes-compatible object.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from mirt.constants import PROB_EPSILON
 
@@ -229,15 +229,150 @@ def _item_information(
     )
 
 
+def _category_columns(probabilities: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return category probabilities, adding ``1 - P`` to binary curves."""
+    import numpy as np
+
+    if probabilities.ndim == 1:
+        return np.column_stack((1.0 - probabilities, probabilities))
+    return probabilities
+
+
+def _numerical_factor_information(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_idx: int,
+    factor: int,
+) -> NDArray[np.float64]:
+    """Fisher information of one item along one factor, by central differences.
+
+    The information along the unit vector ``e_k`` is
+    ``sum_c (dP_c / dtheta_k)^2 / P_c`` over the item's categories.
+    """
+    import numpy as np
+
+    step = np.cbrt(np.finfo(np.float64).eps) * np.maximum(1.0, np.abs(theta[:, factor]))
+    upper = theta.copy()
+    lower = theta.copy()
+    upper[:, factor] += step
+    lower[:, factor] -= step
+    width = (upper[:, factor] - lower[:, factor])[:, None]
+    center = _category_columns(_probability_curves(model, theta, item_idx))
+    derivative = (
+        _category_columns(_probability_curves(model, upper, item_idx))
+        - _category_columns(_probability_curves(model, lower, item_idx))
+    ) / width
+    return np.sum(np.square(derivative) / np.maximum(center, PROB_EPSILON), axis=1)
+
+
+def _factor_item_information(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_idx: int,
+    factor: int,
+) -> NDArray[np.float64]:
+    """Information of one item along ``factor``: ``[I_j(theta)]_kk``.
+
+    Models with ``item_information_matrix`` supply the diagonal element of
+    their exact Fisher matrices; other models are differentiated
+    numerically along the factor.
+    """
+    import numpy as np
+
+    from mirt.exceptions import MirtModelError
+
+    n_points, n_factors = theta.shape
+    matrix_function = getattr(model, "item_information_matrix", None)
+    matrices = None
+    if callable(matrix_function):
+        try:
+            matrices = np.asarray(matrix_function(theta, item_idx), dtype=np.float64)
+        except (MirtModelError, NotImplementedError):
+            pass  # e.g. mixed-format components without exact matrices
+    if matrices is None:
+        values = _numerical_factor_information(model, theta, item_idx, factor)
+    elif matrices.shape == (n_points, n_factors, n_factors):
+        values = matrices[:, factor, factor]
+    else:
+        raise ValueError(
+            "item information matrices must have shape (n_points, n_factors, n_factors)"
+        )
+    return _curve(
+        values,
+        n_points,
+        f"information for item {item_idx}",
+        nonnegative=True,
+    )
+
+
+def _factor_test_information(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    factor: int,
+    item_curves: NDArray[np.float64] | None = None,
+) -> NDArray[np.float64]:
+    """Test information along ``factor``: ``[I(theta)]_kk``, summed over items.
+
+    ``item_curves`` may hold every item's curve along the factor already.
+    """
+    import numpy as np
+
+    n_items, n_factors = _model_size(model)
+    n_points = theta.shape[0]
+    matrix_function = getattr(model, "test_information_matrix", None)
+    if item_curves is None and callable(matrix_function):
+        matrices = np.asarray(matrix_function(theta), dtype=np.float64)
+        if matrices.shape != (n_points, n_factors, n_factors):
+            raise ValueError(
+                "test information matrices must have shape "
+                "(n_points, n_factors, n_factors)"
+            )
+        return _curve(
+            matrices[:, factor, factor],
+            n_points,
+            "test information",
+            nonnegative=True,
+        )
+    if item_curves is None:
+        item_curves = np.column_stack(
+            [
+                _factor_item_information(model, theta, index, factor)
+                for index in range(n_items)
+            ]
+        )
+    return np.sum(item_curves, axis=1)
+
+
 def _information_curves(
     model: BaseItemModel,
     theta: NDArray[np.float64],
     indices: list[int],
     include_total: bool,
+    factor: int = 0,
 ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None]:
     import numpy as np
 
-    n_items, _ = _model_size(model)
+    n_items, n_factors = _model_size(model)
+    if n_factors > 1:
+        # Information along the plotted factor, not the trace over factors.
+        item_curves = (
+            np.column_stack(
+                [
+                    _factor_item_information(model, theta, index, factor)
+                    for index in indices
+                ]
+            )
+            if indices
+            else None
+        )
+        if not include_total:
+            return None, item_curves
+        all_items = item_curves is not None and sorted(indices) == list(range(n_items))
+        total = _factor_test_information(
+            model, theta, factor, item_curves if all_items else None
+        )
+        return total, item_curves
+
     is_polytomous = bool(getattr(model, "is_polytomous", False))
 
     if is_polytomous and indices:
@@ -261,6 +396,12 @@ def _information_curves(
     else:
         selected = full_item_curves[:, indices]
     return total if include_total else None, selected
+
+
+def _factor_label(label: str, model: BaseItemModel, factor: int) -> str:
+    """Name the plotted factor of a multidimensional model in an axis label."""
+    _, n_factors = _model_size(model)
+    return label if n_factors == 1 else f"{label} (factor {factor + 1})"
 
 
 def _expected_score(
@@ -338,6 +479,40 @@ def _mapping_values(
     if not np.all(finite):
         raise ValueError(f"{key} must contain only finite values")
     return values
+
+
+def _result_columns(
+    results: Any, name: str
+) -> tuple[Mapping[str, Any], list[str] | None]:
+    """Read a results mapping or a pandas/polars DataFrame of item rows.
+
+    Returns the columns by name and the item labels of a frame: the index of
+    a pandas frame unless it is the default ``0, 1, ...`` range, or the
+    ``item`` column of a polars frame, as :func:`mirt.itemfit` and
+    :func:`mirt.dif` label their rows.
+    """
+    import numpy as np
+
+    if isinstance(results, Mapping):
+        return results, None
+    columns = getattr(results, "columns", None)
+    if columns is None:
+        raise ValueError(f"{name} must be a mapping or a pandas or polars DataFrame")
+    get_column = getattr(results, "get_column", None)
+    if callable(get_column):
+        values = {str(column): get_column(column).to_numpy() for column in columns}
+        labels = values.pop("item", None)
+    else:
+        values = {
+            str(column): np.asarray(results[column].to_numpy()) for column in columns
+        }
+        index = getattr(results, "index", None)
+        labels = None if index is None else list(index)
+        if labels is not None and getattr(index, "name", None) is None:
+            if labels == list(range(len(labels))):
+                labels = None
+    names = None if labels is None else [str(label) for label in labels]
+    return values, names
 
 
 def _ordered_pair(values: tuple[float, float], name: str) -> tuple[float, float]:
@@ -454,7 +629,15 @@ def plot_information(
     factor: int = 0,
     **kwargs: Any,
 ) -> Any:
-    """Plot test information and optional item-information curves."""
+    """Plot test information and optional item-information curves.
+
+    For a multidimensional model the curves vary ``factor`` while holding the
+    other factors at zero and show the information along that factor: the
+    diagonal element ``[I(theta)]_kk`` of the Fisher information matrix, as
+    R's ``testinfo(degrees=)`` for the angle pointing along the factor.
+    This is not the trace over all factors that :func:`mirt.testinfo` and
+    :func:`mirt.iteminfo` return for multidimensional models.
+    """
     import numpy as np
 
     model = _resolve_model(model)
@@ -468,7 +651,9 @@ def plot_information(
         indices = _item_indices(model, item_idx)
     if not test_info and not indices:
         raise ValueError("select at least one item when test_info is False")
-    total, item_curves = _information_curves(model, theta, indices, bool(test_info))
+    total, item_curves = _information_curves(
+        model, theta, indices, bool(test_info), int(factor)
+    )
 
     ax = _resolve_axes(ax, (8, 6))
     if total is not None:
@@ -485,7 +670,7 @@ def plot_information(
                 **{"label": _item_name(model, index), "alpha": 0.7, **kwargs},
             )
     ax.set_xlabel(r"$\theta$ (Ability)")
-    ax.set_ylabel("Information")
+    ax.set_ylabel(_factor_label("Information", model, int(factor)))
     ax.set_title("Information Function")
     ax.set_xlim(limits)
     ax.grid(True, alpha=0.3)
@@ -575,19 +760,24 @@ def plot_ability_distribution(
 
 
 def plot_itemfit(
-    fit_stats: dict[str, NDArray[np.float64]],
+    fit_stats: Mapping[str, Any] | Any,
     statistic: str = "infit",
     criterion: tuple[float, float] = (0.7, 1.3),
     item_names: list[str] | None = None,
     ax: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Plot item-fit statistics and flag values outside a criterion band."""
-    if not isinstance(fit_stats, Mapping):
-        raise ValueError("fit_stats must be a mapping")
-    values = _mapping_values(fit_stats, statistic)
+    """Plot item-fit statistics and flag values outside a criterion band.
+
+    ``fit_stats`` is the mapping of
+    :func:`mirt.diagnostics.itemfit.compute_itemfit` or the pandas or polars
+    DataFrame of :func:`mirt.itemfit`, whose item labels name the bars
+    unless ``item_names`` is given.
+    """
+    columns, frame_names = _result_columns(fit_stats, "fit_stats")
+    values = _mapping_values(columns, statistic)
     lower, upper = _ordered_pair(criterion, "criterion")
-    names = _names(item_names, values.size)
+    names = _names(frame_names if item_names is None else item_names, values.size)
     colors = ["steelblue" if lower <= value <= upper else "tomato" for value in values]
     custom_color = "color" in kwargs
     bar_kwargs = {"color": colors, **kwargs}
@@ -610,66 +800,149 @@ def plot_itemfit(
     return ax
 
 
+def _slope_matrix(
+    model: BaseItemModel,
+    params: Mapping[str, Any],
+    n_items: int,
+    n_factors: int,
+) -> NDArray[np.float64] | None:
+    """Return item slopes of shape ``(n_items, n_factors)``, if the model has any."""
+    import numpy as np
+
+    slopes = params.get("slopes", params.get("discrimination"))
+    if slopes is None:
+        loading_matrix = getattr(model, "get_loading_matrix", None)
+        if not callable(loading_matrix):
+            return None
+        slopes = loading_matrix()
+    slope_values = np.asarray(slopes, dtype=np.float64)
+    if slope_values.shape == (n_items,) and n_factors == 1:
+        return slope_values[:, None]
+    if slope_values.shape == (n_items, n_factors):
+        return slope_values
+    raise ValueError("slope parameters have an unsupported shape")
+
+
+def _active_means(
+    model: BaseItemModel,
+    values: NDArray[np.float64],
+    n_items: int,
+    name: str,
+) -> NDArray[np.float64]:
+    """Mean of each item's active thresholds or steps, ignoring padding."""
+    import numpy as np
+
+    if values.ndim != 2 or values.shape[0] != n_items:
+        raise ValueError(f"{name} parameters have an unsupported shape")
+    counts = getattr(model, "n_categories", None)
+    if not (isinstance(counts, Sequence) and len(counts) == n_items):
+        return np.mean(values, axis=1)
+    category_counts = np.asarray(counts, dtype=np.int64)
+    if np.any(category_counts < 2) or np.any(category_counts - 1 > values.shape[1]):
+        raise ValueError(f"n_categories is inconsistent with {name}")
+    return np.asarray(
+        [
+            np.mean(values[index, : int(category_counts[index]) - 1])
+            for index in range(n_items)
+        ],
+        dtype=np.float64,
+    )
+
+
 def _item_locations(model: BaseItemModel, factor: int) -> NDArray[np.float64]:
+    """Locations of the items on ``factor``, NaN where none is defined.
+
+    A location is the point of the factor, with the other factors at zero,
+    where the item's (mean) logit is zero: the difficulty of a dichotomous
+    item, the mean threshold of a graded item and the mean step of a
+    (generalized) partial credit item, or ``-d / a_k`` for slope-intercept
+    items. In several dimensions an item stored with a difficulty and slope
+    vector ``a`` is located at ``sum(a) / a_k`` times that difficulty. Items
+    with a zero slope on the factor have no location there. Mixed-format
+    models locate each component's items.
+    """
     import numpy as np
 
     n_items, n_factors = _model_size(model)
     if factor < 0 or factor >= n_factors:
         raise ValueError(f"factor must be in [0, {n_factors})")
+
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        locations = np.full(n_items, np.nan)
+        for component, items in model.components:
+            try:
+                locations[np.asarray(items)] = _item_locations(component, factor)
+            except ValueError:
+                # Families without item locations, such as nominal items.
+                continue
+        if not np.any(np.isfinite(locations)):
+            raise ValueError("no item of this model has an item location")
+        return locations
+
     params = model.parameters
     if not isinstance(params, Mapping):
         raise ValueError("model.parameters must be a mapping")
 
+    defined = np.ones(n_items, dtype=np.bool_)
     if "difficulty" in params:
         difficulty = np.asarray(params["difficulty"], dtype=np.float64)
         if difficulty.shape == (n_items,):
             locations = difficulty
+            scale_by_slopes = True
         elif difficulty.shape == (n_items, n_factors):
             locations = difficulty[:, factor]
+            scale_by_slopes = False
         else:
             raise ValueError("difficulty parameters have an unsupported shape")
     elif "thresholds" in params:
         thresholds = np.asarray(params["thresholds"], dtype=np.float64)
         if thresholds.ndim != 2 or thresholds.shape[0] != n_items:
             raise ValueError("threshold parameters have an unsupported shape")
-        counts = getattr(model, "n_categories", None)
-        if isinstance(counts, Sequence) and len(counts) == n_items:
-            category_counts = np.asarray(counts, dtype=np.int64)
-            if np.any(category_counts < 2) or np.any(
-                category_counts - 1 > thresholds.shape[1]
-            ):
-                raise ValueError("n_categories is inconsistent with thresholds")
-            locations = np.asarray(
-                [
-                    np.mean(thresholds[index, : int(category_counts[index]) - 1])
-                    for index in range(n_items)
-                ],
-                dtype=np.float64,
-            )
-        else:
-            locations = np.mean(thresholds, axis=1)
+        locations = _active_means(model, thresholds, n_items, "thresholds")
+        scale_by_slopes = True
+    elif "steps" in params:
+        steps = np.asarray(params["steps"], dtype=np.float64)
+        locations = _active_means(model, steps, n_items, "steps")
+        scale_by_slopes = True
     elif "intercepts" in params:
         intercepts = np.asarray(params["intercepts"], dtype=np.float64)
         if intercepts.shape != (n_items,):
-            raise ValueError("intercept parameters have an unsupported shape")
-        slopes = params.get("slopes", params.get("discrimination"))
+            raise ValueError(
+                "intercept parameters have an unsupported shape; nominal "
+                "response items have no single item location"
+            )
+        slopes = _slope_matrix(model, params, n_items, n_factors)
         if slopes is None:
             locations = -intercepts
         else:
-            slope_values = np.asarray(slopes, dtype=np.float64)
-            if slope_values.shape == (n_items,):
-                denominator = slope_values
-            elif slope_values.shape == (n_items, n_factors):
-                denominator = slope_values[:, factor]
-            else:
-                raise ValueError("slope parameters have an unsupported shape")
-            if np.any(np.abs(denominator) <= PROB_EPSILON):
+            denominator = slopes[:, factor]
+            defined = np.abs(denominator) > PROB_EPSILON
+            if not np.any(defined):
                 raise ValueError("item locations are undefined for zero slopes")
-            locations = -intercepts / denominator
+            locations = np.full(n_items, np.nan)
+            locations[defined] = -intercepts[defined] / denominator[defined]
+        scale_by_slopes = False
     else:
         raise ValueError("model does not expose item location parameters")
 
-    if locations.shape != (n_items,) or not np.all(np.isfinite(locations)):
+    if scale_by_slopes and n_factors > 1:
+        # A slope-weighted location: the logit a @ theta - sum(a) * b is zero
+        # at theta_k = sum(a) * b / a_k when the other factors are zero.
+        slopes = _slope_matrix(model, params, n_items, n_factors)
+        if slopes is not None:
+            denominator = slopes[:, factor]
+            defined = np.abs(denominator) > PROB_EPSILON
+            if not np.any(defined):
+                raise ValueError("item locations are undefined for zero slopes")
+            scaled = np.full(n_items, np.nan)
+            scaled[defined] = (
+                locations[defined] * slopes[defined].sum(axis=1) / denominator[defined]
+            )
+            locations = scaled
+
+    if locations.shape != (n_items,) or not np.all(np.isfinite(locations[defined])):
         raise ValueError("item locations must be finite")
     return locations
 
@@ -684,7 +957,21 @@ def plot_person_item_map(
     item_kwargs: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Plot a Wright map for one factor with persons and item locations."""
+    """Plot a Wright map for one factor with persons and item locations.
+
+    Item locations are difficulties, mean GRM thresholds, mean GPCM or PCM
+    steps, or ``-d / a`` for slope-intercept items; mixed-format models
+    combine their components. For a multidimensional model the map shows
+    the items that load on ``factor``, located where their (mean) logit is
+    zero with the other factors at zero; items without a slope on the
+    factor are left out and counted in a note.
+
+    Raises
+    ------
+    ValueError
+        If no item has a location on the factor, as for nominal response
+        models, whose unordered categories have no single item location.
+    """
     import numpy as np
 
     model = _resolve_model(model)
@@ -695,6 +982,7 @@ def plot_person_item_map(
     except (TypeError, ValueError):
         raise ValueError("bins must be a valid histogram bin specification") from None
     locations = _item_locations(model, factor)
+    located = np.flatnonzero(np.isfinite(locations))
     if item_kwargs is not None and not isinstance(item_kwargs, Mapping):
         raise ValueError("item_kwargs must be a mapping")
     marker_kwargs = {"color": "red", "s": 64.0, **dict(item_kwargs or {})}
@@ -709,50 +997,115 @@ def plot_person_item_map(
     ax = _resolve_axes(ax, (10, 8))
     item_ax = ax.twiny()
     ax.hist(values, bins=bins, **histogram_kwargs)
-    item_ax.scatter(np.full(locations.size, 0.5), locations, **marker_kwargs)
-    for location, name in zip(
-        locations,
-        (_item_name(model, index) for index in range(model.n_items)),
-        strict=True,
-    ):
-        item_ax.annotate(name, (0.55, location), fontsize=8, va="center")
-    ax.set_ylabel(r"$\theta$ / Item Location")
+    item_ax.scatter(np.full(located.size, 0.5), locations[located], **marker_kwargs)
+    for index in located:
+        item_ax.annotate(
+            _item_name(model, int(index)),
+            (0.55, locations[index]),
+            fontsize=8,
+            va="center",
+        )
+    ax.set_ylabel(_factor_label(r"$\theta$ / Item Location", model, int(factor)))
     ax.set_xlabel("Person Count")
     item_ax.set_xlim(0, 1)
     item_ax.set_xticks([])
-    ax.set_title("Person-Item Map (Wright Map)")
+    n_omitted = locations.size - located.size
+    if n_omitted:
+        ax.text(
+            0.99,
+            0.01,
+            f"{n_omitted} item(s) without a location on this factor not shown",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+        )
+    ax.set_title(_factor_label("Person-Item Map (Wright Map)", model, int(factor)))
     ax.legend(loc="upper left")
     return ax
 
 
+_ETS_THRESHOLDS = {
+    # Zwick (2012): |MH D-DIF| of 1 and 1.5 for binary items, and |SMD/SD|
+    # above 0.17 and 0.25 for polytomous items, start classes B and C.
+    "delta": (1.0, 1.5, "|MH D-DIF|"),
+    "smd": (0.17, 0.25, "|SMD / SD|"),
+}
+
+
 def plot_dif(
-    dif_results: dict[str, NDArray[np.float64]],
-    effect_size_key: str = "effect_size",
+    dif_results: Mapping[str, Any] | Any,
+    effect_size_key: str | None = None,
     classification_key: str = "classification",
     item_names: list[str] | None = None,
     ax: Any = None,
+    *,
+    ets_scale: Literal["delta", "smd"] | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Plot absolute DIF effect sizes using ETS A/B/C classifications.
+    """Plot absolute DIF effects using ETS A/B/C classifications.
 
-    Untested items, such as DIF anchors, have ``NaN`` effect sizes and are
-    drawn with zero height.
+    Parameters
+    ----------
+    dif_results : mapping or DataFrame
+        The mapping of :func:`mirt.diagnostics.compute_dif` or the pandas or
+        polars DataFrame of :func:`mirt.dif`, whose item labels name the
+        bars unless ``item_names`` is given.
+    effect_size_key : str, optional
+        Column to plot. Defaults to ``"ets_effect"``, the MH D-DIF or
+        SMD/SD behind the ETS class, when present, otherwise
+        ``"effect_size"``.
+    classification_key : str, default="classification"
+        Column of A/B/C classes that colors the bars.
+    item_names : list of str, optional
+        Bar labels.
+    ax : matplotlib axes, optional
+        Axes to draw on.
+    ets_scale : {"delta", "smd"}, optional
+        Scale of ``ets_effect``, which places the B and C threshold lines:
+        ``"delta"`` (binary items, ``|MH D-DIF|`` of 1 and 1.5) or ``"smd"``
+        (polytomous items, ``|SMD/SD|`` of 0.17 and 0.25). Defaults to the
+        ``ets_scale`` entry of ``dif_results``. The DataFrame of
+        :func:`mirt.dif` does not carry it, so pass it to draw the lines for
+        a frame; without a scale, and for columns other than
+        ``ets_effect``, no threshold lines are drawn.
+    **kwargs
+        Forwarded to ``ax.bar``.
+
+    Notes
+    -----
+    Untested items, such as DIF anchors, have ``NaN`` effects and are drawn
+    with zero height.
     """
     import numpy as np
 
-    if not isinstance(dif_results, Mapping):
-        raise ValueError("dif_results must be a mapping")
-    effect_sizes = _mapping_values(dif_results, effect_size_key, allow_missing=True)
-    if classification_key not in dif_results:
+    columns, frame_names = _result_columns(dif_results, "dif_results")
+    if effect_size_key is None:
+        effect_size_key = "ets_effect" if "ets_effect" in columns else "effect_size"
+    effect_sizes = _mapping_values(columns, effect_size_key, allow_missing=True)
+    if classification_key not in columns:
         raise ValueError(f"results do not contain {classification_key!r}")
-    classifications = np.asarray(dif_results[classification_key])
+    classifications = np.asarray(columns[classification_key])
     if classifications.shape != effect_sizes.shape:
         raise ValueError("classifications must match effect-size shape")
     labels = np.char.upper(classifications.astype(str))
     valid_labels = {"A", "B", "C"}
     if any(label not in valid_labels for label in labels):
         raise ValueError("classifications must contain only A, B, or C")
-    names = _names(item_names, effect_sizes.size)
+    if frame_names is None and isinstance(dif_results, Mapping):
+        stored_names = dif_results.get("item_names")
+        if stored_names is not None and len(stored_names) == effect_sizes.size:
+            frame_names = [str(name) for name in stored_names]
+    names = _names(frame_names if item_names is None else item_names, effect_sizes.size)
+    thresholds = None
+    if effect_size_key == "ets_effect":
+        scale = ets_scale if ets_scale is not None else columns.get("ets_scale")
+        if scale is not None:
+            if scale not in _ETS_THRESHOLDS:
+                raise ValueError("ets_scale must be 'delta' or 'smd'")
+            thresholds = _ETS_THRESHOLDS[scale]
+    elif ets_scale is not None:
+        raise ValueError("ets_scale applies only to the 'ets_effect' column")
     color_map = {"A": "green", "B": "gold", "C": "red"}
     colors = [color_map[label] for label in labels]
     custom_color = "color" in kwargs
@@ -763,12 +1116,32 @@ def plot_dif(
         np.abs(np.nan_to_num(effect_sizes, nan=0.0)),
         **{"color": colors, **kwargs},
     )
-    ax.axhline(y=0.426, color="gold", linestyle="--", alpha=0.7, label="B threshold")
-    ax.axhline(y=0.638, color="red", linestyle="--", alpha=0.7, label="C threshold")
+    if thresholds is not None:
+        low, high, axis_label = thresholds
+        ax.axhline(
+            y=low,
+            color="gold",
+            linestyle="--",
+            alpha=0.7,
+            label=f"B threshold ({low:g})",
+        )
+        ax.axhline(
+            y=high,
+            color="red",
+            linestyle="--",
+            alpha=0.7,
+            label=f"C threshold ({high:g})",
+        )
+    elif effect_size_key == "ets_effect":
+        axis_label = "|ETS effect|"
+    elif effect_size_key == "effect_size":
+        axis_label = "|Effect Size|"
+    else:
+        axis_label = f"|{effect_size_key}|"
     ax.set_xticks(range(effect_sizes.size))
     ax.set_xticklabels(names, rotation=45, ha="right")
     ax.set_xlabel("Item")
-    ax.set_ylabel("|Effect Size|")
+    ax.set_ylabel(axis_label)
     ax.set_title("DIF Effect Sizes (ETS Classification)")
     ax.grid(True, alpha=0.3, axis="y")
     if not custom_color:
@@ -780,7 +1153,8 @@ def plot_dif(
             ax.scatter(
                 [], [], marker="s", color=color, label=f"{label} ({description})"
             )
-    ax.legend(loc="best")
+    if thresholds is not None or not custom_color or "label" in kwargs:
+        ax.legend(loc="best")
     return ax
 
 
@@ -822,19 +1196,29 @@ def plot_se(
     factor: int = 0,
     **kwargs: Any,
 ) -> Any:
-    """Plot standard error of measurement from total information."""
+    """Plot standard error of measurement from total information.
+
+    The standard error is ``1 / sqrt(I(theta))``. For a multidimensional
+    model ``I`` is the test information along ``factor``, the diagonal
+    element ``[I(theta)]_kk`` that :func:`plot_information` draws, so the
+    curve is the standard error of that factor when the others are known.
+    """
     import numpy as np
 
     model = _resolve_model(model)
 
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
-    information, _ = _full_information(model, theta)
+    _, n_factors = _model_size(model)
+    if n_factors > 1:
+        information = _factor_test_information(model, theta, int(factor))
+    else:
+        information, _ = _full_information(model, theta)
     standard_error = 1.0 / np.sqrt(np.maximum(information, PROB_EPSILON))
 
     ax = _resolve_axes(ax, (8, 6))
     ax.plot(theta_values, standard_error, **{"linewidth": 2.0, **kwargs})
     ax.set_xlabel(r"$\theta$ (Ability)")
-    ax.set_ylabel("Standard Error")
+    ax.set_ylabel(_factor_label("Standard Error", model, int(factor)))
     ax.set_title("Standard Error of Measurement")
     ax.set_xlim(limits)
     ax.grid(True, alpha=0.3)

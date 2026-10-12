@@ -502,9 +502,7 @@ class TestBenchmarkCommand:
             for label in (
                 "1pl",
                 "2pl",
-                "complete_e_step",
                 "3pl",
-                "mirt_3d",
                 "grm",
                 "grm_mixed",
                 "gpcm",

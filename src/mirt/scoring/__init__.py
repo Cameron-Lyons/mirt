@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike, NDArray
 
     from mirt.models.base import BaseItemModel
+    from mirt.multigroup.results import MultigroupFitResult
     from mirt.results.fit_result import FitResult
     from mirt.results.score_result import ScoreResult
 
@@ -28,7 +29,7 @@ _LAZY_IMPORTS = {
 
 
 def fscores(
-    model_or_result: BaseItemModel | FitResult,
+    model_or_result: BaseItemModel | FitResult | MultigroupFitResult,
     responses: ArrayLike,
     method: Literal["EAP", "MAP", "ML", "WLE", "EAPsum"] = "EAP",
     n_quadpts: int | None = None,
@@ -38,6 +39,8 @@ def fscores(
     bounds: tuple[float, float] = (-6.0, 6.0),
     n_jobs: int = 1,
     batch_size: int | None = None,
+    *,
+    groups: ArrayLike | None = None,
 ) -> ScoreResult:
     """Compute ability (theta) estimates for respondents.
 
@@ -46,12 +49,20 @@ def fscores(
 
     Parameters
     ----------
-    model_or_result : BaseItemModel | FitResult
-        A fitted IRT model or a FitResult from fit_mirt().
+    model_or_result : BaseItemModel | FitResult | MultigroupFitResult
+        A fitted IRT model, a FitResult from fit_mirt(), or a
+        MultigroupFitResult from fit_multigroup(), which scores each row
+        under its group's items and latent distribution (see
+        :meth:`~mirt.multigroup.MultigroupFitResult.fscores`).
     responses : array-like of shape (n_persons, n_items)
         Response matrix, as an array or a pandas or polars DataFrame.
         Negative codes, ``NaN`` and the nulls of nullable DataFrame columns
-        denote missing responses, as in :func:`mirt.fit_mirt`.
+        denote missing responses, as in :func:`mirt.fit_mirt`. Array columns
+        are matched to the model's items by position. DataFrame columns are
+        matched by name when the model's items have names, as after fitting
+        a DataFrame: columns may then come in any order, and columns that
+        are not items, such as respondent identifiers, are ignored (see
+        :func:`mirt.utils.data.align_response_columns`).
     method : {"EAP", "MAP", "ML", "WLE", "EAPsum"}, default="EAP"
         Scoring method to use:
 
@@ -84,18 +95,30 @@ def fscores(
     person_ids : list or 1-D ndarray, optional
         Identifiers for each person in the output, one per response row.
     bounds : tuple of float, default=(-6.0, 6.0)
-        Bounds for theta estimation used by MAP, ML, and WLE.
+        Bounds for theta estimation used by MAP, ML, and WLE. A pattern
+        whose observed responses are all in the lowest category, or all in
+        each item's highest category, has no finite ML estimate; ML reports
+        it at the lower or upper bound in every coordinate with an infinite
+        standard error, for every model family. For multidimensional models,
+        ML likewise reports a coordinate whose likelihood still increases at
+        a bound, such as a factor whose items are all answered in their
+        lowest or highest category, at that bound with an infinite standard
+        error. R's mirt reports ``-Inf``/``Inf`` with missing standard errors
+        instead.
     n_jobs : int, default=1
         Number of response patterns to optimize in parallel for MAP, ML, and
         WLE scoring. ``-1`` uses all available CPU cores. Unidimensional
-        models, and MAP for built-in multidimensional models, score every
-        pattern in one vectorized optimization that does not use a thread
-        pool.
+        models and built-in multidimensional models score every pattern in
+        one vectorized optimization that does not use a thread pool.
     batch_size : int, optional
         Maximum response rows per EAP likelihood batch. Repetition-heavy data
         are compressed to unique patterns when beneficial and expanded back to
         respondents. The default chooses a memory-bounded size automatically.
         Other scoring methods ignore this option.
+    groups : array-like of shape (n_persons,), optional
+        Group label of each row, required for a ``MultigroupFitResult`` and
+        rejected otherwise. The groups' fitted latent distributions are the
+        priors, so ``prior_mean`` and ``prior_cov`` must be omitted then.
 
     Returns
     -------
@@ -109,9 +132,20 @@ def fscores(
     Raises
     ------
     ValueError
-        If model is not fitted or responses shape is invalid.
+        If the model is not fitted or ``method`` is unknown.
+    MirtDataError
+        If ``responses`` has the wrong shape or invalid response codes, or is
+        a DataFrame without columns for some of the model's named items.
+        ``MirtDataError`` is a ``ValueError``.
     MirtValidationError
         If ``person_ids`` does not contain one identifier per response row.
+
+    Notes
+    -----
+    WLE for multidimensional models maximizes the likelihood weighted by the
+    square root of the determinant of the observed items' Fisher information
+    matrix, as R's mirt does, and reports standard errors from the inverse of
+    that matrix.
 
     Examples
     --------
@@ -120,8 +154,33 @@ def fscores(
     >>> scores = fscores(result, data, method="EAP")
     >>> print(scores.theta[:5])
     """
-    from mirt.results._common import resolve_latent_prior
-    from mirt.utils.data import _missing_coded_responses
+    from mirt.exceptions import MirtValidationError
+    from mirt.multigroup.results import MultigroupFitResult
+    from mirt.results._common import resolve_latent_prior, validate_person_ids
+    from mirt.scoring._common import validate_scoring_responses
+
+    if isinstance(model_or_result, MultigroupFitResult):
+        if groups is None or prior_mean is not None or prior_cov is not None:
+            raise MirtValidationError(
+                "multigroup results score each row under its group's fitted "
+                "latent distribution: pass groups and omit prior_mean and "
+                "prior_cov",
+                parameter="groups" if groups is None else "prior_mean",
+            )
+        return model_or_result.fscores(
+            responses,
+            groups,
+            method=method,
+            n_quadpts=n_quadpts,
+            person_ids=person_ids,
+            bounds=bounds,
+            n_jobs=n_jobs,
+            batch_size=batch_size,
+        )
+    if groups is not None:
+        raise MirtValidationError(
+            "groups applies only to multigroup results", parameter="groups"
+        )
 
     model, prior_mean, prior_cov = resolve_latent_prior(
         model_or_result, prior_mean, prior_cov
@@ -130,14 +189,10 @@ def fscores(
     if not model.is_fitted:
         raise ValueError("Model must be fitted before scoring")
 
-    responses = _missing_coded_responses(responses)
-    if responses.ndim != 2:
-        raise ValueError(f"responses must be 2D, got {responses.ndim}D")
-    if responses.shape[1] != model.n_items:
-        raise ValueError(
-            f"responses has {responses.shape[1]} items, expected {model.n_items}"
-        )
-    person_ids = _validated_person_ids(person_ids, responses.shape[0])
+    responses = validate_scoring_responses(model, responses)
+
+    # Check identifiers before scoring so a mismatch fails without work.
+    person_ids = validate_person_ids(person_ids, responses.shape[0], row_label="score")
 
     if method == "EAP":
         from mirt.scoring.eap import EAPScorer
@@ -180,36 +235,6 @@ def fscores(
     if person_ids is None:
         return result
     return dataclasses.replace(result, person_ids=person_ids)
-
-
-def _validated_person_ids(
-    person_ids: list[Any] | NDArray[Any] | None,
-    n_persons: int,
-) -> list[Any] | None:
-    """Check identifiers before scoring so a mismatch fails without work."""
-    if person_ids is None:
-        return None
-
-    import numpy as np
-
-    from mirt.exceptions import MirtValidationError
-
-    if isinstance(person_ids, np.ndarray) and person_ids.ndim != 1:
-        raise MirtValidationError(
-            "person_ids must be one-dimensional",
-            parameter="person_ids",
-            value=person_ids.shape,
-            expected=f"({n_persons},)",
-        )
-    resolved = list(person_ids)
-    if len(resolved) != n_persons:
-        raise MirtValidationError(
-            "person_ids must contain one identifier per score row",
-            parameter="person_ids",
-            value=len(resolved),
-            expected=str(n_persons),
-        )
-    return resolved
 
 
 __all__ = [

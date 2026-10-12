@@ -36,8 +36,11 @@ def _stub_fit_and_scores(
     )
     monkeypatch.setattr(
         dif_module,
-        "_expected_response_matrix",
-        lambda model, theta, n_items: np.zeros((n_rows, n_items)),
+        "_expected_response_moments",
+        lambda model, theta, n_items: (
+            np.zeros((n_rows, n_items)),
+            np.zeros((n_rows, n_items)),
+        ),
     )
     return model
 

@@ -153,3 +153,137 @@ def test_fscores_eapsum_default_keeps_49_points() -> None:
 
     assert_array_equal(actual.theta, expected.theta)
     assert_array_equal(actual.standard_error, expected.standard_error)
+
+
+def test_person_id_checks_share_one_validator() -> None:
+    import mirt.results.ability_posterior as posterior_module
+    import mirt.results.score_result as score_module
+    from mirt.results._common import validate_person_ids
+
+    assert not hasattr(scoring, "_validated_person_ids")
+    assert score_module.validate_person_ids is validate_person_ids
+    assert posterior_module.validate_person_ids is validate_person_ids
+    ids = np.array(["a", "b"])
+    assert validate_person_ids(ids, 2, row_label="score") == ["a", "b"]
+    assert validate_person_ids(None, 2, row_label="score") is None
+    with pytest.raises(MirtValidationError, match="one identifier per posterior row"):
+        posterior_module.AbilityPosteriorResult._validated_person_ids(["a"], 2)
+    with pytest.raises(MirtValidationError, match="one identifier per score row"):
+        ScoreResult(np.zeros(2), np.ones(2), "EAP", person_ids=["a"])
+    with pytest.raises(MirtValidationError, match="one-dimensional"):
+        ScoreResult(np.zeros(2), np.ones(2), "EAP", person_ids=np.zeros((2, 1)))
+
+
+def _named_model() -> TwoParameterLogistic:
+    model = _model(n_items=6)
+    model.item_names = [f"Q{index}" for index in range(6)]
+    return model
+
+
+@pytest.mark.parametrize("library", ["pandas", "polars"])
+@pytest.mark.parametrize("method", ["EAP", "MAP", "ML", "WLE", "EAPsum"])
+def test_fscores_matches_data_frame_columns_to_item_names(
+    library: str, method: str
+) -> None:
+    frames = pytest.importorskip(library)
+    model = _named_model()
+    responses = _responses(n_persons=12)
+    columns = {name: responses[:, index] for index, name in enumerate(model.item_names)}
+    reversed_columns = dict(reversed(list(columns.items())))
+    reversed_columns["respondent"] = np.arange(12)
+
+    expected = fscores(model, responses, method=method)
+    actual = fscores(model, frames.DataFrame(reversed_columns), method=method)
+
+    assert_array_equal(actual.theta, expected.theta)
+    assert_array_equal(actual.standard_error, expected.standard_error)
+
+
+def test_scoring_entry_points_share_data_frame_alignment() -> None:
+    pd = pytest.importorskip("pandas")
+    from mirt.utils.data import align_response_columns
+    from mirt.utils.plausible import generate_plausible_values
+
+    model = _named_model()
+    responses = _responses(n_persons=9)
+    frame = pd.DataFrame(responses, columns=model.item_names)
+    shuffled = frame[["Q3", "Q5", "Q0", "Q2", "Q4", "Q1"]]
+
+    assert_array_equal(
+        align_response_columns(shuffled, model.item_names).to_numpy(), responses
+    )
+    assert_array_equal(
+        ability_posterior(model, shuffled).weights,
+        ability_posterior(model, responses).weights,
+    )
+    assert_array_equal(
+        scoring.eapsum(model, shuffled).theta, scoring.eapsum(model, responses).theta
+    )
+    assert_array_equal(
+        generate_plausible_values(model, shuffled, seed=3),
+        generate_plausible_values(model, responses, seed=3),
+    )
+
+
+def test_data_frames_missing_named_items_are_rejected() -> None:
+    pd = pytest.importorskip("pandas")
+    from mirt.exceptions import MirtDataError
+
+    model = _named_model()
+    responses = _responses()
+    frame = pd.DataFrame(responses, columns=model.item_names)
+
+    with pytest.raises(MirtDataError, match="model's items Q4, Q5"):
+        fscores(model, frame[["Q0", "Q1", "Q2", "Q3"]])
+    renamed = frame.rename(columns={"Q4": "X4", "Q5": "X5"})
+    with pytest.raises(MirtDataError, match="Q4, Q5"):
+        ability_posterior(model, renamed)
+    # Arrays keep positional semantics.
+    assert_array_equal(
+        fscores(model, renamed.to_numpy()).theta, fscores(model, responses).theta
+    )
+
+
+def test_unnamed_models_and_default_labels_read_frames_by_position() -> None:
+    pd = pytest.importorskip("pandas")
+    from mirt.utils.data import align_response_columns
+
+    model = _model()
+    responses = _responses()
+    expected = fscores(model, responses).theta
+
+    labelled = pd.DataFrame(responses, columns=[f"V{index}" for index in range(6)])
+    assert_array_equal(fscores(model, labelled).theta, expected)
+    assert_array_equal(fscores(model, pd.DataFrame(responses)).theta, expected)
+    # Default model labels still select named columns when present.
+    shuffled = pd.DataFrame(responses, columns=model.item_names).iloc[:, ::-1]
+    assert_array_equal(fscores(model, shuffled).theta, expected)
+    assert align_response_columns(responses, model.item_names) is responses
+    assert align_response_columns(labelled, None) is labelled
+
+
+def test_scoring_validators_share_messages_and_error_type() -> None:
+    from mirt.exceptions import MirtDataError
+    from mirt.models import GradedResponseModel
+
+    model = _model()
+    for method in ("EAP", "ML", "EAPsum"):
+        with pytest.raises(MirtDataError, match="must be coded as 0 or 1"):
+            fscores(model, np.full((1, 6), 2), method=method)
+        with pytest.raises(MirtDataError, match="responses must be 2D"):
+            fscores(model, np.zeros(6, dtype=int), method=method)
+        with pytest.raises(MirtDataError, match="has 3 items, expected 6"):
+            fscores(model, np.zeros((1, 3), dtype=int), method=method)
+        # Missing codes must be integers, as in fit_mirt.
+        with pytest.raises(MirtDataError, match="integer-valued"):
+            fscores(model, np.array([[-0.5, 0, 1, 0, 1, 0]]), method=method)
+
+    graded = GradedResponseModel(n_items=2, n_categories=[3, 4])
+    graded._is_fitted = True
+    for scorer in (EAPScorer(), EAPSumScorer()):
+        with pytest.raises(MirtDataError, match="item 0 must be below 3"):
+            scorer.score(graded, np.array([[3, 0]]))
+    # EAPsum now normalizes every missing code, like the other scorers.
+    assert_array_equal(
+        EAPSumScorer._validate_responses(graded, np.array([[-9, 1]])), [[-1, 1]]
+    )

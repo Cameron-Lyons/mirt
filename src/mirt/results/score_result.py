@@ -15,6 +15,7 @@ from mirt.results._common import (
     classify_from_probabilities,
     normal_critical_value,
     validate_classification_confidence,
+    validate_person_ids,
 )
 
 
@@ -23,6 +24,40 @@ def _portable_person_id(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+# JSON has no non-finite numbers. These are the tokens R's jsonlite writes
+# for them, and reads back as numbers, inside numeric arrays.
+_NON_FINITE_TOKENS = {"Inf": np.inf, "-Inf": -np.inf, "NaN": np.nan}
+
+
+def _encode_json_numbers(values: Any) -> Any:
+    """Replace non-finite floats in nested lists with their JSON tokens."""
+    if isinstance(values, list):
+        return [_encode_json_numbers(value) for value in values]
+    if isinstance(values, float) and not np.isfinite(values):
+        if np.isnan(values):
+            return "NaN"
+        return "Inf" if values > 0.0 else "-Inf"
+    return values
+
+
+def _decode_json_numbers(values: Any, name: str) -> Any:
+    """Restore non-finite tokens, and ``null`` as NaN, in nested lists."""
+    if isinstance(values, (list, tuple)):
+        return [_decode_json_numbers(value, name) for value in values]
+    if values is None:
+        return np.nan
+    if isinstance(values, str):
+        if values not in _NON_FINITE_TOKENS:
+            raise MirtValidationError(
+                f"{name} contains a string that is not a non-finite number token",
+                parameter=name,
+                value=values,
+                expected="numbers, null, or one of 'Inf', '-Inf', 'NaN'",
+            )
+        return _NON_FINITE_TOKENS[values]
+    return values
 
 
 @dataclass
@@ -72,24 +107,9 @@ class ScoreResult:
                 expected="non-empty string",
             )
 
-        if self.person_ids is None:
-            resolved_ids = None
-        else:
-            if isinstance(self.person_ids, np.ndarray) and self.person_ids.ndim != 1:
-                raise MirtValidationError(
-                    "person_ids must be one-dimensional",
-                    parameter="person_ids",
-                    value=self.person_ids.shape,
-                    expected=f"({theta.shape[0]},)",
-                )
-            resolved_ids = list(self.person_ids)
-            if len(resolved_ids) != theta.shape[0]:
-                raise MirtValidationError(
-                    "person_ids must contain one identifier per score row",
-                    parameter="person_ids",
-                    value=len(resolved_ids),
-                    expected=str(theta.shape[0]),
-                )
+        resolved_ids = validate_person_ids(
+            self.person_ids, theta.shape[0], row_label="score"
+        )
 
         self.theta = theta.copy()
         self.standard_error = standard_error.copy()
@@ -309,7 +329,12 @@ class ScoreResult:
         return np.column_stack([self.theta, self.standard_error])
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a dependency-free, JSON-compatible score representation."""
+        """Return a dependency-free score representation of nested lists.
+
+        Scores and standard errors keep non-finite values as Python floats,
+        such as the infinite standard errors of extreme ML scores;
+        :meth:`to_json` writes them as standard JSON.
+        """
         return {
             "method": self.method,
             "n_persons": self.n_persons,
@@ -326,8 +351,11 @@ class ScoreResult:
         """Reconstruct scores from :meth:`to_dict` output.
 
         Derived shape metadata is optional, but when supplied it must agree
-        with the reconstructed arrays. Unknown fields are rejected so that
-        misspelled input does not silently disappear.
+        with the reconstructed arrays; an empty score list takes its factor
+        count from ``n_factors``. Unknown fields are rejected so that
+        misspelled input does not silently disappear. Score values may be
+        numbers, ``None`` (read as NaN) or the strings ``"Inf"``, ``"-Inf"``
+        and ``"NaN"`` that :meth:`to_json` writes for non-finite values.
         """
         if not isinstance(payload, Mapping):
             raise MirtValidationError(
@@ -366,9 +394,26 @@ class ScoreResult:
                 expected="method, theta, and standard_error",
             )
 
+        theta = _decode_json_numbers(payload["theta"], "theta")
+        standard_error = _decode_json_numbers(
+            payload["standard_error"], "standard_error"
+        )
+        n_factors = payload.get("n_factors")
+        if (
+            isinstance(n_factors, (int, np.integer))
+            and not isinstance(n_factors, bool)
+            and n_factors > 1
+        ):
+            # Nested lists cannot record the factor count of zero persons.
+            empty_shape = (0, int(n_factors))
+            if isinstance(theta, list) and not theta:
+                theta = np.empty(empty_shape, dtype=np.float64)
+            if isinstance(standard_error, list) and not standard_error:
+                standard_error = np.empty(empty_shape, dtype=np.float64)
+
         result = cls(
-            theta=payload["theta"],
-            standard_error=payload["standard_error"],
+            theta=theta,
+            standard_error=standard_error,
             method=payload["method"],
             person_ids=payload.get("person_ids"),
         )
@@ -393,10 +438,25 @@ class ScoreResult:
         return result
 
     def to_json(self, *, indent: int | None = None) -> str:
-        """Serialize scores to JSON without a dataframe dependency."""
+        """Serialize scores to standard JSON without a dataframe dependency.
+
+        JSON has no infinite or NaN numbers, so non-finite scores and
+        standard errors are written as the strings ``"Inf"``, ``"-Inf"`` and
+        ``"NaN"``, the tokens R's ``jsonlite::fromJSON`` reads back as
+        numbers. :meth:`from_json` restores them exactly.
+
+        Raises
+        ------
+        ValueError
+            If a person identifier is a non-finite float, which JSON cannot
+            represent.
+        """
         import json
 
-        return json.dumps(self.to_dict(), indent=indent)
+        payload = self.to_dict()
+        payload["theta"] = _encode_json_numbers(payload["theta"])
+        payload["standard_error"] = _encode_json_numbers(payload["standard_error"])
+        return json.dumps(payload, indent=indent, allow_nan=False)
 
     @classmethod
     def from_json(cls, value: str | bytes | bytearray) -> Self:

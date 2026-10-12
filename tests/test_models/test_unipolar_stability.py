@@ -1,34 +1,132 @@
-"""Independent tail, peak, and batching contracts for the unipolar curve."""
+"""Lucke's unipolar log-logistic curve: R parity, tails, and batching contracts."""
 
 from decimal import Decimal, localcontext
 
 import numpy as np
 import pytest
 
+from mirt.estimation.em import EMEstimator
 from mirt.models import dichotomous
-from mirt.models.dichotomous import UnipolarLogLogistic
+from mirt.models.dichotomous import TwoParameterLogistic, UnipolarLogLogistic
 
 _MIN_FLOAT = np.nextafter(0.0, 1.0)
 _MAX_FLOAT = np.finfo(float).max
 
+# R mirt 1.48: an itemtype = "ULL" item with eta1 = 1.39342 and
+# log_lambda1 = -0.3722916, evaluated with probtrace() and iteminfo() at the
+# unipolar trait values below. iteminfo() is information about tau itself.
+_R_ETA = 1.39342
+_R_LOG_LAMBDA = -0.3722916
+_R_TAU = np.array([0.01, 0.5, 1.0, 2.0, 5.0, 20.0])
+_R_PROBABILITY = np.array(
+    [
+        1.12457167962e-03,
+        2.07816637264e-01,
+        4.07987406489e-01,
+        6.44180077746e-01,
+        8.66496615768e-01,
+        9.78161955905e-01,
+    ]
+)
+_R_TRAIT_INFORMATION = np.array(
+    [
+        1.27858646033e00,
+        4.68966458907e-01,
+        1.11260661604e-01,
+        8.98427872003e-03,
+        1.03688023201e-04,
+    ]
+)
+
 
 def _decimal_curve(theta, slope, location=0.0):
+    """Return the logistic probability and Fisher information to 100 digits."""
     with localcontext() as context:
         context.prec = 100
         t, a, b = (Decimal.from_float(float(v)) for v in (theta, slope, location))
-        z = abs(a * (t - b))
-        if z > 10_000:
-            return 0.0, 0.0
-        if z < Decimal("1e-30"):
-            # The relative corrections are O(z²), far below float precision.
-            return 0.25, float(a * a * z * z / 12)
-        tail = (-z).exp()
-        if z > 100:
-            return float(tail), float(a * a * tail)
-        probability = tail / (1 + tail) ** 2
-        attenuation = (1 - tail) / (1 + tail)
-        information = a * a * probability * attenuation**2 / (1 - probability)
+        z = a * (t - b)
+        if abs(z) > 10_000:
+            return (1.0 if z > 0 else 0.0), 0.0
+        # Both values use the far tail, so that neither cancels to zero.
+        tail = (-abs(z)).exp()
+        probability = 1 / (1 + tail) if z >= 0 else tail / (1 + tail)
+        information = a * a * tail / (1 + tail) ** 2
         return float(probability), float(information)
+
+
+def _r_item() -> UnipolarLogLogistic:
+    return UnipolarLogLogistic(1).set_parameters(
+        discrimination=[_R_ETA], difficulty=[-_R_LOG_LAMBDA / _R_ETA]
+    )
+
+
+def test_probability_matches_r_mirt_on_the_unipolar_trait():
+    model = _r_item()
+
+    probability = model.probability(np.log(_R_TAU), 0)
+
+    np.testing.assert_allclose(probability, _R_PROBABILITY, rtol=1e-10, atol=0.0)
+    lam = np.exp(_R_LOG_LAMBDA)
+    lucke = lam * _R_TAU**_R_ETA / (1.0 + lam * _R_TAU**_R_ETA)
+    np.testing.assert_allclose(probability, lucke, rtol=1e-14, atol=0.0)
+    np.testing.assert_allclose(model.eta, [_R_ETA], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(model.log_lambda, [_R_LOG_LAMBDA], rtol=1e-15)
+
+
+def test_information_converts_to_r_mirt_trait_information():
+    model = _r_item()
+    tau = _R_TAU[1:]
+
+    information = model.information(np.log(tau), 0)
+
+    probability = model.probability(np.log(tau), 0)
+    np.testing.assert_allclose(
+        information, _R_ETA**2 * probability * (1.0 - probability), rtol=1e-14
+    )
+    np.testing.assert_allclose(
+        information / tau**2, _R_TRAIT_INFORMATION, rtol=1e-8, atol=0.0
+    )
+
+
+def test_curve_is_monotone_and_not_capped_at_a_quarter():
+    """The former logistic-density curve never exceeded 0.25."""
+    model = UnipolarLogLogistic(2).set_parameters(
+        discrimination=np.array([0.8, 1.5]), difficulty=np.array([-0.5, 1.0])
+    )
+    theta = np.linspace(-8.0, 8.0, 801)
+
+    probability = model.probability(theta)
+
+    assert np.all(np.diff(probability, axis=0) > 0.0)
+    assert probability.max() > 0.99
+    np.testing.assert_allclose(
+        np.diag(model.probability(model.difficulty)), [0.5, 0.5], rtol=1e-15
+    )
+
+
+def test_marginal_fit_on_the_log_trait_matches_the_logistic_likelihood():
+    """A standard normal log trait is R mirt's log-normal ULL density."""
+    rng = np.random.default_rng(3)
+    eta = np.array([0.8, 1.2, 1.6, 2.0, 1.1])
+    log_lambda = np.array([-1.0, -0.3, 0.2, 0.6, 1.4])
+    generator = UnipolarLogLogistic(5).set_parameters(
+        discrimination=eta, difficulty=-log_lambda / eta
+    )
+    responses = generator.simulate(rng.normal(size=600), seed=4)
+    # Items endorsed by more than a quarter of respondents are now fittable.
+    assert responses.mean(axis=0).max() > 0.6
+
+    def fit(model):
+        estimator = EMEstimator(tol=1e-8, max_iter=2000, compute_standard_errors=False)
+        return estimator.fit(model, responses)
+
+    ull, logistic = fit(UnipolarLogLogistic(5)), fit(TwoParameterLogistic(5))
+
+    assert ull.log_likelihood == pytest.approx(logistic.log_likelihood, abs=1e-5)
+    np.testing.assert_allclose(
+        ull.model.eta, logistic.model.discrimination, rtol=0.0, atol=1e-3
+    )
+    assert ull.n_parameters == 10
 
 
 @pytest.mark.parametrize("direction", [-1.0, 1.0])
@@ -37,13 +135,11 @@ def _decimal_curve(theta, slope, location=0.0):
     [
         (1.0, 0.0),
         (1.0, 1e-8),
-        (1.0, 1e-16),
         (1.0, 1e-160),
         (1.0, 40.0),
         (1.0, 400.0),
         (1.0, 710.0),
         (1.0, 745.0),
-        (1.0, 1000.0),
         (1e100, 1e-300),
         (1e160, _MIN_FLOAT),
         (1e308, 1000.0 / 1e308),
@@ -52,7 +148,7 @@ def _decimal_curve(theta, slope, location=0.0):
         (_MIN_FLOAT, _MIN_FLOAT),
     ],
 )
-def test_tails_and_peak_preserve_representable_values(slope, theta, direction):
+def test_tails_preserve_representable_values(slope, theta, direction):
     theta *= direction
     model = UnipolarLogLogistic(1).set_parameters(discrimination=np.array([slope]))
     probability, information = _decimal_curve(theta, slope)
@@ -160,16 +256,6 @@ def test_nonfinite_abilities_retain_tail_limits_and_nan():
     with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
         probability = model.probability([-np.inf, np.inf, np.nan], 0)
         information = model.information([-np.inf, np.inf, np.nan], 0)
-    np.testing.assert_array_equal(probability[:2], [0.0, 0.0])
+    np.testing.assert_array_equal(probability[:2], [0.0, 1.0])
     np.testing.assert_array_equal(information[:2], [0.0, 0.0])
     assert np.isnan(probability[-1]) and np.isnan(information[-1])
-
-
-def test_probability_preserves_symmetry_and_the_exact_peak_bound():
-    theta = np.concatenate(([0.0], np.geomspace(1e-20, 1e-2, 1024), [40.0, 710.0]))
-    model = UnipolarLogLogistic(1)
-    positive = model.probability(theta, 0)
-    negative = model.probability(-theta, 0)
-    np.testing.assert_array_equal(positive, negative)
-    assert np.all((positive >= 0.0) & (positive <= 0.25))
-    assert positive[0] == 0.25

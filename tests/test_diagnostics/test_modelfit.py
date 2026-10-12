@@ -6,11 +6,12 @@ import pytest
 from mirt import compute_fit_indices, compute_m2
 from mirt.diagnostics import modelfit
 from mirt.diagnostics.modelfit import (
-    _compute_expected_margins,
     _compute_rmsea,
     _compute_rmsea_ci,
+    _integrate_model_moments,
 )
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.exceptions import MirtValidationError
 from mirt.models import GradedResponseModel, TwoParameterLogistic
 
 
@@ -101,7 +102,8 @@ class TestM2:
         )
         quadrature = GaussHermiteQuadrature(n_points=15, n_dimensions=1)
 
-        expected_uni, expected_bi = _compute_expected_margins(model, 15)
+        moments, _ = _integrate_model_moments(model, 15)
+        expected_uni, expected_bi = moments.univariate, moments.bivariate
         item_probabilities = np.column_stack(
             [model.probability(quadrature.nodes, idx) for idx in range(model.n_items)]
         )
@@ -112,6 +114,64 @@ class TestM2:
 
         np.testing.assert_allclose(expected_uni, manual_uni)
         np.testing.assert_allclose(expected_bi, manual_bi)
+
+
+def _simple_structure_2pl(n_factors, n_items=16, n_persons=400, seed=0):
+    """A simple-structure multidimensional 2PL and responses drawn from it."""
+    rng = np.random.default_rng(seed)
+    slopes = np.zeros((n_items, n_factors))
+    per_factor = n_items // n_factors
+    for factor in range(n_factors):
+        rows = slice(factor * per_factor, (factor + 1) * per_factor)
+        slopes[rows, factor] = rng.uniform(1.0, 2.0, per_factor)
+    difficulty = rng.uniform(-1.0, 1.0, n_items)
+    model = TwoParameterLogistic(n_items, n_factors=n_factors)
+    model.set_parameters(discrimination=slopes, difficulty=difficulty)
+    theta = rng.standard_normal((n_persons, n_factors))
+    probability = 1.0 / (1.0 + np.exp(-(theta @ slopes.T - slopes.sum(1) * difficulty)))
+    return model, (rng.random(probability.shape) < probability).astype(int)
+
+
+class TestDimensionAwareQuadrature:
+    """Default M2 grids shrink with the number of factors."""
+
+    @pytest.mark.parametrize(
+        ("n_factors", "points"),
+        [(1, 21), (2, 21), (3, 21), (4, 9), (5, 7), (6, 5), (7, 5), (8, 4)],
+    )
+    def test_default_points_per_factor(self, n_factors, points):
+        model = TwoParameterLogistic(n_factors, n_factors=n_factors)
+        assert modelfit._resolve_quadpts(None, model) == points
+        assert modelfit._resolve_quadpts(13, model) == 13
+
+    def test_four_factor_default_uses_nine_points(self):
+        model, responses = _simple_structure_2pl(4)
+        default = compute_m2(model, responses)
+        assert default == compute_m2(model, responses, n_quadpts=9)
+        indices = compute_fit_indices(model, responses)
+        assert indices["M2"] == default["M2"]
+
+    def test_six_factor_default_does_not_build_a_full_grid(self, monkeypatch):
+        """Twenty-one points in six factors (85.8M nodes) used to exhaust memory."""
+        model, responses = _simple_structure_2pl(6, n_items=12, n_persons=200)
+        grids = []
+        original = modelfit._latent_grid
+
+        def recording_grid(model, n_quadpts, latent):
+            grids.append(n_quadpts**model.n_factors)
+            return original(model, n_quadpts, latent)
+
+        monkeypatch.setattr(modelfit, "_latent_grid", recording_grid)
+        result = compute_m2(model, responses)
+        assert np.isfinite(result["M2"]) and result["df"] > 0
+        assert grids and max(grids) == 5**6
+
+    def test_oversized_grids_are_rejected_before_allocation(self):
+        model, responses = _simple_structure_2pl(6, n_items=12, n_persons=50)
+        with pytest.raises(MirtValidationError, match="omit n_quadpts to use 5"):
+            compute_m2(model, responses, n_quadpts=21)
+        with pytest.raises(MirtValidationError, match="4826809 grid nodes"):
+            compute_fit_indices(model, responses, n_quadpts=13)
 
 
 class TestFitIndices:
@@ -309,3 +369,24 @@ class TestCholeskyWhitening:
         present = modelfit._score_features(np.isfinite(responses).astype(float))
         np.testing.assert_array_equal(design.counts, present.sum(axis=0))
         np.testing.assert_array_equal(design.overlap, present.T @ present)
+
+
+def test_m2_of_a_1pl_fit_counts_the_common_slope_once_as_r_rasch():
+    # R mirt 1.48 on these data: M2(mirt(x, 1, "Rasch")) gives M2 = 44.986
+    # on 44 df, RMSEA = 0.00387 and SRMSR = 0.02296. The estimated common
+    # slope is one parameter, as R's latent variance is.
+    from mirt import fit_mirt
+
+    rng = np.random.default_rng(2024)
+    theta = rng.normal(0.0, 1.5, 1500)
+    difficulty = np.linspace(-1.8, 1.8, 10)
+    probability = 1.0 / (1.0 + np.exp(-(theta[:, None] - difficulty)))
+    data = (rng.random(probability.shape) < probability).astype(int)
+    result = fit_mirt(data, model="1PL", compute_standard_errors=False)
+
+    m2 = compute_m2(result, data)
+    assert m2["df"] == 44
+    assert m2["M2"] == pytest.approx(44.986, abs=0.05)
+    indices = compute_fit_indices(result, data)
+    assert indices["RMSEA"] == pytest.approx(0.00387, abs=2e-4)
+    assert indices["SRMSR"] == pytest.approx(0.02296, abs=2e-4)

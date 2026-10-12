@@ -404,6 +404,80 @@ class TestVerticalScale:
             )
         assert all(r.fit_statistics is not None for r in result.linking_results)
 
+    @pytest.mark.parametrize("model_type", ["grm", "gpcm", "nrm"])
+    def test_concurrent_scaling_supports_polytomous_grades(
+        self, monkeypatch, model_type
+    ):
+        """Concurrent scaling diagnoses polytomous pairs with family curves."""
+        from mirt.equating.polytomous import transform_polytomous_parameters
+        from mirt.models.polytomous import (
+            GeneralizedPartialCredit,
+            GradedResponseModel,
+            NominalResponseModel,
+        )
+
+        locations = np.linspace(-1.5, 1.0, 6)[:, None] + np.array([-0.6, 0.0, 0.7])
+        slopes = np.linspace(0.7, 1.8, 6)
+        if model_type == "grm":
+            base = GradedResponseModel(6, n_categories=4)
+            base.set_parameters(discrimination=slopes, thresholds=locations)
+        elif model_type == "gpcm":
+            base = GeneralizedPartialCredit(6, n_categories=4)
+            base.set_parameters(discrimination=slopes, steps=locations)
+        else:
+            base = NominalResponseModel(6, n_categories=4)
+            base.set_parameters(
+                slopes=slopes[:, None] * np.arange(4.0),
+                intercepts=np.column_stack(
+                    [np.zeros(6), -np.cumsum(locations, axis=1)]
+                ),
+            )
+        scales, shifts = [1.0, 1.3, 0.8], [0.0, 0.4, -0.3]
+        models = [
+            transform_polytomous_parameters(base, scale, shift, model_type=model_type)
+            for scale, shift in zip(scales, shifts, strict=True)
+        ]
+        anchors = [0, 1, 2, 3]
+        grade_data = [
+            GradeData("g0", np.zeros((3, 6), dtype=int), anchor_items_above=anchors),
+            GradeData(
+                "g1",
+                np.zeros((3, 6), dtype=int),
+                anchor_items_below=anchors,
+                anchor_items_above=anchors,
+            ),
+            GradeData("g2", np.zeros((3, 6), dtype=int), anchor_items_below=anchors),
+        ]
+        grade_models = [
+            _GradeModelInfo(model, np.zeros((3, 1)), gd.grade_label)
+            for model, gd in zip(models, grade_data, strict=True)
+        ]
+        monkeypatch.setattr(
+            vertical_module,
+            "_fit_grade_models",
+            lambda grade_data, models: grade_models,
+        )
+
+        results = {
+            method: vertical_scale(
+                grade_data, models=models, method=method, enforce_monotonicity=False
+            )
+            for method in ("chain", "concurrent")
+        }
+
+        for scale, shift, gd in zip(scales, shifts, grade_data, strict=True):
+            for result in results.values():
+                np.testing.assert_allclose(
+                    result.grade_transformations[gd.grade_label],
+                    (1.0 / scale, -shift / scale),
+                    atol=1e-3,
+                )
+        for linking in results["concurrent"].linking_results:
+            assert linking.fit_statistics is not None
+            assert linking.fit_statistics.tcc_rmse < 1e-3
+            assert linking.anchor_diagnostics is not None
+            assert np.max(linking.anchor_diagnostics.area_diff) < 1e-3
+
     def test_monotonicity_preserves_reference_and_scale(self):
         """Growth correction shifts locations without rescaling abilities."""
         labels = ["g1", "g2", "g3"]

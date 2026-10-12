@@ -125,7 +125,8 @@ class TestHeldOutLikelihood:
         ebic_score = _score_regularized_result(result, responses, "ebic", 5)
 
         expected_bic = -(-2 * test_ll + 4 * np.log(4)) / 4
-        expected_ebic = expected_bic - (2 * 2 * np.log(2)) / 4
+        # Chen and Chen's term log C(4, 2) for 2 of 4 candidate loadings.
+        expected_ebic = expected_bic - np.log(6) / 4
         assert bic_score == pytest.approx(expected_bic)
         assert ebic_score == pytest.approx(expected_ebic)
 
@@ -182,7 +183,7 @@ class TestCrossValidatedSelection:
     ):
         fitted_lambdas = []
 
-        def fake_fit(self, responses, lambda_val=None):
+        def fake_fit(self, responses, lambda_val=None, start="default"):
             fitted_lambdas.append(lambda_val)
             if lambda_val == 0.1:
                 return _result(lambda_val, np.array([[2.0, 0.0], [2.0, 0.0]]))
@@ -207,7 +208,7 @@ class TestCrossValidatedSelection:
     def test_bic_does_not_reuse_training_criterion(
         self, concordant_responses, monkeypatch
     ):
-        def fake_fit(self, responses, lambda_val=None):
+        def fake_fit(self, responses, lambda_val=None, start="default"):
             if lambda_val == 0.1:
                 return _result(
                     lambda_val,
@@ -244,7 +245,7 @@ class TestCrossValidatedSelection:
             0.5: iter([9.5, 9.5, 9.5, 9.5]),
         }
 
-        def fake_fit(self, responses, lambda_val=None):
+        def fake_fit(self, responses, lambda_val=None, start="default"):
             fit_lambdas.append(lambda_val)
             return _result(lambda_val, np.ones((2, 2)))
 
@@ -284,7 +285,7 @@ class TestCrossValidatedSelection:
         monkeypatch.setattr(
             RegularizedMIRTEstimator,
             "fit",
-            lambda self, responses, lambda_val=None: _result(
+            lambda self, responses, lambda_val=None, start="default": _result(
                 lambda_val, np.zeros((2, 2))
             ),
         )
@@ -300,8 +301,63 @@ class TestCrossValidatedSelection:
         assert selection.lambda_values == [0.0]
         assert selection.best_lambda == 0.0
 
+    def test_folds_fit_a_warm_started_path_from_the_smallest_penalty(
+        self, concordant_responses, monkeypatch
+    ):
+        calls = []
+
+        def fake_fit(self, responses, lambda_val=None, start="default"):
+            result = _result(lambda_val, np.ones((2, 2)))
+            calls.append((len(responses), lambda_val, start))
+            return result
+
+        monkeypatch.setattr(RegularizedMIRTEstimator, "fit", fake_fit)
+
+        cv_select_lambda(
+            concordant_responses,
+            lambda_values=[1.0, 0.1, 0.5],
+            n_folds=2,
+            n_quadpts=3,
+            max_iter=1,
+            seed=4,
+        )
+
+        fold_calls = [call for call in calls if call[0] < len(concordant_responses)]
+        assert [call[1] for call in fold_calls] == [0.1, 0.5, 1.0] * 2
+        for first, second, third in (fold_calls[:3], fold_calls[3:]):
+            assert first[2] == "default"
+            assert second[2].lambda_val == 0.1
+            assert third[2].lambda_val == 0.5
+
+    def test_failed_fold_fit_scores_nan_and_path_continues(
+        self, concordant_responses, monkeypatch
+    ):
+        starts = []
+
+        def fake_fit(self, responses, lambda_val=None, start="default"):
+            starts.append((lambda_val, start))
+            if lambda_val == 0.1 and len(responses) < len(concordant_responses):
+                raise RuntimeError("fit failed")
+            return _result(lambda_val, np.ones((2, 2)))
+
+        monkeypatch.setattr(RegularizedMIRTEstimator, "fit", fake_fit)
+
+        selection = cv_select_lambda(
+            concordant_responses,
+            lambda_values=[1.0, 0.1],
+            n_folds=2,
+            n_quadpts=3,
+            max_iter=1,
+            seed=4,
+        )
+
+        assert np.all(np.isnan(selection.fold_scores[1]))
+        assert np.isnan(selection.mean_nonzero[1])
+        assert selection.best_lambda == 1.0
+        assert starts[1] == (1.0, "default")
+
     def test_all_failed_fits_raise_clear_error(self, concordant_responses, monkeypatch):
-        def fail_fit(self, responses, lambda_val=None):
+        def fail_fit(self, responses, lambda_val=None, start="default"):
             raise RuntimeError("fit failed")
 
         monkeypatch.setattr(RegularizedMIRTEstimator, "fit", fail_fit)
@@ -354,6 +410,50 @@ class TestCrossValidatedSelection:
                 n_folds=2,
                 max_iter=1,
             )
+
+
+def _two_factor_responses(n_persons=600, per_factor=6, seed=3):
+    rng = np.random.default_rng(seed)
+    slopes = np.zeros((2 * per_factor, 2))
+    slopes[:per_factor, 0] = rng.uniform(1.0, 2.0, per_factor)
+    slopes[per_factor:, 1] = rng.uniform(1.0, 2.0, per_factor)
+    intercepts = rng.uniform(-1.0, 1.0, 2 * per_factor)
+    theta = rng.standard_normal((n_persons, 2))
+    probabilities = 1 / (1 + np.exp(-(theta @ slopes.T + intercepts)))
+    return (rng.random(probabilities.shape) < probabilities).astype(int)
+
+
+class TestDefaultPenaltyGrid:
+    # Zero loadings are stationary for every penalty, so the former
+    # lambda_max was ~1e-14 and both selectors evaluated and chose [0.0].
+    def test_information_path_selects_a_sparse_model(self):
+        responses = _two_factor_responses()
+
+        best_lambda, best_result, path = information_criteria_path(
+            responses, n_lambda=5, n_quadpts=7, max_iter=100
+        )
+
+        lambdas = [result.lambda_val for result in path]
+        assert len(lambdas) == 5
+        assert lambdas == sorted(lambdas, reverse=True)
+        assert lambdas[0] > 50.0
+        assert path[0].n_nonzero == 0
+        assert best_lambda > 0.0
+        assert best_result.n_nonzero < best_result.loadings.size
+
+    def test_cross_validation_grid_spans_the_penalty_scale(self):
+        responses = _two_factor_responses(n_persons=300)
+
+        selection = cv_select_lambda(
+            responses, n_lambda=3, n_folds=2, n_quadpts=5, max_iter=20, seed=1
+        )
+
+        assert len(selection.lambda_values) == 3
+        assert selection.lambda_values[0] > 25.0
+        assert selection.lambda_values[-1] == pytest.approx(
+            selection.lambda_values[0] * 0.01
+        )
+        assert selection.mean_nonzero[0] < selection.mean_nonzero[-1]
 
 
 class TestPathAndResult:

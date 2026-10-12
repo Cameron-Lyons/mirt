@@ -13,7 +13,6 @@ from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.personfit import (
     compute_personfit,
     compute_personfit_significance,
-    flag_aberrant_persons,
 )
 from mirt.typing import PersonFitStatistic
 from mirt.utils.numeric import compute_fit_stats, compute_probability_moments
@@ -427,116 +426,6 @@ class TestPersonfitSignificance:
         """Test scores must be a real one-dimensional vector."""
         with pytest.raises(ValueError, match="zh"):
             compute_personfit_significance(zh)
-
-
-class TestFlagAberrantPersons:
-    """Tests for flag_aberrant_persons function."""
-
-    def test_basic_flagging(self, fitted_2pl_model, dichotomous_responses):
-        """Test basic aberrant person flagging."""
-        from mirt.scoring import fscores
-
-        model = fitted_2pl_model.model
-        scores = fscores(model, dichotomous_responses["responses"], method="EAP")
-
-        fit_stats = compute_personfit(
-            model,
-            dichotomous_responses["responses"],
-            theta=scores.theta,
-        )
-
-        flags = flag_aberrant_persons(fit_stats)
-
-        assert len(flags) == dichotomous_responses["n_persons"]
-        assert flags.dtype == bool
-
-    def test_flagging_with_custom_criteria(
-        self, fitted_2pl_model, dichotomous_responses
-    ):
-        """Test flagging with custom criteria."""
-        from mirt.scoring import fscores
-
-        model = fitted_2pl_model.model
-        scores = fscores(model, dichotomous_responses["responses"], method="EAP")
-
-        fit_stats = compute_personfit(
-            model,
-            dichotomous_responses["responses"],
-            theta=scores.theta,
-        )
-
-        strict_flags = flag_aberrant_persons(
-            fit_stats,
-            criteria={
-                "infit": (0.8, 1.2),
-                "outfit": (0.8, 1.2),
-            },
-        )
-
-        lenient_flags = flag_aberrant_persons(
-            fit_stats,
-            criteria={
-                "infit": (0.3, 2.0),
-                "outfit": (0.3, 2.0),
-            },
-        )
-
-        assert np.sum(strict_flags) >= np.sum(lenient_flags)
-
-    def test_flagging_no_flags_with_wide_criteria(
-        self, fitted_2pl_model, dichotomous_responses
-    ):
-        """Test that very wide criteria flag no one."""
-        from mirt.scoring import fscores
-
-        model = fitted_2pl_model.model
-        scores = fscores(model, dichotomous_responses["responses"], method="EAP")
-
-        fit_stats = compute_personfit(
-            model,
-            dichotomous_responses["responses"],
-            theta=scores.theta,
-        )
-
-        flags = flag_aberrant_persons(
-            fit_stats,
-            criteria={
-                "infit": (-100, 100),
-                "outfit": (-100, 100),
-                "Zh": (-100, 100),
-            },
-        )
-
-        assert np.sum(flags) == 0
-
-    def test_flagging_default_criteria(self, fitted_2pl_model, dichotomous_responses):
-        """Test that default criteria are reasonable."""
-        from mirt.scoring import fscores
-
-        model = fitted_2pl_model.model
-        scores = fscores(model, dichotomous_responses["responses"], method="EAP")
-
-        fit_stats = compute_personfit(
-            model,
-            dichotomous_responses["responses"],
-            theta=scores.theta,
-        )
-
-        flags = flag_aberrant_persons(fit_stats)
-
-        flag_rate = np.mean(flags)
-        assert flag_rate < 0.5
-
-    def test_default_criteria_support_lz_alias(self):
-        """Test lz-only results use the documented likelihood thresholds."""
-        flags = flag_aberrant_persons({"lz": np.array([-2.5, 0.0, 2.5])})
-
-        np.testing.assert_array_equal(flags, np.array([True, False, True]))
-
-    def test_empty_statistics_are_rejected(self):
-        """Test empty inputs fail with a clear message."""
-        with pytest.raises(ValueError, match="at least one"):
-            flag_aberrant_persons({})
 
 
 class TestPersonfitEdgeCases:

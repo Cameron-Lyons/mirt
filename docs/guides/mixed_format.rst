@@ -71,9 +71,10 @@ Estimation details
 whole test in each E-step and then updates every component through its own
 family's M-step, so graded and partial-credit components keep the native
 optimizer and 1PL and 2PL components the batched Newton step. Standard errors
-default to the observed information (``se_method="oakes"``) when every
-component is a unidimensional built-in 1PL-4PL, GRM, GPCM, PCM, RSM or GRSM
-model, and to itemwise complete-data curvature otherwise. The observed
+default to the exact observed information (``se_method="oakes"``) when every
+component has exact item-local derivatives, as the built-in 1PL-4PL, GRM,
+GPCM, PCM, NRM, RSM and GRSM families with any number of factors and custom
+item models do, and to itemwise complete-data curvature otherwise. The observed
 information treats all components jointly, so ``FitResult.vcov`` includes
 covariances between items of different families. SQUAREM acceleration falls
 back to plain EM.

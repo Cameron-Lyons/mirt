@@ -250,7 +250,8 @@ def test_nonfinite_posterior_keeps_last_mcat_state_and_can_recover():
     # Public slope arrays are mutable. Invalid evidence must leave both moments
     # intact, and correcting the parameters must reevaluate the full history.
     model.slopes[0, 0] = np.nan
-    engine._update_theta()
+    with pytest.warns(RuntimeWarning, match="keeping the previous estimate"):
+        engine._update_theta()
     assert_allclose(engine._current_theta, original_theta)
     assert_allclose(engine._current_covariance, original_covariance)
 

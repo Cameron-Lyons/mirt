@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from mirt.diagnostics.dif import _ets_classify, compute_dif, flag_dif_items
+from mirt.diagnostics.dif import (
+    _ETS_THETA,
+    _ets_classify,
+    _ets_effects,
+    compute_dif,
+    flag_dif_items,
+)
 from mirt.models.dichotomous import TwoParameterLogistic
 
 try:
@@ -66,12 +72,12 @@ class TestDIF:
         assert np.all(result["p_value_adjusted"] >= result["p_value"])
         assert np.all(result["adjustment"] == "holm")
         expected_classes = np.where(
-            (result["p_value_adjusted"] > 0.05)
-            | (np.abs(result["effect_size"]) < 0.426),
+            (result["p_value_adjusted"] > 0.05) | (np.abs(result["ets_effect"]) < 1.0),
             "A",
-            np.where(np.abs(result["effect_size"]) < 0.638, "B", "C"),
+            np.where(np.abs(result["ets_effect"]) < 1.5, "B", "C"),
         )
         np.testing.assert_array_equal(result["classification"], expected_classes)
+        assert result["ets_scale"] == "delta"
 
     def test_dif_wald_method(self, rng):
         """Test DIF analysis with Wald method."""
@@ -442,14 +448,15 @@ def _simulate_two_groups(
     return data, np.repeat([0, 1], n_per_group)
 
 
-def _impact_calibrations(dif_shift: float = 0.0):
+def _impact_calibrations(dif_shift: float = 0.0, first_slope: float = 0.8):
     """Reference 2PL and the separate focal calibration under impact.
 
     Focal abilities follow N(-1, 1.2**2); calibrating the focal group alone
-    standardizes them, giving ``a * 1.2`` and ``(b + 1) / 1.2``. Item 0 is
-    ``dif_shift`` harder for the focal group on the common scale.
+    standardizes them, giving ``a * 1.2`` and ``(b + 1) / 1.2``. Item 0, of
+    slope ``first_slope``, is ``dif_shift`` harder for the focal group on
+    the common scale.
     """
-    discrimination = np.array([0.8, 1.0, 1.3, 1.6, 2.0, 1.1])
+    discrimination = np.array([first_slope, 1.0, 1.3, 1.6, 2.0, 1.1])
     difficulty = np.array([-1.5, -0.8, -0.2, 0.3, 0.9, 1.4])
     focal_difficulty = difficulty.copy()
     focal_difficulty[0] += dif_shift
@@ -695,15 +702,76 @@ class TestCommonScaleDIF:
         assert np.max(np.abs(result["effect_size"])) < 0.3
 
     def test_ets_classes_need_significance_unless_descriptive(self):
-        effects = np.array([0.8, 0.5, 0.2, np.nan, -0.7])
+        deltas = np.array([-1.9, 1.2, -0.6, np.nan, 1.5])
         p_values = np.array([0.01, 0.01, 0.01, 0.01, np.nan])
 
         np.testing.assert_array_equal(
-            _ets_classify(effects, p_values), ["C", "B", "A", "A", "A"]
+            _ets_classify(deltas, p_values), ["C", "B", "A", "A", "A"]
         )
         np.testing.assert_array_equal(
-            _ets_classify(effects, None), ["C", "B", "A", "A", "C"]
+            _ets_classify(deltas, None), ["C", "B", "A", "A", "C"]
         )
+        # Polytomous SMD / SD: A up to 0.17, B up to 0.25, C above.
+        np.testing.assert_array_equal(
+            _ets_classify(np.array([0.17, -0.2, 0.25, 0.26]), None, "smd"),
+            ["A", "B", "B", "C"],
+        )
+
+    def test_ets_effects_are_mh_deltas_matched_on_ability(self):
+        """Regression: ETS cut-offs were applied to theta-metric shifts.
+
+        A 2PL location shift ``db`` is the log odds ratio ``a * db`` at every
+        ability, so its MH D-DIF is ``-2.35 * a * db`` whatever the ability
+        densities; the cut-offs 1.0 and 1.5 apply to that, not to ``db``.
+        """
+        theta = _ETS_THETA[:, None]
+        slopes = np.array([2.2, 0.5, 1.0])
+        shifts = np.array([0.35, 1.0, 0.5])
+        reference = 1.0 / (1.0 + np.exp(-slopes * theta))
+        focal = 1.0 / (1.0 + np.exp(-slopes * (theta - shifts)))
+
+        deltas = _ets_effects(
+            reference,
+            focal,
+            latent=((0.0, 1.0), (-0.8, 1.3)),
+            group_sizes=(500, 300),
+            item_sd=None,
+        )
+
+        np.testing.assert_allclose(deltas, -2.35 * slopes * shifts, rtol=1e-10)
+        np.testing.assert_array_equal(
+            _ets_classify(deltas, np.full(3, 0.001)), ["C", "B", "B"]
+        )
+
+    def test_polytomous_ets_effect_is_the_standardized_mean_difference(self):
+        theta = _ETS_THETA
+        reference = np.column_stack([np.tanh(theta) + 1.0])
+        focal = reference - 0.3
+        item_sd = np.array([1.5])
+
+        effect = _ets_effects(
+            reference,
+            focal,
+            latent=((0.0, 1.0), (0.5, 0.8)),
+            group_sizes=(100, 100),
+            item_sd=item_sd,
+        )
+
+        np.testing.assert_allclose(effect, [-0.2])
+
+    def test_raju_classifies_a_steep_item_on_the_log_odds_metric(self, monkeypatch):
+        reference, focal = _impact_calibrations(dif_shift=0.35, first_slope=2.2)
+        _install_calibrations(monkeypatch, reference, focal)
+        data, groups = _calibration_data()
+
+        result = compute_dif(data, groups, method="raju", anchors=[1, 2, 3, 4, 5])
+
+        # The 0.35 shift was class A; its MH D-DIF -2.35 * 2.2 * 0.35 is C.
+        assert result["effect_size"][0] == pytest.approx(0.35, abs=2e-3)
+        assert result["ets_effect"][0] == pytest.approx(-1.8095, abs=1e-3)
+        assert result["classification"][0] == "C"
+        assert np.all(np.isnan(result["ets_effect"][1:]))
+        assert flag_dif_items(result, min_effect_size=0.3, classification="C")[0]
 
     @pytest.mark.skipif(not HAS_DATAFRAME, reason="Requires pandas or polars")
     def test_dataframe_wrapper_drops_metadata(self, monkeypatch):
@@ -771,13 +839,39 @@ def test_anchors_may_be_item_names(monkeypatch):
     data, groups = _simulate_two_groups(4, n_per_group=60, n_items=5)
 
     with pytest.raises(RuntimeError, match="stop"):
-        compute_dif(data, groups, anchors=["Item_3", 1])
+        compute_dif(data, groups, anchors=["Item_4", 1])
     assert calls[0]["anchors"] == [1, 3]
     with pytest.raises(ValueError, match="unknown item name"):
         compute_dif(data, groups, anchors=["Item_9"])
 
-    linked = compute_dif(data, groups, method="raju", anchors=["Item_2", "Item_4"])
+    linked = compute_dif(data, groups, method="raju", anchors=["Item_3", "Item_5"])
     assert linked["anchors"] == [2, 4]
+
+
+def test_default_item_names_match_fit_mirt(monkeypatch):
+    """Regression: dif named items Item_0.. while fit_mirt used Item_1..
+
+    ``anchors=["Item_1"]`` silently anchored the second item.
+    """
+    import mirt
+    from mirt.multigroup.dif import resolve_items
+
+    reference, focal = _impact_calibrations(dif_shift=0.6)
+    _install_calibrations(monkeypatch, reference, focal)
+    data, groups = _calibration_data()
+    names = [f"Item_{index + 1}" for index in range(data.shape[1])]
+
+    result = compute_dif(data, groups, method="raju", anchors=["Item_1", "Item_6"])
+
+    assert result["anchors"] == [0, 5]
+    assert result["item_names"] == names
+    np.testing.assert_array_equal(result["tested"], [False] + [True] * 4 + [False])
+    with pytest.raises(ValueError, match="run from 'Item_1' to 'Item_6'"):
+        resolve_items(["Item_0"], names, "anchors")
+    if HAS_DATAFRAME:
+        frame = mirt.dif(data, groups, method="raju", anchors=["Item_1", "Item_6"])
+        labels = list(frame["item"]) if "item" in frame.columns else list(frame.index)
+        assert labels == names
 
 
 @pytest.mark.skipif(not HAS_DATAFRAME, reason="Requires pandas or polars")

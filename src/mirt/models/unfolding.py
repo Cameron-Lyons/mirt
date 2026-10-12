@@ -666,28 +666,44 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
             observed,
         )
 
-    def _validate_threshold_matrix(self, values: NDArray[np.float64]) -> None:
-        for item, n_categories in enumerate(self._n_categories):
-            c = n_categories - 1
-            m = 2 * c + 1
-            active = values[item, :m]
-            if not np.isclose(active[c], 0.0, atol=1e-12, rtol=0.0):
-                raise MirtValidationError(
-                    f"item {item} center threshold must be zero",
-                    parameter="thresholds",
-                )
-            if not np.allclose(
-                active[c + 1 :], -active[:c][::-1], atol=1e-12, rtol=0.0
-            ):
-                raise MirtValidationError(
-                    f"item {item} thresholds must be symmetric",
-                    parameter="thresholds",
-                )
-            if np.any(values[item, m:] != 0.0):
-                raise MirtValidationError(
-                    f"item {item} padded thresholds must be zero",
-                    parameter="thresholds",
-                )
+    def _validate_threshold_matrix(
+        self,
+        values: NDArray[np.float64],
+        items: NDArray[np.intp] | None = None,
+    ) -> None:
+        """Check the center, mirror and padding layout of threshold rows.
+
+        ``values`` holds the rows of ``items``, or of every item when
+        ``items`` is omitted. The first invalid item is reported.
+        """
+        categories = np.asarray(self._n_categories, dtype=np.intp)
+        if items is not None:
+            categories = categories[items]
+        # Item ``c = n_categories - 1`` stores its center at column c and
+        # mirrors column 2c - k with opposite sign into column k above it.
+        centers = categories[:, None] - 1
+        columns = np.arange(values.shape[1])[None, :]
+        reflected = (columns > centers) & (columns <= 2 * centers)
+        mirrored = -np.take_along_axis(
+            values, np.where(reflected, 2 * centers - columns, 0), axis=1
+        )
+        center_invalid = (
+            np.abs(np.take_along_axis(values, centers, axis=1)[:, 0]) > 1e-12
+        )
+        asymmetric = np.any(reflected & (np.abs(values - mirrored) > 1e-12), axis=1)
+        padding_invalid = np.any((columns > 2 * centers) & (values != 0.0), axis=1)
+        invalid = np.flatnonzero(center_invalid | asymmetric | padding_invalid)
+        if invalid.size == 0:
+            return
+        row = int(invalid[0])
+        item = row if items is None else int(items[row])
+        if center_invalid[row]:
+            message = f"item {item} center threshold must be zero"
+        elif asymmetric[row]:
+            message = f"item {item} thresholds must be symmetric"
+        else:
+            message = f"item {item} padded thresholds must be zero"
+        raise MirtValidationError(message, parameter="thresholds")
 
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         """Atomically set validated GGUM parameters."""
@@ -766,7 +782,17 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         elif param_name == "location":
             self.set_parameters(location=updated)
         else:
-            self.set_parameters(thresholds=updated)
+            # The other rows are already valid, so only the edited row is
+            # checked; M-steps call this once per objective evaluation.
+            if not np.all(np.isfinite(updated[item])):
+                raise MirtValidationError(
+                    "thresholds must contain only finite values",
+                    parameter="thresholds",
+                )
+            self._validate_threshold_matrix(
+                updated[item : item + 1], np.array([item], dtype=np.intp)
+            )
+            self._parameters = {**self._parameters, "thresholds": updated}
 
     def copy(self) -> Self:
         """Create an independent model copy."""
@@ -910,11 +936,16 @@ class IdealPointModel(_UnfoldingDichotomousModel):
     """Gaussian ideal-point model for dichotomous responses.
 
     ``P(X=1 | theta) = h * exp(-a * (theta-delta)^2)``, where ``a`` is
-    positive and the peak height ``h`` is in ``(0, 1]``.
+    positive and the peak height ``h`` is in ``(0, 1]``. EM keeps ``h`` in
+    ``[0.001, 1]``. Reversing the latent trait together with every location
+    leaves the marginal likelihood unchanged, so a fit identifies the
+    locations only up to that reflection.
     """
 
     model_name = "IdealPoint"
     supports_multidimensional = False
+    # Keeps optimizer proposals inside the (0, 1] range the setter enforces.
+    _parameter_boxes = {"peak_height": (1e-3, 1.0)}
 
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items, dtype=np.float64)

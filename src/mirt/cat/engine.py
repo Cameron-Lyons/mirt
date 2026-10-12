@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterator
 from copy import deepcopy
 from functools import cache
 from inspect import signature
@@ -24,6 +26,7 @@ from mirt.cat._engine_common import (
     finalize_administered_item,
     get_pending_item,
     initialize_common_engine,
+    is_numerical_scoring_failure,
     record_item_administration,
     reset_session_state,
     run_simulation_loop,
@@ -32,12 +35,16 @@ from mirt.cat._engine_common import (
     simulate_error_moments,
     validate_replications,
     validate_simulation_values,
+    validate_test_length,
+    warn_scoring_failure,
 )
 from mirt.cat._lockstep import conditional_error_moments as lockstep_error_moments
 from mirt.cat._lockstep import simulate as simulate_lockstep
 from mirt.cat._lockstep import supports_lockstep
+from mirt.cat._names import canonical_name
 from mirt.cat._native import register_native_defaults as _register_native_defaults
 from mirt.cat._native import uses_native_defaults
+from mirt.cat._stopping_common import finite_real, item_limit, positive_real
 from mirt.cat.content import ContentConstraint, NoContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
@@ -48,8 +55,8 @@ from mirt.cat.results import CATResult, CATState
 from mirt.cat.selection import (
     AStratified,
     ItemSelectionStrategy,
-    MaxExpectedInformation,
     MaxFisherInformation,
+    _PosteriorGridSelection,
     _selection_strategy_class,
     create_selection_strategy,
 )
@@ -65,6 +72,23 @@ from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
+
+# Bound the (session x position) paths of one native batch call, and the
+# sessions of one native conditional-MSE call.
+_NATIVE_PATH_VALUES = 1 << 21
+_NATIVE_MSE_SESSIONS = 1 << 18
+
+_SCORING_METHODS = ("EAP", "MAP", "ML", "WLE")
+_STOPPING_NAMES = (
+    "SE",
+    "max_items",
+    "theta_change",
+    "se_change",
+    "classification",
+    "min_items",
+    "combined",
+)
 
 
 def _hook_accepts_test_length(hook: Any) -> bool:
@@ -101,6 +125,28 @@ def _accepts_test_length(strategy: ItemSelectionStrategy) -> bool:
     return True
 
 
+def _named_stopping_rule(
+    name: str, se_threshold: float, max_items: int | None
+) -> StoppingRule:
+    """Build a stopping rule named by a canonical ``CATEngine`` option."""
+    if name == "SE":
+        return StandardErrorStop(se_threshold)
+    if name == "max_items":
+        if max_items is None:
+            raise ValueError("stopping_rule='max_items' requires max_items")
+        return MaxItemsStop(max_items)
+    if name == "classification":
+        raise ValueError(
+            "stopping_rule='classification' needs a cut score; pass "
+            "ClassificationStop(cut_score, confidence) instead"
+        )
+    if name in ("min_items", "combined"):
+        raise ValueError(
+            f"stopping_rule={name!r} needs arguments; pass a StoppingRule instance"
+        )
+    return create_stopping_rule(name)
+
+
 def _validate_batch_controls(
     true_thetas: NDArray[np.float64] | list[float],
     n_replications: int,
@@ -133,41 +179,81 @@ class CATEngine:
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model containing item parameters.
+    model : BaseItemModel | FitResult
+        Fitted unidimensional IRT model containing item parameters, or the
+        ``FitResult`` of its calibration, whose ``latent_mean`` and
+        ``latent_covariance`` then supply the default scoring prior. Use
+        :class:`~mirt.cat.mcat_engine.MCATEngine` for multidimensional
+        models.
     item_selection : ItemSelectionStrategy | str, optional
         Item selection strategy or name. Default is "MFI".
-        Options: "MFI", "MEI", "KL", "Urry", "random", "a-stratified".
+        Options: "MFI", "MEI", "MPWI", "MLWI", "KL", "KLP", "MEPV", "Urry",
+        "random", "a-stratified". The posterior-weighted criteria (MEI,
+        MPWI, MLWI, KLP, MEPV) use the engine's ``n_quadpts`` and
+        ``theta_bounds``.
     stopping_rule : StoppingRule | str, optional
         Stopping rule or name. Default is "SE".
-        Options: "SE", "max_items", "theta_change", "classification".
+        Options: "SE" (uses ``se_threshold``), "max_items" (uses
+        ``max_items``, which is then required), "theta_change", and
+        "se_change". Rules that need further settings, such as
+        ``ClassificationStop(cut_score, confidence)``, are passed as objects.
+        Selection that plans over the test length (a-stratified strata,
+        shadow tests, progressive exposure) uses the length the rules
+        enforce: ``max_items`` or a ``MaxItemsStop`` in the rule, otherwise
+        the pool size.
     scoring_method : {"EAP", "MAP", "ML", "WLE"}, optional
-        Method for ability estimation. Default is "EAP".
-    initial_theta : float, optional
-        Initial ability estimate. Default is 0.0.
+        Method for ability estimation. Default is "EAP". Names ignore case.
+        EAP and MAP use the normal prior ``N(prior_mean, prior_sd**2)``. ML
+        has no finite estimate while every response is in the lowest
+        category, or every response in the highest; following
+        :func:`~mirt.fscores`, the estimate is then the corresponding
+        ``theta_bounds`` limit with an infinite standard error, so SE-based
+        rules wait for a mixed response pattern.
+    initial_theta : float | None, optional
+        Ability estimate before the first response, which selects the first
+        item. Default is ``prior_mean``.
     se_threshold : float, optional
         Standard error threshold for SE stopping rule. Default is 0.3.
     max_items : int | None, optional
         Maximum number of items to administer. Default is None.
     min_items : int, optional
-        Minimum number of items before stopping. Default is 1.
+        Minimum number of items before stopping, a non-negative integer that
+        may not exceed ``max_items`` or the length a maximum-length stopping
+        rule allows. Default is 1.
     exposure_control : ExposureControl | str | None, optional
         Exposure control method. Default is None (no control).
     content_constraint : ContentConstraint | None, optional
         Content balancing constraint. Default is None (no constraint).
     n_quadpts : int, optional
-        Number of quadrature points for EAP scoring. Default is 21.
+        Number of quadrature points for EAP scoring, an integer of at least
+        5. Default is 21.
     theta_bounds : tuple[float, float], optional
-        Bounds for ability estimation. Default is (-4.0, 4.0).
+        Bounds for MAP, ML, and WLE ability estimation. Default is
+        (-4.0, 4.0).
     seed : int | None, optional
         Random seed for reproducibility.
+    prior_mean : float | None, optional
+        Mean of the normal scoring prior. Default is the ``latent_mean`` of
+        a ``FitResult`` that has one, otherwise 0.
+    prior_sd : float | None, optional
+        Positive standard deviation of the normal scoring prior. Default is
+        the square root of a ``FitResult``'s ``latent_covariance``, otherwise
+        1.
+
+    Raises
+    ------
+    ValueError
+        If the model is not fitted or is multidimensional, if
+        ``scoring_method``, ``n_quadpts``, ``theta_bounds``, the prior, or
+        ``min_items`` is invalid, or if ``min_items`` exceeds the maximum
+        test length.
 
     Examples
     --------
     >>> from mirt import fit_mirt
     >>> from mirt.cat import CATEngine
     >>> result = fit_mirt(data, model="2PL")
-    >>> cat = CATEngine(result.model, se_threshold=0.3, max_items=20)
+    >>> cat = CATEngine(result, se_threshold=0.3, max_items=20)
     >>> state = cat.get_current_state()
     >>> while not state.is_complete:
     ...     response = get_response(state.next_item)  # User provides response
@@ -177,11 +263,11 @@ class CATEngine:
 
     def __init__(
         self,
-        model: BaseItemModel,
+        model: BaseItemModel | FitResult,
         item_selection: ItemSelectionStrategy | str = "MFI",
         stopping_rule: StoppingRule | str = "SE",
         scoring_method: Literal["EAP", "MAP", "ML", "WLE"] = "EAP",
-        initial_theta: float = 0.0,
+        initial_theta: float | None = None,
         se_threshold: float = 0.3,
         max_items: int | None = None,
         min_items: int = 1,
@@ -190,22 +276,46 @@ class CATEngine:
         n_quadpts: int = 21,
         theta_bounds: tuple[float, float] = (-4.0, 4.0),
         seed: int | None = None,
+        prior_mean: float | None = None,
+        prior_sd: float | None = None,
     ):
+        from mirt.results._common import resolve_latent_prior
+
+        model, fitted_mean, fitted_cov = resolve_latent_prior(model)
         initialize_common_engine(
             self,
             model=model,
             scoring_method=scoring_method,
+            scoring_methods=_SCORING_METHODS,
             n_quadpts=n_quadpts,
             theta_bounds=theta_bounds,
             seed=seed,
             engine_name="CAT",
         )
+        if model.n_factors != 1:
+            raise ValueError(
+                f"CATEngine requires a unidimensional model, got "
+                f"n_factors={model.n_factors}. Use MCATEngine for "
+                "multidimensional models."
+            )
 
-        self.initial_theta = initial_theta
+        if prior_mean is None:
+            prior_mean = 0.0 if fitted_mean is None else float(fitted_mean.ravel()[0])
+        if prior_sd is None:
+            prior_sd = (
+                1.0 if fitted_cov is None else math.sqrt(float(fitted_cov.ravel()[0]))
+            )
+        self.prior_mean: float = finite_real(prior_mean, "prior_mean")
+        self.prior_sd: float = positive_real(prior_sd, "prior_sd")
+        self.initial_theta = self.prior_mean if initial_theta is None else initial_theta
 
         if isinstance(item_selection, str):
             selection_kwargs: dict[str, Any] = {}
-            if _selection_strategy_class(item_selection) is MaxExpectedInformation:
+            # Posterior-grid criteria (MEI, MPWI, MLWI, KLP, MEPV) integrate
+            # over the engine's quadrature settings.
+            if issubclass(
+                _selection_strategy_class(item_selection), _PosteriorGridSelection
+            ):
                 selection_kwargs = {
                     "n_quadpts": n_quadpts,
                     "theta_bounds": theta_bounds,
@@ -216,24 +326,27 @@ class CATEngine:
         else:
             self._selection = item_selection
 
+        rule_name = None
         if isinstance(stopping_rule, str):
-            if stopping_rule == "SE":
-                base_rule = StandardErrorStop(se_threshold)
-            else:
-                base_rule = create_stopping_rule(stopping_rule)
+            rule_name = canonical_name(
+                stopping_rule, _STOPPING_NAMES, kind="stopping rule"
+            )
+            base_rule = _named_stopping_rule(rule_name, se_threshold, max_items)
         else:
             base_rule = stopping_rule
 
         rules = [base_rule]
-        if max_items is not None:
+        # A rule named "max_items" already enforces max_items.
+        if max_items is not None and rule_name != "max_items":
             rules.append(MaxItemsStop(max_items))
+        min_items = validate_test_length(
+            min_items, rules, length_rule=MaxItemsStop, combined_rule=CombinedStop
+        )
 
         if len(rules) > 1 or min_items > 1:
             self._stopping = CombinedStop(rules, operator="or", min_items=min_items)
         else:
             self._stopping = base_rule
-
-        self._selection_horizon = max_items if max_items is not None else model.n_items
 
         self._exposure = configure_exposure_control(exposure_control, seed=seed)
         self._content = configure_content_constraint(content_constraint)
@@ -245,7 +358,7 @@ class CATEngine:
                 "control, which selects items without the selection strategy"
             )
 
-        self._current_theta = initial_theta
+        self._current_theta = self.initial_theta
         self._current_se = float("inf")
         self._items_administered: list[int] = []
         self._responses: list[int] = []
@@ -255,6 +368,18 @@ class CATEngine:
         self._info_history: list[float] = []
         self._is_complete = False
         self._stopping_reason = ""
+
+    @property
+    def _selection_horizon(self) -> int:
+        """Return the test length that selection and exposure plan over.
+
+        Strata, shadow tests and progressive exposure span the length the
+        stopping rules enforce, whether set by ``max_items`` or a rule. It is
+        read at each selection, so a rule changed after construction counts.
+        """
+        n_items = self.model.n_items
+        limit = item_limit(self._stopping, MaxItemsStop, CombinedStop)
+        return n_items if limit is None else min(limit, n_items)
 
     def reset(self) -> None:
         """Reset the engine for a new examinee.
@@ -392,8 +517,25 @@ class CATEngine:
 
         return self.get_current_state()
 
+    def _scoring_prior(
+        self,
+    ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None]:
+        """Return the scoring prior's mean and covariance for the scorers.
+
+        Each part is None when it takes its standard-normal default.
+        """
+        mean = None if self.prior_mean == 0.0 else np.array([float(self.prior_mean)])
+        variance = float(self.prior_sd) ** 2
+        cov = None if variance == 1.0 else np.array([[variance]])
+        return mean, cov
+
     def _update_theta(self) -> None:
-        """Update ability estimate based on administered items."""
+        """Update ability estimate based on administered items.
+
+        A numerical scoring failure, such as a posterior without finite mass,
+        warns and falls back to a logit of the proportion of the maximum
+        score. Configuration errors propagate.
+        """
         try:
             if self.scoring_method == "EAP":
                 from mirt.cat._eap import score_binary_eap
@@ -410,22 +552,29 @@ class CATEngine:
             )
             self._current_theta = float(result.theta.ravel()[0])
             self._current_se = float(result.standard_error.ravel()[0])
-        except (
-            ValueError,
-            RuntimeError,
-            ArithmeticError,
-            FloatingPointError,
-            np.linalg.LinAlgError,
-        ):
+        except (ArithmeticError, np.linalg.LinAlgError, ValueError) as error:
+            if not is_numerical_scoring_failure(error):
+                raise
+            warn_scoring_failure(
+                self, error, "using a logit of the proportion of the maximum score"
+            )
             self._current_theta = self._simple_theta_estimate()
             self._current_se = self._simple_se_estimate()
 
     def _simple_theta_estimate(self) -> float:
-        """Simple theta estimate based on proportion correct."""
+        """Crude theta estimate: a logit of the proportion of the maximum score.
+
+        A response in category ``k`` of an item with ``m`` categories scores
+        ``k / (m - 1)``, so dichotomous items count correct answers.
+        """
         if not self._responses:
             return self.initial_theta
 
-        p = np.mean(self._responses)
+        if self.model.is_polytomous:
+            categories = np.asarray(self.model.n_categories)[self._items_administered]
+            p = float(np.sum(self._responses) / np.sum(categories - 1))
+        else:
+            p = float(np.mean(self._responses))
         p = np.clip(p, PROB_CLIP_MIN, PROB_CLIP_MAX)
 
         return float(np.log(p / (1 - p)))
@@ -471,6 +620,7 @@ class CATEngine:
             theta_history=list(self._theta_history),
             se_history=list(self._se_history),
             item_info_history=list(self._info_history),
+            polytomous=bool(self.model.is_polytomous),
         )
 
     def run_simulation(
@@ -559,6 +709,10 @@ class CATEngine:
         pool size. A seeded engine therefore gives identical results on both
         paths when every examinee answers ``L`` items (fixed-length tests)
         and other, equally distributed, responses when tests end early.
+        The Rust backend draws its responses from its own generator, seeded
+        for each call from the engine's generator. On every path a seeded
+        engine is reproducible, and successive calls on one engine continue
+        its random stream instead of repeating earlier sessions.
         The Rust and lock-step paths leave the engine's interactive session
         state unchanged.
 
@@ -646,11 +800,17 @@ class CATEngine:
         return self._native_stopping_parameters() is not None
 
     def _get_quadrature(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Get quadrature points and weights."""
-        from mirt.estimation.quadrature import GaussHermiteQuadrature
+        """Get the scoring prior's quadrature points and weights."""
+        from mirt.scoring._common import build_quadrature
 
-        quad = GaussHermiteQuadrature(self.n_quadpts, n_dimensions=1)
-        return quad.nodes.ravel(), quad.weights.ravel()
+        prior_mean, prior_cov = self._scoring_prior()
+        points, weights = build_quadrature(
+            n_quadpts=self.n_quadpts,
+            n_factors=1,
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
+        )
+        return points.ravel(), weights.ravel()
 
     def _native_stopping_parameters(
         self, *, require_standard_error: bool = True
@@ -717,11 +877,79 @@ class CATEngine:
             raise RuntimeError("stopping rules are not supported by native simulation")
         return parameters
 
-    def _resolve_seed(self) -> int:
-        """Resolve a deterministic seed value for Rust calls."""
-        if self.seed is not None:
-            return int(self.seed)
-        return int(np.random.default_rng().integers(0, 2**31))
+    def _native_calls(
+        self,
+        true_thetas: NDArray[np.float64],
+        n_replications: int,
+        kernel: Any,
+        chunk: int,
+    ) -> Iterator[tuple[int, int, int, Any]] | None:
+        """Return native results for every session, in theta-major order.
+
+        The kernels give replication ``r`` of theta ``t`` its own random
+        stream, mixed from the call's seed, ``t`` and ``r``. Each call takes
+        its seed from the engine's generator, so neighbouring engine seeds do
+        not replay each other's sessions and successive calls advance the
+        generator as the Python paths do. A call covers at most ``chunk``
+        sessions: a block of whole thetas, or a block of one theta's
+        replications when they alone exceed ``chunk``.
+        ``kernel(thetas, n_replications, seed)`` runs one call; each item
+        yields the index of the call's first theta, its number of thetas, its
+        replications per theta and its payload. Returns None, with the
+        generator restored, when the backend is unavailable.
+        """
+        n_thetas = len(true_thetas)
+        if n_replications <= chunk:
+            per_call = chunk // n_replications
+            blocks = [
+                (start, min(per_call, n_thetas - start), n_replications)
+                for start in range(0, n_thetas, per_call)
+            ]
+        else:
+            blocks = [
+                (theta, 1, min(chunk, n_replications - done))
+                for theta in range(n_thetas)
+                for done in range(0, n_replications, chunk)
+            ]
+
+        def call(block: tuple[int, int, int]) -> Any:
+            start, count, replications = block
+            seed = int(self.rng.integers(0, 2**64, dtype=np.uint64))
+            return kernel(true_thetas[start : start + count], replications, seed)
+
+        state = self.rng.bit_generator.state
+        first = call(blocks[0])
+        if first is None:
+            self.rng.bit_generator.state = state
+            return None
+
+        def calls() -> Iterator[tuple[int, int, int, Any]]:
+            yield (*blocks[0], first)
+            for block in blocks[1:]:
+                payload = call(block)
+                if payload is None:
+                    raise RuntimeError("native CAT simulation became unavailable")
+                yield (*block, payload)
+
+        return calls()
+
+    def _native_controls(
+        self,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        float,
+        int,
+        int,
+    ]:
+        """Return the item bank, quadrature, and stopping controls."""
+        params = self.model.parameters
+        disc = params["discrimination"].astype(np.float64)
+        diff = params["difficulty"].astype(np.float64)
+        quad_points, quad_weights = self._get_quadrature()
+        return (disc, diff, quad_points, quad_weights, *self._get_stopping_parameters())
 
     def _run_batch_rust(
         self,
@@ -729,68 +957,88 @@ class CATEngine:
         n_replications: int,
     ) -> list[CATResult] | None:
         """Run batch simulation using Rust backend, or None if it is unavailable."""
-        params = self.model.parameters
-        disc = params["discrimination"].astype(np.float64)
-        diff = params["difficulty"].astype(np.float64)
-
-        quad_points, quad_weights = self._get_quadrature()
-        se_threshold, max_items, min_items = self._get_stopping_parameters()
-        seed = self._resolve_seed()
-        result = rust_cat_simulate_batch_full(
+        controls = self._native_controls()
+        width = max(1, min(int(controls[5]), self.model.n_items))
+        calls = self._native_calls(
             true_thetas,
-            disc,
-            diff,
-            quad_points,
-            quad_weights,
-            se_threshold,
-            max_items,
-            min_items,
             n_replications,
-            seed,
+            lambda thetas, replications, seed: rust_cat_simulate_batch_full(
+                thetas, *controls, replications, seed
+            ),
+            max(1, _NATIVE_PATH_VALUES // width),
         )
-
-        if result is None:
+        if calls is None:
             return None
-
-        theta_est, se_est, n_items, _, item_paths, response_paths = result
 
         # Preserve authored rule priority and distinguish an exhausted pool
         # from a configured maximum. Evaluating an isolated copy also leaves
         # the engine's previous interactive stopping state intact.
         stopping = deepcopy(self._stopping)
         results = []
-        for i in range(len(theta_est)):
-            count = int(n_items[i])
-            items = np.asarray(item_paths[i, :count], dtype=np.int_).tolist()
-            responses = np.asarray(response_paths[i, :count], dtype=np.int_)
-            stopping.reset()
-            state = CATState(
-                theta=float(theta_est[i]),
-                standard_error=float(se_est[i]),
-                items_administered=items,
-                responses=responses.tolist(),
-                n_items=count,
-            )
-            stopping_reason = (
-                stopping.get_reason()
-                if stopping.should_stop(state)
-                else "Item pool exhausted"
-            )
-            results.append(
-                CATResult(
+        for *_, payload in calls:
+            theta_est, se_est, n_items, _, item_paths, response_paths = payload
+            for i in range(len(theta_est)):
+                count = int(n_items[i])
+                items = np.asarray(item_paths[i, :count], dtype=np.int_).tolist()
+                responses = np.asarray(response_paths[i, :count], dtype=np.int_)
+                stopping.reset()
+                state = CATState(
                     theta=float(theta_est[i]),
                     standard_error=float(se_est[i]),
                     items_administered=items,
-                    responses=responses,
-                    n_items_administered=count,
-                    stopping_reason=stopping_reason,
-                    theta_history=[],
-                    se_history=[],
-                    item_info_history=[],
+                    responses=responses.tolist(),
+                    n_items=count,
                 )
-            )
+                stopping_reason = (
+                    stopping.get_reason()
+                    if stopping.should_stop(state)
+                    else "Item pool exhausted"
+                )
+                results.append(
+                    CATResult(
+                        theta=float(theta_est[i]),
+                        standard_error=float(se_est[i]),
+                        items_administered=items,
+                        responses=responses,
+                        n_items_administered=count,
+                        stopping_reason=stopping_reason,
+                        theta_history=[],
+                        se_history=[],
+                        item_info_history=[],
+                        polytomous=False,
+                    )
+                )
 
         return results
+
+    def _native_error_moments(
+        self,
+        true_thetas: NDArray[np.float64],
+        n_replications: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]] | None:
+        """Return native conditional bias, MSE, and mean test length.
+
+        Each call reports every theta's mean error, squared error and length
+        over its replications, which are pooled across calls.
+        """
+        controls = self._native_controls()
+        calls = self._native_calls(
+            true_thetas,
+            n_replications,
+            lambda thetas, replications, seed: rust_cat_conditional_mse(
+                thetas, *controls, replications, seed
+            ),
+            _NATIVE_MSE_SESSIONS,
+        )
+        if calls is None:
+            return None
+        sums = np.zeros((3, len(true_thetas)))
+        for start, count, replications, (_, *moments) in calls:
+            sums[:, start : start + count] += replications * np.asarray(
+                moments, dtype=np.float64
+            )
+        bias, mse, avg_items = sums / n_replications
+        return bias, mse, avg_items
 
     def compute_conditional_mse(
         self,
@@ -817,9 +1065,14 @@ class CATEngine:
             Available for matching 1PL/2PL, EAP, MFI, and SE-stop configurations.
         vectorized : bool, optional
             Use lock-step simulation when the configuration supports it, as
-            described in :meth:`run_batch_simulation`. A seeded engine then
-            draws the same responses as ``run_batch_simulation`` with the same
-            arguments. Default is True.
+            described in :meth:`run_batch_simulation`. Default is True.
+
+        Notes
+        -----
+        On the lock-step path, a seeded engine simulates the same sessions as
+        ``run_batch_simulation`` with the same arguments on an engine with the
+        same seed. The Rust path seeds every session independently from the
+        engine's generator, as ``run_batch_simulation`` does.
 
         Returns
         -------
@@ -833,31 +1086,10 @@ class CATEngine:
             vectorized,
         )
 
-        can_use_rust = should_use_rust(use_rust) and self._can_use_rust_simulation()
-
-        if can_use_rust:
-            params = self.model.parameters
-            disc = params["discrimination"].astype(np.float64)
-            diff = params["difficulty"].astype(np.float64)
-
-            quad_points, quad_weights = self._get_quadrature()
-            se_threshold, max_items, min_items = self._get_stopping_parameters()
-            seed = self._resolve_seed()
-            result = rust_cat_conditional_mse(
-                thetas,
-                disc,
-                diff,
-                quad_points,
-                quad_weights,
-                se_threshold,
-                max_items,
-                min_items,
-                n_replications,
-                seed,
-            )
-
-            if result is not None:
-                return result
+        if should_use_rust(use_rust) and self._can_use_rust_simulation():
+            native = self._native_error_moments(thetas, n_replications)
+            if native is not None:
+                return (thetas, *native)
 
         if vectorized and supports_lockstep(self):
             moments = lockstep_error_moments(self, thetas, n_replications)

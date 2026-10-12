@@ -1,19 +1,82 @@
-//! Dynamic and longitudinal IRT models.
-//!
-//! This module provides Rust implementations for:
-//! - Bayesian Knowledge Tracing (BKT) forward-backward algorithm
-//! - Forward-filtering backward-sampling (FFBS)
-//! - Longitudinal IRT likelihood computations
+//! Bayesian Knowledge Tracing (BKT) filtering, smoothing and Viterbi decoding.
 
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
-use crate::utils::{EPSILON, sigmoid};
+use crate::utils::EPSILON;
 
 const LOG_FLOOR: f64 = 1e-300;
+
+/// Posterior state probabilities with per-trial scaling or per-person
+/// log-likelihoods.
+type PyStateResult<'py> = PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>)>;
+
+/// Skill parameters of one call, one entry per skill.
+struct SkillParameters {
+    p_init: Vec<f64>,
+    p_learn: Vec<f64>,
+    p_forget: Vec<f64>,
+    p_slip: Vec<f64>,
+    p_guess: Vec<f64>,
+}
+
+impl SkillParameters {
+    /// Copy the parameters, rejecting vectors of different lengths.
+    fn new(
+        p_init: Option<PyReadonlyArray1<f64>>,
+        p_learn: PyReadonlyArray1<f64>,
+        p_forget: PyReadonlyArray1<f64>,
+        p_slip: PyReadonlyArray1<f64>,
+        p_guess: PyReadonlyArray1<f64>,
+    ) -> PyResult<Self> {
+        let p_learn = p_learn.as_array().to_vec();
+        let n_skills = p_learn.len();
+        let parameters = Self {
+            p_init: p_init.map_or_else(|| vec![0.0; n_skills], |v| v.as_array().to_vec()),
+            p_forget: p_forget.as_array().to_vec(),
+            p_slip: p_slip.as_array().to_vec(),
+            p_guess: p_guess.as_array().to_vec(),
+            p_learn,
+        };
+        let lengths = [
+            parameters.p_init.len(),
+            parameters.p_forget.len(),
+            parameters.p_slip.len(),
+            parameters.p_guess.len(),
+        ];
+        if lengths.iter().any(|&length| length != n_skills) {
+            return Err(PyValueError::new_err(
+                "skill parameters must have one entry per skill",
+            ));
+        }
+        Ok(parameters)
+    }
+
+    /// Copy the skill index of every trial, rejecting a count other than
+    /// `n_trials` and indices outside `[0, n_skills)`.
+    fn skills(&self, skills: PyReadonlyArray1<i32>, n_trials: usize) -> PyResult<Vec<i32>> {
+        let skills = skills.as_array().to_vec();
+        if skills.len() != n_trials {
+            return Err(PyValueError::new_err(format!(
+                "skill_assignments must have shape ({n_trials},), got ({},)",
+                skills.len()
+            )));
+        }
+        let n_skills = self.p_learn.len();
+        if skills
+            .iter()
+            .any(|&skill| skill < 0 || skill as usize >= n_skills)
+        {
+            return Err(PyValueError::new_err(format!(
+                "skill indices must lie in [0, {n_skills})"
+            )));
+        }
+        Ok(skills)
+    }
+}
 
 /// BKT forward algorithm for a single person.
 ///
@@ -39,29 +102,17 @@ pub fn bkt_forward<'py>(
     p_forget: PyReadonlyArray1<f64>,
     p_slip: PyReadonlyArray1<f64>,
     p_guess: PyReadonlyArray1<f64>,
-) -> (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>) {
-    let responses = responses.as_array();
-    let skills = skill_assignments.as_array();
-    let p_init = p_init.as_array();
-    let p_learn = p_learn.as_array();
-    let p_forget = p_forget.as_array();
-    let p_slip = p_slip.as_array();
-    let p_guess = p_guess.as_array();
+) -> PyStateResult<'py> {
+    let responses = responses.as_array().to_vec();
+    let parameters = SkillParameters::new(Some(p_init), p_learn, p_forget, p_slip, p_guess)?;
+    let skills = parameters.skills(skill_assignments, responses.len())?;
 
-    let (alpha, scaling) = forward_single(
-        responses.as_slice().unwrap(),
-        skills.as_slice().unwrap(),
-        p_init.as_slice().unwrap(),
-        p_learn.as_slice().unwrap(),
-        p_forget.as_slice().unwrap(),
-        p_slip.as_slice().unwrap(),
-        p_guess.as_slice().unwrap(),
-    );
+    let (alpha, scaling) = forward_single(&responses, &skills, &parameters);
 
-    (
+    Ok((
         alpha.to_pyarray(py),
         Array1::from_vec(scaling).to_pyarray(py),
-    )
+    ))
 }
 
 /// BKT backward algorithm for a single person.
@@ -76,25 +127,20 @@ pub fn bkt_backward<'py>(
     p_forget: PyReadonlyArray1<f64>,
     p_slip: PyReadonlyArray1<f64>,
     p_guess: PyReadonlyArray1<f64>,
-) -> Bound<'py, PyArray2<f64>> {
-    let responses = responses.as_array();
-    let skills = skill_assignments.as_array();
-    let scaling = scaling.as_array();
-    let p_learn = p_learn.as_array();
-    let p_forget = p_forget.as_array();
-    let p_slip = p_slip.as_array();
-    let p_guess = p_guess.as_array();
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let responses = responses.as_array().to_vec();
+    let scaling = scaling.as_array().to_vec();
+    let parameters = SkillParameters::new(None, p_learn, p_forget, p_slip, p_guess)?;
+    let skills = parameters.skills(skill_assignments, responses.len())?;
+    if scaling.len() != responses.len() {
+        return Err(PyValueError::new_err(format!(
+            "scaling must have shape ({},), got ({},)",
+            responses.len(),
+            scaling.len()
+        )));
+    }
 
-    backward_single(
-        responses.as_slice().unwrap(),
-        skills.as_slice().unwrap(),
-        scaling.as_slice().unwrap(),
-        p_learn.as_slice().unwrap(),
-        p_forget.as_slice().unwrap(),
-        p_slip.as_slice().unwrap(),
-        p_guess.as_slice().unwrap(),
-    )
-    .to_pyarray(py)
+    Ok(backward_single(&responses, &skills, &scaling, &parameters).to_pyarray(py))
 }
 
 /// BKT forward-backward for multiple persons in parallel.
@@ -109,42 +155,20 @@ pub fn bkt_forward_backward_batch<'py>(
     p_forget: PyReadonlyArray1<f64>,
     p_slip: PyReadonlyArray1<f64>,
     p_guess: PyReadonlyArray1<f64>,
-) -> (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>) {
+) -> PyStateResult<'py> {
     let responses = responses.as_array();
-    let skills = skill_assignments.as_array();
-    let p_init = p_init.as_array();
-    let p_learn = p_learn.as_array();
-    let p_forget = p_forget.as_array();
-    let p_slip = p_slip.as_array();
-    let p_guess = p_guess.as_array();
-
     let n_persons = responses.nrows();
     let n_trials = responses.ncols();
+    let parameters = SkillParameters::new(Some(p_init), p_learn, p_forget, p_slip, p_guess)?;
+    let skills = parameters.skills(skill_assignments, n_trials)?;
 
     let results: Vec<(Array2<f64>, f64)> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let person_responses: Vec<i32> = (0..n_trials).map(|t| responses[[i, t]]).collect();
+            let person_responses: Vec<i32> = responses.row(i).to_vec();
 
-            let (alpha, scaling) = forward_single(
-                &person_responses,
-                skills.as_slice().unwrap(),
-                p_init.as_slice().unwrap(),
-                p_learn.as_slice().unwrap(),
-                p_forget.as_slice().unwrap(),
-                p_slip.as_slice().unwrap(),
-                p_guess.as_slice().unwrap(),
-            );
-
-            let beta = backward_single(
-                &person_responses,
-                skills.as_slice().unwrap(),
-                &scaling,
-                p_learn.as_slice().unwrap(),
-                p_forget.as_slice().unwrap(),
-                p_slip.as_slice().unwrap(),
-                p_guess.as_slice().unwrap(),
-            );
+            let (alpha, scaling) = forward_single(&person_responses, &skills, &parameters);
+            let beta = backward_single(&person_responses, &skills, &scaling, &parameters);
 
             let mut gamma = Array2::zeros((n_trials, 2));
             for t in 0..n_trials {
@@ -173,18 +197,21 @@ pub fn bkt_forward_backward_batch<'py>(
         ll_out[i] = ll;
     }
 
-    (gamma_out.to_pyarray(py), ll_out.to_pyarray(py))
+    Ok((gamma_out.to_pyarray(py), ll_out.to_pyarray(py)))
 }
 
 fn forward_single(
     responses: &[i32],
     skills: &[i32],
-    p_init: &[f64],
-    p_learn: &[f64],
-    p_forget: &[f64],
-    p_slip: &[f64],
-    p_guess: &[f64],
+    parameters: &SkillParameters,
 ) -> (Array2<f64>, Vec<f64>) {
+    let SkillParameters {
+        p_init,
+        p_learn,
+        p_forget,
+        p_slip,
+        p_guess,
+    } = parameters;
     let n_trials = responses.len();
     let mut alpha = Array2::zeros((n_trials, 2));
     let mut scaling = vec![0.0; n_trials];
@@ -228,11 +255,15 @@ fn backward_single(
     responses: &[i32],
     skills: &[i32],
     scaling: &[f64],
-    p_learn: &[f64],
-    p_forget: &[f64],
-    p_slip: &[f64],
-    p_guess: &[f64],
+    parameters: &SkillParameters,
 ) -> Array2<f64> {
+    let SkillParameters {
+        p_learn,
+        p_forget,
+        p_slip,
+        p_guess,
+        ..
+    } = parameters;
     let n_trials = responses.len();
     let mut beta = Array2::zeros((n_trials, 2));
     let mut next_trial = vec![None; p_learn.len()];
@@ -271,15 +302,14 @@ fn backward_single(
     beta
 }
 
-fn viterbi_single(
-    responses: &[i32],
-    skills: &[i32],
-    p_init: &[f64],
-    p_learn: &[f64],
-    p_forget: &[f64],
-    p_slip: &[f64],
-    p_guess: &[f64],
-) -> Vec<i32> {
+fn viterbi_single(responses: &[i32], skills: &[i32], parameters: &SkillParameters) -> Vec<i32> {
+    let SkillParameters {
+        p_init,
+        p_learn,
+        p_forget,
+        p_slip,
+        p_guess,
+    } = parameters;
     let n_trials = responses.len();
     let mut delta = Array2::zeros((n_trials, 2));
     let mut psi = Array2::<usize>::zeros((n_trials, 2));
@@ -344,52 +374,6 @@ fn viterbi_single(
     path
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ffbs_single<R: Rng + ?Sized>(
-    responses: &[i32],
-    skills: &[i32],
-    p_init: &[f64],
-    p_learn: &[f64],
-    p_forget: &[f64],
-    p_slip: &[f64],
-    p_guess: &[f64],
-    rng: &mut R,
-) -> Vec<i32> {
-    let (alpha, _) = forward_single(
-        responses, skills, p_init, p_learn, p_forget, p_slip, p_guess,
-    );
-    let n_trials = responses.len();
-    let mut states = vec![0i32; n_trials];
-    let mut next_trial = vec![None; p_init.len()];
-
-    for t in (0..n_trials).rev() {
-        let skill_idx = skills[t] as usize;
-        let learned_probability = if let Some(next) = next_trial[skill_idx] {
-            let next_state = states[next] as usize;
-            let mut state_probability = [0.0; 2];
-            for state in 0..2 {
-                state_probability[state] = alpha[[t, state]]
-                    * transition_prob(state, next_state, p_learn[skill_idx], p_forget[skill_idx]);
-            }
-            let total = state_probability[0] + state_probability[1];
-            if total > EPSILON {
-                state_probability[1] / total
-            } else {
-                alpha[[t, 1]]
-            }
-        } else {
-            alpha[[t, 1]]
-        };
-        states[t] = if rng.random::<f64>() < learned_probability {
-            1
-        } else {
-            0
-        };
-        next_trial[skill_idx] = Some(t);
-    }
-    states
-}
-
 #[inline]
 fn transition_prob(from: usize, to: usize, p_learn: f64, p_forget: f64) -> f64 {
     match (from, to) {
@@ -438,204 +422,12 @@ pub fn bkt_viterbi<'py>(
     p_forget: PyReadonlyArray1<f64>,
     p_slip: PyReadonlyArray1<f64>,
     p_guess: PyReadonlyArray1<f64>,
-) -> Bound<'py, PyArray1<i32>> {
-    let responses = responses.as_array();
-    let skills = skill_assignments.as_array();
-    let p_init = p_init.as_array();
-    let p_learn = p_learn.as_array();
-    let p_forget = p_forget.as_array();
-    let p_slip = p_slip.as_array();
-    let p_guess = p_guess.as_array();
+) -> PyResult<Bound<'py, PyArray1<i32>>> {
+    let responses = responses.as_array().to_vec();
+    let parameters = SkillParameters::new(Some(p_init), p_learn, p_forget, p_slip, p_guess)?;
+    let skills = parameters.skills(skill_assignments, responses.len())?;
 
-    Array1::from_vec(viterbi_single(
-        responses.as_slice().unwrap(),
-        skills.as_slice().unwrap(),
-        p_init.as_slice().unwrap(),
-        p_learn.as_slice().unwrap(),
-        p_forget.as_slice().unwrap(),
-        p_slip.as_slice().unwrap(),
-        p_guess.as_slice().unwrap(),
-    ))
-    .to_pyarray(py)
-}
-
-/// Compute log-likelihood for longitudinal IRT data.
-#[pyfunction]
-pub fn longitudinal_log_likelihood(
-    responses: PyReadonlyArray2<i32>,
-    theta: PyReadonlyArray1<f64>,
-    discrimination: PyReadonlyArray1<f64>,
-    difficulty: PyReadonlyArray1<f64>,
-) -> f64 {
-    let responses = responses.as_array();
-    let theta = theta.as_array();
-    let disc = discrimination.as_array();
-    let diff = difficulty.as_array();
-
-    let n_obs = responses.nrows();
-    let n_items = responses.ncols();
-
-    let ll: f64 = (0..n_obs)
-        .into_par_iter()
-        .map(|i| {
-            let mut ll_i = 0.0;
-            for j in 0..n_items {
-                let resp = responses[[i, j]];
-                if resp >= 0 {
-                    let z = disc[j] * (theta[i] - diff[j]);
-                    let p = sigmoid(z).clamp(EPSILON, 1.0 - EPSILON);
-
-                    if resp == 1 {
-                        ll_i += p.ln();
-                    } else {
-                        ll_i += (1.0 - p).ln();
-                    }
-                }
-            }
-            ll_i
-        })
-        .sum();
-
-    ll
-}
-
-/// Compute growth curve predictions.
-#[pyfunction]
-pub fn compute_growth_trajectory<'py>(
-    py: Python<'py>,
-    growth_factors: PyReadonlyArray2<f64>,
-    time_values: PyReadonlyArray1<f64>,
-    growth_model: &str,
-) -> Bound<'py, PyArray2<f64>> {
-    let factors = growth_factors.as_array();
-    let times = time_values.as_array();
-
-    let n_persons = factors.nrows();
-    let n_times = times.len();
-
-    let trajectories: Vec<Vec<f64>> = (0..n_persons)
-        .into_par_iter()
-        .map(|i| {
-            let intercept = factors[[i, 0]];
-            let slope = factors[[i, 1]];
-
-            let mut traj = Vec::with_capacity(n_times);
-
-            for t in 0..n_times {
-                let mut theta = intercept + slope * times[t];
-
-                if growth_model == "quadratic" && factors.ncols() > 2 {
-                    let quad = factors[[i, 2]];
-                    theta += quad * times[t] * times[t];
-                }
-
-                traj.push(theta);
-            }
-
-            traj
-        })
-        .collect();
-
-    let mut result = Array2::zeros((n_persons, n_times));
-    for (i, traj) in trajectories.into_iter().enumerate() {
-        for (t, val) in traj.into_iter().enumerate() {
-            result[[i, t]] = val;
-        }
-    }
-
-    result.to_pyarray(py)
-}
-
-/// Forward-filtering backward-sampling (FFBS) for BKT.
-/// Returns sampled state sequence.
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-pub fn bkt_ffbs<'py>(
-    py: Python<'py>,
-    responses: PyReadonlyArray1<i32>,
-    skill_assignments: PyReadonlyArray1<i32>,
-    p_init: PyReadonlyArray1<f64>,
-    p_learn: PyReadonlyArray1<f64>,
-    p_forget: PyReadonlyArray1<f64>,
-    p_slip: PyReadonlyArray1<f64>,
-    p_guess: PyReadonlyArray1<f64>,
-    seed: u64,
-) -> Bound<'py, PyArray1<i32>> {
-    let responses = responses.as_array();
-    let skills = skill_assignments.as_array();
-    let p_init = p_init.as_array();
-    let p_learn = p_learn.as_array();
-    let p_forget = p_forget.as_array();
-    let p_slip = p_slip.as_array();
-    let p_guess = p_guess.as_array();
-
-    let mut rng = StdRng::seed_from_u64(seed);
-    Array1::from_vec(ffbs_single(
-        responses.as_slice().unwrap(),
-        skills.as_slice().unwrap(),
-        p_init.as_slice().unwrap(),
-        p_learn.as_slice().unwrap(),
-        p_forget.as_slice().unwrap(),
-        p_slip.as_slice().unwrap(),
-        p_guess.as_slice().unwrap(),
-        &mut rng,
-    ))
-    .to_pyarray(py)
-}
-
-/// Batch FFBS for multiple persons.
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-pub fn bkt_ffbs_batch<'py>(
-    py: Python<'py>,
-    responses: PyReadonlyArray2<i32>,
-    skill_assignments: PyReadonlyArray1<i32>,
-    p_init: PyReadonlyArray1<f64>,
-    p_learn: PyReadonlyArray1<f64>,
-    p_forget: PyReadonlyArray1<f64>,
-    p_slip: PyReadonlyArray1<f64>,
-    p_guess: PyReadonlyArray1<f64>,
-    seed: u64,
-) -> Bound<'py, PyArray2<i32>> {
-    let responses = responses.as_array();
-    let skills = skill_assignments.as_array();
-    let p_init = p_init.as_array();
-    let p_learn = p_learn.as_array();
-    let p_forget = p_forget.as_array();
-    let p_slip = p_slip.as_array();
-    let p_guess = p_guess.as_array();
-
-    let n_persons = responses.nrows();
-    let n_trials = responses.ncols();
-
-    let results: Vec<Vec<i32>> = (0..n_persons)
-        .into_par_iter()
-        .map(|i| {
-            let mut rng = StdRng::seed_from_u64(seed + i as u64);
-
-            let person_responses: Vec<i32> = (0..n_trials).map(|t| responses[[i, t]]).collect();
-
-            ffbs_single(
-                &person_responses,
-                skills.as_slice().unwrap(),
-                p_init.as_slice().unwrap(),
-                p_learn.as_slice().unwrap(),
-                p_forget.as_slice().unwrap(),
-                p_slip.as_slice().unwrap(),
-                p_guess.as_slice().unwrap(),
-                &mut rng,
-            )
-        })
-        .collect();
-
-    let mut result = Array2::zeros((n_persons, n_trials));
-    for (i, states) in results.into_iter().enumerate() {
-        for (t, s) in states.into_iter().enumerate() {
-            result[[i, t]] = s;
-        }
-    }
-
-    result.to_pyarray(py)
+    Ok(Array1::from_vec(viterbi_single(&responses, &skills, &parameters)).to_pyarray(py))
 }
 
 /// Register dynamic model functions with the Python module.
@@ -644,9 +436,5 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bkt_backward, m)?)?;
     m.add_function(wrap_pyfunction!(bkt_forward_backward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(bkt_viterbi, m)?)?;
-    m.add_function(wrap_pyfunction!(bkt_ffbs, m)?)?;
-    m.add_function(wrap_pyfunction!(bkt_ffbs_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(longitudinal_log_likelihood, m)?)?;
-    m.add_function(wrap_pyfunction!(compute_growth_trajectory, m)?)?;
     Ok(())
 }

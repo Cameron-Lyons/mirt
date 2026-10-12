@@ -24,11 +24,14 @@ class ItemwiseEstimator(MultigroupEMEstimator):
 
 SPECS = {
     "configural": InvarianceSpec("configural"),
+    "metric": InvarianceSpec("metric"),
     "strict": InvarianceSpec("strict"),
     # Items 1 and 3 are group-specific, the others shared.
     "partial": InvarianceSpec(
         "strict", free_discrimination=[1, 3], free_intercepts=[1, 3]
     ),
+    # Items 1 and 3 share slopes only, the others every parameter.
+    "partial-metric": InvarianceSpec("strict", free_intercepts=[1, 3]),
 }
 MODELS = {
     "1PL": lambda: OneParameterLogistic(5),
@@ -37,14 +40,14 @@ MODELS = {
 }
 
 
-def _m_step_inputs(factory, spec, seed=8):
+def _m_step_inputs(factory, spec, seed=8, n_groups=2):
     rng = np.random.default_rng(seed)
-    model = MultigroupModel(factory(), 2)
+    model = MultigroupModel(factory(), n_groups)
     spec.apply_to_model(model)
     n_factors = model.n_factors
     quadrature = GaussHermiteQuadrature(9 if n_factors == 1 else 5, n_factors)
     responses, posterior = [], []
-    for shift in (0.0, 0.4):
+    for shift in (0.0, 0.4, -0.5)[:n_groups]:
         theta = rng.normal(shift, 1.0, (400, n_factors))
         slopes = rng.uniform(0.8, 1.8, (5, n_factors))
         p = expit(theta @ slopes.T - rng.normal(0.0, 0.8, 5))
@@ -54,7 +57,9 @@ def _m_step_inputs(factory, spec, seed=8):
         distance = ((theta[:, None, :] - quadrature.nodes[None]) ** 2).sum(axis=2)
         weights = np.exp(-distance)
         posterior.append(weights / weights.sum(axis=1, keepdims=True))
-    for group, difficulty in zip(model.group_models, (0.2, -0.3), strict=True):
+    for group, difficulty in zip(
+        model.group_models, (0.2, -0.3, 0.6)[:n_groups], strict=True
+    ):
         group.set_parameters(difficulty=np.full(5, difficulty))
     model.synchronize_shared_parameters()
     return model, responses, posterior, quadrature
@@ -66,11 +71,16 @@ def _run_m_step(estimator, model, responses, posterior, quadrature, spec):
     return model
 
 
-@pytest.mark.parametrize("invariance", list(SPECS))
+@pytest.mark.parametrize(
+    ("invariance", "n_groups"),
+    [(name, 2) for name in SPECS] + [("metric", 3), ("partial-metric", 3)],
+)
 @pytest.mark.parametrize("kind", list(MODELS))
-def test_newton_m_step_matches_the_itemwise_optimizer(kind, invariance):
+def test_newton_m_step_matches_the_itemwise_optimizer(kind, invariance, n_groups):
     spec = SPECS[invariance]
-    model, responses, posterior, quadrature = _m_step_inputs(MODELS[kind], spec)
+    model, responses, posterior, quadrature = _m_step_inputs(
+        MODELS[kind], spec, n_groups=n_groups
+    )
     newton = _run_m_step(
         MultigroupEMEstimator(),
         deepcopy(model),
@@ -98,7 +108,8 @@ def test_newton_m_step_matches_the_itemwise_optimizer(kind, invariance):
 
 
 def test_partly_shared_and_fixed_items_take_the_itemwise_path():
-    spec = InvarianceSpec("metric")
+    # Shared difficulties with group-specific slopes are not a Newton class.
+    spec = InvarianceSpec("scalar", free_discrimination=[1, 3])
     model, responses, posterior, quadrature = _m_step_inputs(
         MODELS["2PL"], spec, seed=2
     )
@@ -111,10 +122,17 @@ def test_partly_shared_and_fixed_items_take_the_itemwise_path():
         )
     ]
     masks = [model.effective_free_parameter_masks(g) for g in range(2)]
-    # Metric invariance shares slopes but not difficulties.
-    assert estimator._newton_m_step(model, counts, masks, quadrature.nodes) == list(
-        range(5)
-    )
+    assert estimator._newton_m_step(model, counts, masks, quadrature.nodes) == [1, 3]
+
+    # Metric invariance shares slopes but not difficulties: one Newton
+    # problem per item with a shared slope and one intercept per group.
+    metric = MultigroupModel(TwoParameterLogistic(5), 2)
+    InvarianceSpec("metric").apply_to_model(metric)
+    masks = [metric.effective_free_parameter_masks(g) for g in range(2)]
+    assert estimator._newton_m_step(metric, counts, masks, quadrature.nodes) == []
+    first, second = metric.group_models
+    np.testing.assert_array_equal(first.discrimination, second.discrimination)
+    assert np.all(first.difficulty != second.difficulty)
 
     strict = MultigroupModel(TwoParameterLogistic(5), 2)
     InvarianceSpec("strict").apply_to_model(strict)

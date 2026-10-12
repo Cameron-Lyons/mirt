@@ -1,8 +1,9 @@
 """Advanced Cognitive Diagnosis Models.
 
 This module provides:
-- GDINA (Generalized DINA with reduced models)
-- HigherOrderCDM (Higher-order model with attribute hierarchy)
+- GDINA (Generalized DINA with reduced models) and ``fit_gdina``
+- HigherOrderCDM (Higher-order model with attribute hierarchy) and
+  ``fit_higher_order_cdm``
 - AttributeHierarchy (DAG of prerequisite attributes)
 """
 
@@ -13,12 +14,22 @@ from dataclasses import dataclass, field
 from typing import Literal, Self
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from scipy.optimize import LinearConstraint, minimize
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
-from mirt.models.cdm import BaseCDM
+from mirt.exceptions import MirtIndexError, MirtValidationError
+from mirt.models.cdm import (
+    BaseCDM,
+    CDMResult,
+    _class_posterior,
+    _hierarchy_pattern_mask,
+    _pattern_log_likelihood_matrix,
+    _response_indicators,
+    _validate_fit_configuration,
+    _validate_fit_inputs,
+)
 from mirt.utils.numeric import logsumexp
 
 ReducedModelType = Literal["DINA", "DINO", "ACDM", "LLM", "RRUM", "saturated"]
@@ -43,6 +54,72 @@ _DEFAULT_REDUCED_MODELS: tuple[ReducedModelType, ...] = (
     "saturated",
 )
 _MAX_GDINA_PROBABILITY_CHUNK_ENTRIES = 1_000_000
+# Implied success probabilities may leave [0, 1] by this much, as converged
+# constrained optimizers do, before a coefficient vector is rejected.
+_PROBABILITY_RANGE_TOLERANCE = 1e-9
+_DEFAULT_HIGHER_ORDER_QUADRATURE = 31
+# Box constraints of the higher-order structural M-step, on the loadings and
+# on the intercepts -loading * threshold.
+_HIGHER_ORDER_LOADING_BOUNDS = (0.1, 5.0)
+_HIGHER_ORDER_INTERCEPT_BOUNDS = (-10.0, 10.0)
+
+
+def _expected_coefficient_count(model_type: ReducedModelType, n_required: int) -> int:
+    """Number of stored delta coefficients of one reduced-model item."""
+    if model_type == "saturated":
+        return 2**n_required
+    if model_type in ("DINA", "DINO"):
+        return 2
+    return n_required + 1
+
+
+def _reduced_group_probabilities(
+    model_type: ReducedModelType,
+    group_patterns: NDArray[np.int_],
+    delta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Unclipped success probability of each latent group of one item.
+
+    ``group_patterns`` holds the required-attribute pattern of each group.
+    """
+    if model_type == "saturated":
+        return np.asarray(delta, dtype=np.float64)
+    if model_type in ("DINA", "DINO"):
+        if model_type == "DINA":
+            ideal = np.all(group_patterns == 1, axis=1)
+        else:
+            ideal = np.any(group_patterns == 1, axis=1)
+        return np.where(ideal, delta[1], delta[0])
+    linear = delta[0] + group_patterns @ delta[1:]
+    if model_type == "ACDM":
+        return np.asarray(linear, dtype=np.float64)
+    if model_type == "LLM":
+        return np.asarray(sigmoid(linear), dtype=np.float64)
+    return delta[0] * np.prod(
+        np.where(group_patterns == 1, 1.0, delta[None, 1:]),
+        axis=1,
+    )
+
+
+def _higher_order_quadrature(
+    n_quad: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Equally spaced standard-normal grid on [-4, 4] with normalized weights."""
+    points = np.linspace(-4.0, 4.0, n_quad)
+    weights = np.exp(-0.5 * points**2)
+    return points, weights / np.sum(weights)
+
+
+def _validate_quadrature_count(n_quad: int) -> int:
+    if (
+        isinstance(n_quad, (bool, np.bool_))
+        or not isinstance(n_quad, (int, np.integer))
+        or n_quad <= 0
+    ):
+        raise MirtValidationError(
+            "n_quad must be a positive integer", parameter="n_quad"
+        )
+    return int(n_quad)
 
 
 def _gdina_item_chunks(
@@ -78,19 +155,23 @@ class AttributeHierarchy:
     def __post_init__(self) -> None:
         raw_adjacency = np.asarray(self.adjacency)
         if raw_adjacency.ndim != 2 or raw_adjacency.shape[0] != raw_adjacency.shape[1]:
-            raise ValueError("Adjacency matrix must be square")
+            raise MirtValidationError("Adjacency matrix must be square")
         n_attrs = raw_adjacency.shape[0]
         if n_attrs == 0:
-            raise ValueError("Adjacency matrix must contain at least one attribute")
+            raise MirtValidationError(
+                "Adjacency matrix must contain at least one attribute"
+            )
         if raw_adjacency.dtype.kind not in "biuf":
-            raise ValueError("Adjacency matrix must contain numeric binary values")
+            raise MirtValidationError(
+                "Adjacency matrix must contain numeric binary values"
+            )
         adjacency = np.asarray(raw_adjacency, dtype=np.float64)
         if not np.all(np.isfinite(adjacency)) or np.any(
             (adjacency != 0.0) & (adjacency != 1.0)
         ):
-            raise ValueError("Adjacency matrix must contain only 0 and 1")
+            raise MirtValidationError("Adjacency matrix must contain only 0 and 1")
         if np.any(np.diag(adjacency) != 0.0):
-            raise ValueError("An attribute cannot be its own prerequisite")
+            raise MirtValidationError("An attribute cannot be its own prerequisite")
 
         self.adjacency = adjacency.astype(np.int_, copy=True)
         self._topological_order = self._compute_topological_order()
@@ -99,7 +180,7 @@ class AttributeHierarchy:
         if self.attribute_names is None:
             self.attribute_names = [f"A{i}" for i in range(n_attrs)]
         elif len(self.attribute_names) != n_attrs:
-            raise ValueError(
+            raise MirtValidationError(
                 f"attribute_names length ({len(self.attribute_names)}) "
                 f"must match n_attributes ({n_attrs})"
             )
@@ -113,7 +194,7 @@ class AttributeHierarchy:
             or attribute < 0
             or attribute >= self.n_attributes
         ):
-            raise IndexError(f"attribute must be in [0, {self.n_attributes})")
+            raise MirtIndexError(f"attribute must be in [0, {self.n_attributes})")
         return int(attribute)
 
     def _compute_topological_order(self) -> list[int]:
@@ -129,7 +210,9 @@ class AttributeHierarchy:
             available.extend(int(child) for child in children if in_degree[child] == 0)
 
         if len(order) != self.n_attributes:
-            raise ValueError("Adjacency matrix must describe a directed acyclic graph")
+            raise MirtValidationError(
+                "Adjacency matrix must describe a directed acyclic graph"
+            )
         return order
 
     @property
@@ -162,12 +245,12 @@ class AttributeHierarchy:
         """
         raw_pattern = np.asarray(pattern)
         if raw_pattern.shape != (self.n_attributes,):
-            raise ValueError(f"pattern must have shape ({self.n_attributes},)")
+            raise MirtValidationError(f"pattern must have shape ({self.n_attributes},)")
         if raw_pattern.dtype.kind not in "biuf":
-            raise ValueError("pattern must contain numeric binary values")
+            raise MirtValidationError("pattern must contain numeric binary values")
         values = np.asarray(raw_pattern, dtype=np.float64)
         if not np.all(np.isfinite(values)) or np.any((values != 0.0) & (values != 1.0)):
-            raise ValueError("pattern must contain only 0 and 1")
+            raise MirtValidationError("pattern must contain only 0 and 1")
 
         prerequisites, attributes = np.where(self.adjacency == 1)
         return bool(np.all(values[attributes] <= values[prerequisites]))
@@ -213,13 +296,35 @@ class GDINA(BaseCDM):
 
     Notes
     -----
-    Reduced models:
-    - saturated: All main effects and interactions (default)
-    - DINA: Only intercept and highest-order interaction
-    - DINO: Compensatory (OR gate)
-    - ACDM: Only main effects (additive CDM)
-    - LLM: Linear logistic model
-    - RRUM: Reduced reparameterized unified model
+    An item requiring ``K_j`` attributes has ``2**K_j`` latent groups, one
+    for each mastery pattern of its required attributes. Group ``g`` codes
+    those attributes little-endian, in Q-matrix column order: for two
+    required attributes the groups are 00, 10, 01 and 11. With three or
+    more, this order differs from the one R's GDINA package uses.
+
+    The stored ``delta`` coefficients of an item (``delta_parameters``,
+    ``set_delta_parameters`` and the ``delta`` parameter) depend on its
+    reduced model:
+
+    - ``saturated`` (default): the success probability of each latent
+      group, in group order (R GDINA's ``itemprob``).
+    - ``DINA``: the success probabilities of examinees lacking at least one
+      required attribute and of examinees mastering all of them, ``g`` and
+      ``1 - s``.
+    - ``DINO``: the success probabilities of examinees mastering none of
+      the required attributes and of examinees mastering at least one.
+    - ``ACDM``: an intercept and one main effect per required attribute,
+      additive on the probability scale.
+    - ``LLM``: an intercept and one main effect per required attribute,
+      additive on the logit scale.
+    - ``RRUM``: ``pi*``, the success probability when every required
+      attribute is mastered, followed by one penalty ``r*_k`` per required
+      attribute, with ``P = pi* * prod_k r*_k ** (1 - alpha_k)``.
+
+    The saturated, DINA, DINO and RRUM coefficients are therefore not the
+    deltas of de la Torre (2011). :meth:`gdina_deltas` converts any item to
+    that parameterization, and :meth:`item_probabilities` returns the
+    success probability of each latent group.
     """
 
     model_name = "GDINA"
@@ -243,7 +348,7 @@ class GDINA(BaseCDM):
             self._reduced_models: list[ReducedModelType] = ["saturated"] * n_items
         else:
             if len(reduced_models) != n_items:
-                raise ValueError(
+                raise MirtValidationError(
                     f"reduced_models length ({len(reduced_models)}) "
                     f"must match n_items ({n_items})"
                 )
@@ -252,7 +357,7 @@ class GDINA(BaseCDM):
             ]
             if invalid_models:
                 valid = ", ".join(_DEFAULT_REDUCED_MODELS)
-                raise ValueError(
+                raise MirtValidationError(
                     f"Unknown reduced model: {invalid_models[0]!r}. "
                     f"Valid models: {valid}"
                 )
@@ -299,7 +404,11 @@ class GDINA(BaseCDM):
 
             delta = np.zeros(n_params)
             delta[0] = 0.2
-            if n_params > 1:
+            if model_type == "ACDM":
+                # Additive effects summing to 0.6 keep every group probability
+                # in [0.2, 0.8].
+                delta[1:] = 0.6 / max(1, n_params - 1)
+            elif n_params > 1:
                 delta[-1] = 0.6
                 if n_params > 2:
                     remaining = 0.3 / (n_params - 2)
@@ -362,51 +471,199 @@ class GDINA(BaseCDM):
         masks["reduced_model_code"].fill(False)
         return self._apply_free_parameter_restrictions(masks)
 
-    def set_delta_parameters(self, item_idx: int, delta: NDArray[np.float64]) -> Self:
-        """Set delta parameters for an item."""
-        delta = np.asarray(delta, dtype=np.float64)
-        expected_len = len(self._delta_params[item_idx])
+    def _required_group_patterns(self, item_idx: int) -> NDArray[np.int_]:
+        """Required-attribute pattern of each latent group of one item."""
+        required = np.flatnonzero(self._q_matrix[item_idx] == 1)
+        return self._latent_groups[item_idx][:, required]
 
-        if len(delta) != expected_len:
-            raise ValueError(
-                f"delta length ({len(delta)}) must be {expected_len} for item {item_idx}"
+    def _validate_item_coefficients(
+        self,
+        item_idx: int,
+        model_type: ReducedModelType,
+        delta: NDArray[np.float64],
+    ) -> None:
+        """Reject coefficients that do not define success probabilities."""
+        if not np.all(np.isfinite(delta)):
+            raise MirtValidationError(
+                f"delta for item {item_idx} must contain only finite values",
+                parameter="delta",
+            )
+        if model_type == "LLM":
+            return
+        if model_type == "RRUM" and np.any(delta < 0.0):
+            raise MirtValidationError(
+                f"RRUM delta for item {item_idx} must be non-negative",
+                parameter="delta",
+            )
+        if model_type in ("DINA", "DINO", "saturated"):
+            # Gate and saturated coefficients are probabilities themselves,
+            # including a coefficient that no latent group uses.
+            probabilities = delta
+        else:
+            probabilities = _reduced_group_probabilities(
+                model_type,
+                self._required_group_patterns(item_idx),
+                delta,
+            )
+        tolerance = _PROBABILITY_RANGE_TOLERANCE
+        if np.any(probabilities < -tolerance) or np.any(probabilities > 1 + tolerance):
+            raise MirtValidationError(
+                f"delta for item {item_idx} implies success probabilities "
+                "outside [0, 1]",
+                parameter="delta",
             )
 
-        self._delta_params[item_idx] = delta
+    def set_delta_parameters(self, item_idx: int, delta: ArrayLike) -> Self:
+        """Set the stored delta coefficients of one item.
+
+        Parameters
+        ----------
+        item_idx : int
+            Item index in ``[0, n_items)``.
+        delta : array_like
+            Coefficients in the item's stored parameterization (see the class
+            Notes): finite, with success probabilities in ``[0, 1]``.
+
+        Returns
+        -------
+        GDINA
+            The model, for chaining.
+        """
+        index = self._validate_item_index(item_idx)
+        try:
+            values = np.array(delta, dtype=np.float64, copy=True)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "delta must contain numeric values", parameter="delta"
+            ) from exc
+        expected_len = len(self._delta_params[index])
+        if values.ndim != 1 or len(values) != expected_len:
+            raise MirtValidationError(
+                f"delta length ({values.size}) must be {expected_len} for item {index}",
+                parameter="delta",
+            )
+        self._validate_item_coefficients(index, self._reduced_models[index], values)
+
+        self._delta_params[index] = values
         self._sync_parameter_cache()
         return self
 
+    def item_probabilities(self, item_idx: int) -> NDArray[np.float64]:
+        """Return the success probability of each latent group of one item.
+
+        Parameters
+        ----------
+        item_idx : int
+            Item index in ``[0, n_items)``.
+
+        Returns
+        -------
+        ndarray of shape (2**K_j,)
+            Success probabilities in latent-group order, which codes the
+            item's required attributes little-endian (see the class Notes).
+        """
+        index = self._validate_item_index(item_idx)
+        return self._item_probability_from_alpha(self._latent_groups[index], index)
+
+    def gdina_deltas(self, item_idx: int) -> NDArray[np.float64]:
+        """Return one item's coefficients as G-DINA deltas (de la Torre, 2011).
+
+        The deltas are on the link of the item's reduced model: identity for
+        the saturated, DINA, DINO and ACDM models, logit for LLM and log for
+        RRUM. They are ordered as the intercept, the main effects of the
+        required attributes in Q-matrix column order, then the interactions
+        by increasing order, each order in lexicographic attribute order. The
+        saturated model returns all ``2**K_j`` deltas, DINA the intercept and
+        the highest-order interaction, DINO the intercept and the common
+        effect of mastering any required attribute, and the other models the
+        intercept and main effects.
+
+        Parameters
+        ----------
+        item_idx : int
+            Item index in ``[0, n_items)``.
+
+        Returns
+        -------
+        ndarray
+            The item's G-DINA deltas. An item without required attributes
+            returns its single success probability.
+        """
+        index = self._validate_item_index(item_idx)
+        model_type = self._reduced_models[index]
+        delta = self._delta_params[index]
+        n_required = int(np.count_nonzero(self._q_matrix[index]))
+        if n_required == 0:
+            return self.item_probabilities(index)
+        if model_type in ("ACDM", "LLM"):
+            return delta.copy()
+        if model_type in ("DINA", "DINO"):
+            return np.array([delta[0], delta[1] - delta[0]], dtype=np.float64)
+        if model_type == "RRUM":
+            with np.errstate(divide="ignore"):
+                log_parameters = np.log(delta)
+            return np.concatenate(
+                ([log_parameters[0] + np.sum(log_parameters[1:])], -log_parameters[1:])
+            )
+        # Moebius inversion over the subsets of required attributes turns the
+        # latent-group probabilities into main effects and interactions.
+        effects = delta.copy()
+        for bit in range(n_required):
+            has_bit = (np.arange(effects.size) >> bit) & 1 == 1
+            effects[has_bit] -= effects[np.flatnonzero(has_bit) ^ (1 << bit)]
+        order = sorted(
+            range(effects.size),
+            key=lambda group: (
+                bin(group).count("1"),
+                [bit for bit in range(n_required) if (group >> bit) & 1],
+            ),
+        )
+        return effects[order]
+
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
-        """Set model parameters using the generic BaseItemModel interface."""
+        """Set model parameters using the generic BaseItemModel interface.
+
+        ``delta`` rows hold each item's coefficients in its stored
+        parameterization, padded to a common width; ``delta_n_params`` gives
+        the number of coefficients of each row and must match the item's
+        reduced model, and ``reduced_model_code`` the reduced models. Every
+        argument is validated before the model changes.
+        """
         allowed = {"delta", "delta_n_params", "reduced_model_code"}
         unknown = set(params) - allowed
         if unknown:
             valid = ", ".join(sorted(allowed))
             unknown_s = ", ".join(sorted(unknown))
-            raise ValueError(
+            raise MirtValidationError(
                 f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}"
             )
 
+        reduced_models = list(self._reduced_models)
         if "reduced_model_code" in params:
             reduced_codes = np.asarray(params["reduced_model_code"], dtype=np.float64)
             if reduced_codes.shape != (self.n_items,):
-                raise ValueError(
+                raise MirtValidationError(
                     f"Shape mismatch for reduced_model_code: expected ({self.n_items},), "
-                    f"got {reduced_codes.shape}"
+                    f"got {reduced_codes.shape}",
+                    parameter="reduced_model_code",
                 )
-            self._reduced_models = []
+            reduced_models = []
             for code in reduced_codes:
-                rounded = int(np.rint(code))
+                rounded = int(np.rint(code)) if np.isfinite(code) else -1
                 if rounded not in _REDUCED_CODE_TO_MODEL:
-                    raise ValueError(f"Unknown reduced model code: {code}")
-                self._reduced_models.append(_REDUCED_CODE_TO_MODEL[rounded])
+                    raise MirtValidationError(
+                        f"Unknown reduced model code: {code}",
+                        parameter="reduced_model_code",
+                    )
+                reduced_models.append(_REDUCED_CODE_TO_MODEL[rounded])
 
         if "delta" in params:
             delta_matrix = np.asarray(params["delta"], dtype=np.float64)
             if delta_matrix.ndim != 2 or delta_matrix.shape[0] != self.n_items:
-                raise ValueError(
+                raise MirtValidationError(
                     f"Shape mismatch for delta: expected ({self.n_items}, n_params), "
-                    f"got {delta_matrix.shape}"
+                    f"got {delta_matrix.shape}",
+                    parameter="delta",
                 )
         else:
             delta_matrix = self._parameters["delta"]
@@ -414,9 +671,10 @@ class GDINA(BaseCDM):
         if "delta_n_params" in params:
             n_delta_params = np.asarray(params["delta_n_params"], dtype=np.float64)
             if n_delta_params.shape != (self.n_items,):
-                raise ValueError(
+                raise MirtValidationError(
                     f"Shape mismatch for delta_n_params: expected ({self.n_items},), "
-                    f"got {n_delta_params.shape}"
+                    f"got {n_delta_params.shape}",
+                    parameter="delta_n_params",
                 )
         else:
             n_delta_params = self._parameters["delta_n_params"]
@@ -424,15 +682,22 @@ class GDINA(BaseCDM):
         max_params = delta_matrix.shape[1]
         updated_delta_params: list[NDArray[np.float64]] = []
         for j in range(self.n_items):
-            n_params = int(np.rint(n_delta_params[j]))
-            if n_params < 1 or n_params > max_params:
-                raise ValueError(
-                    f"Invalid number of delta parameters for item {j}: {n_params}"
-                )
-            updated_delta_params.append(
-                delta_matrix[j, :n_params].astype(np.float64).copy()
+            count = n_delta_params[j]
+            n_params = int(np.rint(count)) if np.isfinite(count) else 0
+            expected = _expected_coefficient_count(
+                reduced_models[j], int(np.count_nonzero(self._q_matrix[j]))
             )
+            if n_params != expected or n_params > max_params:
+                raise MirtValidationError(
+                    f"Invalid number of delta parameters for item {j}: {n_params}; "
+                    f"its {reduced_models[j]} model has {expected}",
+                    parameter="delta_n_params",
+                )
+            values = delta_matrix[j, :n_params].astype(np.float64).copy()
+            self._validate_item_coefficients(j, reduced_models[j], values)
+            updated_delta_params.append(values)
 
+        self._reduced_models = reduced_models
         self._delta_params = updated_delta_params
         self._sync_parameter_cache()
         return self
@@ -799,33 +1064,12 @@ class GDINA(BaseCDM):
         """Compute eta for G-DINA (returns latent group index)."""
         return self._latent_group_idx(alpha, item_idx)
 
-    def log_likelihood(
-        self,
-        responses: NDArray[np.int_],
-        alpha: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Compute log-likelihood for each person."""
-        responses = np.asarray(responses)
-        alpha = self._ensure_alpha_2d(alpha)
-
-        probs = self.probability(alpha)
-        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-        valid = responses >= 0
-        ll = np.where(
-            valid,
-            responses * np.log(probs) + (1 - responses) * np.log(1 - probs),
-            0.0,
-        )
-
-        return ll.sum(axis=1)
-
     def information(
         self,
         alpha: NDArray[np.int_],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute Fisher information."""
+        """Return Bernoulli response variance for each pattern and item."""
         alpha = self._ensure_alpha_2d(alpha)
         probs = self.probability(alpha, item_idx)
         return probs * (1 - probs)
@@ -909,12 +1153,24 @@ class GDINA(BaseCDM):
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
         global_rate: float,
+        start: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], float]:
         design = np.column_stack(
             (np.ones(group_patterns.shape[0], dtype=np.float64), group_patterns)
         )
         initial = np.zeros(design.shape[1], dtype=np.float64)
         initial[0] = global_rate
+        if start is not None and start.shape == initial.shape:
+            # Warm-start EM M-steps from the current estimates when they
+            # satisfy the bounds and the probability constraints.
+            start_probabilities = design @ start
+            if (
+                np.all(np.isfinite(start))
+                and np.all((start >= 0.0) & (start <= 1.0 - PROB_EPSILON))
+                and np.all(start_probabilities >= PROB_EPSILON - 1e-12)
+                and np.all(start_probabilities <= 1.0 - PROB_EPSILON + 1e-12)
+            ):
+                initial = start.copy()
 
         def objective(parameters: NDArray[np.float64]) -> float:
             probabilities = design @ parameters
@@ -969,12 +1225,18 @@ class GDINA(BaseCDM):
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
         global_rate: float,
+        start: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], float]:
         design = np.column_stack(
             (np.ones(group_patterns.shape[0], dtype=np.float64), group_patterns)
         )
         initial = np.zeros(design.shape[1], dtype=np.float64)
         initial[0] = np.log(global_rate / (1.0 - global_rate))
+        bounds = [(-23.0, 23.0)] + [(0.0, 23.0)] * group_patterns.shape[1]
+        if start is not None and start.shape == initial.shape:
+            if np.all(np.isfinite(start)):
+                lower, upper = np.array(bounds).T
+                initial = np.clip(start, lower, upper)
 
         def objective(parameters: NDArray[np.float64]) -> float:
             linear = design @ parameters
@@ -992,7 +1254,7 @@ class GDINA(BaseCDM):
             initial,
             method="L-BFGS-B",
             jac=gradient,
-            bounds=[(-23.0, 23.0)] + [(0.0, 23.0)] * group_patterns.shape[1],
+            bounds=bounds,
             options={"ftol": 1e-12, "maxiter": 200},
         )
         parameters = np.asarray(result.x, dtype=np.float64)
@@ -1014,6 +1276,7 @@ class GDINA(BaseCDM):
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
         rates: NDArray[np.float64],
+        start: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], float]:
         design = np.column_stack(
             (
@@ -1040,14 +1303,20 @@ class GDINA(BaseCDM):
             return design.T @ derivative
 
         lower = float(np.log(PROB_EPSILON))
+        bounds = [(lower, float(np.log1p(-PROB_EPSILON)))] + [
+            (lower, 0.0)
+        ] * group_patterns.shape[1]
+        if start is not None and start.shape == initial.shape:
+            if np.all(np.isfinite(start)) and np.all(start > 0.0):
+                lower_bounds, upper_bounds = np.array(bounds).T
+                initial = np.clip(np.log(start), lower_bounds, upper_bounds)
         initial_objective = objective(initial)
         result = minimize(
             objective,
             initial,
             method="L-BFGS-B",
             jac=gradient,
-            bounds=[(lower, float(np.log1p(-PROB_EPSILON)))]
-            + [(lower, 0.0)] * group_patterns.shape[1],
+            bounds=bounds,
             options={"ftol": 1e-12, "maxiter": 200},
         )
         log_parameters = np.asarray(result.x, dtype=np.float64)
@@ -1069,7 +1338,13 @@ class GDINA(BaseCDM):
         group_patterns: NDArray[np.int_],
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
+        start: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], float, int]:
+        """Fit one item's reduced model to expected latent-group counts.
+
+        ``start``, an item's current coefficients, warm-starts the iterative
+        ACDM, LLM and RRUM fits; the closed-form fits ignore it.
+        """
         rates, global_rate = self._selection_group_rates(successes, totals)
         n_attributes = group_patterns.shape[1]
 
@@ -1101,6 +1376,7 @@ class GDINA(BaseCDM):
                 successes,
                 totals,
                 global_rate,
+                start,
             )
         elif model_type == "LLM":
             parameters, log_likelihood = self._fit_llm_candidate(
@@ -1108,6 +1384,7 @@ class GDINA(BaseCDM):
                 successes,
                 totals,
                 global_rate,
+                start,
             )
         else:
             parameters, log_likelihood = self._fit_rrum_candidate(
@@ -1115,6 +1392,7 @@ class GDINA(BaseCDM):
                 successes,
                 totals,
                 rates,
+                start,
             )
         return parameters, log_likelihood, n_attributes + 1
 
@@ -1140,7 +1418,9 @@ class GDINA(BaseCDM):
         if candidate_models is None:
             return list(_DEFAULT_REDUCED_MODELS)
         if len(candidate_models) == 0:
-            raise ValueError("candidate_models must contain at least one model")
+            raise MirtValidationError(
+                "candidate_models must contain at least one model"
+            )
 
         validated: list[ReducedModelType] = []
         for model_type in candidate_models:
@@ -1149,40 +1429,13 @@ class GDINA(BaseCDM):
                 or model_type not in _REDUCED_MODEL_TO_CODE
             ):
                 valid = ", ".join(_DEFAULT_REDUCED_MODELS)
-                raise ValueError(
+                raise MirtValidationError(
                     f"Unknown candidate model: {model_type!r}. Valid models: {valid}"
                 )
             if model_type in validated:
-                raise ValueError(f"Duplicate candidate model: {model_type}")
+                raise MirtValidationError(f"Duplicate candidate model: {model_type}")
             validated.append(model_type)
         return validated
-
-    def _validate_responses(
-        self,
-        responses: NDArray[np.int_],
-    ) -> NDArray[np.int_]:
-        raw_responses = np.asarray(responses)
-        if raw_responses.ndim != 2:
-            raise ValueError("responses must be a two-dimensional matrix")
-        if raw_responses.shape[0] == 0:
-            raise ValueError("responses must contain at least one person")
-        if raw_responses.shape[1] != self.n_items:
-            raise ValueError(
-                f"responses has {raw_responses.shape[1]} items, expected {self.n_items}"
-            )
-        if raw_responses.dtype.kind not in "biuf":
-            raise ValueError("responses must contain numeric values")
-        values = np.asarray(raw_responses, dtype=np.float64)
-        if not np.all(np.isfinite(values)):
-            raise ValueError("responses must contain only finite values")
-        observed = values >= 0.0
-        if np.any(observed & (values != 0.0) & (values != 1.0)):
-            raise ValueError(
-                "responses must contain only 0, 1, or negative missing values"
-            )
-        if np.any(np.sum(observed, axis=0) == 0):
-            raise ValueError("every item must have at least one observed response")
-        return np.where(observed, values, -1.0).astype(np.int_, copy=False)
 
     def model_selection(
         self,
@@ -1209,11 +1462,13 @@ class GDINA(BaseCDM):
             Best model type for each item.
         """
         candidates = self._validate_selection_candidates(candidate_models)
-        response_values = self._validate_responses(responses)
+        response_values = self._validate_responses(responses, require_observed=True)
         patterns = self._attribute_patterns
         probabilities = np.asarray(self.probability(patterns), dtype=np.float64)
         if not np.all(np.isfinite(probabilities)):
-            raise ValueError("model probabilities must contain only finite values")
+            raise MirtValidationError(
+                "model probabilities must contain only finite values"
+            )
         probabilities = np.clip(probabilities, PROB_EPSILON, 1.0 - PROB_EPSILON)
 
         log_correct = np.log(probabilities)
@@ -1303,6 +1558,7 @@ class GDINA(BaseCDM):
         new_model._sync_parameter_cache()
 
         self._copy_parameter_restrictions_to(new_model)
+        self._copy_cdm_state_to(new_model)
         return new_model
 
 
@@ -1310,8 +1566,9 @@ class HigherOrderCDM(BaseCDM):
     """Higher-order CDM with attributes loading on a general factor.
 
     This model assumes that attribute mastery is determined by an
-    underlying continuous latent trait (general factor) through
-    a latent regression.
+    underlying continuous latent trait (general factor) through a latent
+    regression, and that item responses follow a G-DINA item model given
+    the mastery pattern (de la Torre & Douglas, 2004).
 
     Parameters
     ----------
@@ -1325,17 +1582,41 @@ class HigherOrderCDM(BaseCDM):
         Attribute hierarchy for constrained patterns.
     item_names : list of str, optional
         Names for items.
+    reduced_models : list of str, optional
+        Reduced G-DINA model of each item, as in :class:`GDINA`. Default is
+        'saturated'.
 
     Notes
     -----
-    The model is:
-        P(alpha_k = 1 | theta) = Phi(lambda_k * (theta - tau_k))
+    The higher-order model is the logistic latent regression
 
-    where theta is the higher-order trait, lambda_k is the loading,
-    and tau_k is the threshold for attribute k.
+        P(alpha_k = 1 | theta) = 1 / (1 + exp(-lambda_k * (theta - tau_k)))
+
+    where theta ~ N(0, 1) is the higher-order trait, lambda_k is the loading,
+    and tau_k is the threshold for attribute k. This is the 2PL form of de
+    la Torre and Douglas (2004), with slope lambda_k and intercept
+    -lambda_k * tau_k. Attributes are independent given theta; under a
+    hierarchy, the pattern probabilities are renormalized over
+    ``valid_patterns``.
+
+    Items are conditionally independent given the mastery pattern alpha,
+    not given theta. The likelihood of a response vector given theta sums
+    over the patterns:
+
+        P(X | theta) = sum_alpha P(alpha | theta) prod_j P(X_j | alpha).
+
+    The item model is a :class:`GDINA` (``base_model``). Change its
+    coefficients with :meth:`set_delta_parameters` or
+    ``set_parameters(delta=...)``; :func:`fit_higher_order_cdm` estimates
+    the item and higher-order parameters together.
     """
 
     model_name = "HigherOrderCDM"
+    _global_parameters = frozenset({"loadings", "thresholds"})
+    # Itemwise estimators cannot move the structural loadings and thresholds;
+    # this names the estimator that integrates the higher-order trait.
+    dedicated_estimator = "mirt.fit_higher_order_cdm"
+    _item_parameters = frozenset({"delta", "delta_n_params", "reduced_model_code"})
 
     def __init__(
         self,
@@ -1344,6 +1625,7 @@ class HigherOrderCDM(BaseCDM):
         q_matrix: NDArray[np.int_],
         hierarchy: AttributeHierarchy | None = None,
         item_names: list[str] | None = None,
+        reduced_models: list[ReducedModelType] | None = None,
     ) -> None:
         super().__init__(
             n_items=n_items,
@@ -1351,15 +1633,30 @@ class HigherOrderCDM(BaseCDM):
             q_matrix=q_matrix,
             item_names=item_names,
         )
+        if hierarchy is not None:
+            if not isinstance(hierarchy, AttributeHierarchy):
+                raise MirtValidationError(
+                    "hierarchy must be an AttributeHierarchy", parameter="hierarchy"
+                )
+            if hierarchy.n_attributes != self._n_attributes:
+                raise MirtValidationError(
+                    f"hierarchy has {hierarchy.n_attributes} attributes, "
+                    f"expected {self._n_attributes}",
+                    parameter="hierarchy",
+                )
 
         self._hierarchy = hierarchy
         self._loadings = np.ones(n_attributes, dtype=np.float64)
         self._thresholds = np.zeros(n_attributes, dtype=np.float64)
+        # Standard-normal grid integrating P(alpha | theta) into the implied
+        # class probabilities.
+        self._n_quad = _DEFAULT_HIGHER_ORDER_QUADRATURE
 
         self._base_cdm = GDINA(
             n_items=n_items,
             n_attributes=n_attributes,
             q_matrix=q_matrix,
+            reduced_models=reduced_models,
             item_names=item_names,
         )
 
@@ -1377,9 +1674,13 @@ class HigherOrderCDM(BaseCDM):
         self._sync_parameter_cache()
 
     def _sync_parameter_cache(self) -> None:
-        """Synchronize generic parameter cache with higher-order parameters."""
+        """Mirror the higher-order and item-model parameters in the cache."""
         self._parameters["loadings"] = self._loadings.copy()
         self._parameters["thresholds"] = self._thresholds.copy()
+        base_cdm = getattr(self, "_base_cdm", None)
+        if base_cdm is not None:
+            for name in self._item_parameters:
+                self._parameters[name] = base_cdm._parameters[name].copy()
 
     @property
     def hierarchy(self) -> AttributeHierarchy | None:
@@ -1400,6 +1701,38 @@ class HigherOrderCDM(BaseCDM):
         """Valid attribute patterns under hierarchy."""
         return self._valid_patterns.copy()
 
+    @property
+    def base_model(self) -> GDINA:
+        """Return an owned copy of the G-DINA item model."""
+        return self._base_cdm.copy()
+
+    @property
+    def reduced_models(self) -> list[ReducedModelType]:
+        """Reduced G-DINA model of each item."""
+        return self._base_cdm.reduced_models
+
+    @property
+    def delta_parameters(self) -> list[NDArray[np.float64]]:
+        """Stored G-DINA coefficients of each item (see :class:`GDINA`)."""
+        return self._base_cdm.delta_parameters
+
+    @property
+    def class_probabilities(self) -> NDArray[np.float64]:
+        """Marginal probabilities of ``valid_patterns`` implied by the model.
+
+        They integrate ``P(alpha | theta)`` over a standard normal theta, and
+        are the default prior of the scoring methods.
+        """
+        return self._default_pattern_prior()
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        """Free item coefficients plus every loading and threshold."""
+        masks = dict(self._base_cdm.free_parameter_masks)
+        masks["loadings"] = np.ones(self._n_attributes, dtype=np.bool_)
+        masks["thresholds"] = np.ones(self._n_attributes, dtype=np.bool_)
+        return self._apply_free_parameter_restrictions(masks)
+
     def set_higher_order_params(
         self,
         loadings: NDArray[np.float64],
@@ -1410,31 +1743,52 @@ class HigherOrderCDM(BaseCDM):
         thresholds = np.asarray(thresholds, dtype=np.float64)
 
         if loadings.shape != (self._n_attributes,):
-            raise ValueError(
-                f"loadings shape {loadings.shape} != ({self._n_attributes},)"
+            raise MirtValidationError(
+                f"loadings shape {loadings.shape} != ({self._n_attributes},)",
+                parameter="loadings",
             )
         if thresholds.shape != (self._n_attributes,):
-            raise ValueError(
-                f"thresholds shape {thresholds.shape} != ({self._n_attributes},)"
+            raise MirtValidationError(
+                f"thresholds shape {thresholds.shape} != ({self._n_attributes},)",
+                parameter="thresholds",
             )
         if not np.all(np.isfinite(loadings)):
-            raise ValueError("loadings must contain only finite values")
+            raise MirtValidationError(
+                "loadings must contain only finite values", parameter="loadings"
+            )
         if not np.all(np.isfinite(thresholds)):
-            raise ValueError("thresholds must contain only finite values")
+            raise MirtValidationError(
+                "thresholds must contain only finite values", parameter="thresholds"
+            )
 
         self._loadings = loadings.copy()
         self._thresholds = thresholds.copy()
         self._sync_parameter_cache()
         return self
 
+    def set_delta_parameters(self, item_idx: int, delta: ArrayLike) -> Self:
+        """Set one item's stored G-DINA coefficients.
+
+        See :meth:`GDINA.set_delta_parameters`.
+        """
+        self._base_cdm.set_delta_parameters(item_idx, delta)
+        self._sync_parameter_cache()
+        return self
+
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
-        """Set higher-order parameters using the generic BaseItemModel interface."""
-        allowed = {"loadings", "thresholds"}
+        """Set parameters using the generic BaseItemModel interface.
+
+        ``loadings`` and ``thresholds`` set the higher-order model, and
+        ``delta``, ``delta_n_params`` and ``reduced_model_code`` the G-DINA
+        item model, as in :meth:`GDINA.set_parameters`. Every argument is
+        validated before the model changes.
+        """
+        allowed = {"loadings", "thresholds"} | self._item_parameters
         unknown = set(params) - allowed
         if unknown:
             valid = ", ".join(sorted(allowed))
             unknown_s = ", ".join(sorted(unknown))
-            raise ValueError(
+            raise MirtValidationError(
                 f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}"
             )
 
@@ -1443,20 +1797,35 @@ class HigherOrderCDM(BaseCDM):
             params.get("thresholds", self._thresholds), dtype=np.float64
         )
         if loadings.shape != (self._n_attributes,):
-            raise ValueError(
+            raise MirtValidationError(
                 f"Shape mismatch for loadings: expected ({self._n_attributes},), "
-                f"got {loadings.shape}"
+                f"got {loadings.shape}",
+                parameter="loadings",
             )
         if thresholds.shape != (self._n_attributes,):
-            raise ValueError(
+            raise MirtValidationError(
                 f"Shape mismatch for thresholds: expected ({self._n_attributes},), "
-                f"got {thresholds.shape}"
+                f"got {thresholds.shape}",
+                parameter="thresholds",
             )
         if not np.all(np.isfinite(loadings)):
-            raise ValueError("loadings must contain only finite values")
+            raise MirtValidationError(
+                "loadings must contain only finite values", parameter="loadings"
+            )
         if not np.all(np.isfinite(thresholds)):
-            raise ValueError("thresholds must contain only finite values")
+            raise MirtValidationError(
+                "thresholds must contain only finite values", parameter="thresholds"
+            )
 
+        item_updates = {
+            name: value
+            for name, value in params.items()
+            if name in self._item_parameters
+        }
+        if item_updates:
+            base_cdm = self._base_cdm.copy()
+            base_cdm.set_parameters(**item_updates)
+            self._base_cdm = base_cdm
         return self.set_higher_order_params(loadings, thresholds)
 
     def _validate_theta(
@@ -1467,35 +1836,24 @@ class HigherOrderCDM(BaseCDM):
     ) -> NDArray[np.float64]:
         raw_theta = np.asarray(theta)
         if raw_theta.ndim > 2 or (raw_theta.ndim == 2 and 1 not in raw_theta.shape):
-            raise ValueError("theta must be a scalar, vector, or single-column matrix")
+            raise MirtValidationError(
+                "theta must be a scalar, vector, or single-column matrix",
+                parameter="theta",
+            )
         if raw_theta.dtype.kind not in "biuf":
-            raise ValueError("theta must contain numeric values")
+            raise MirtValidationError(
+                "theta must contain numeric values", parameter="theta"
+            )
         values = np.asarray(raw_theta, dtype=np.float64).reshape(-1)
         if values.size == 0 and not allow_empty:
-            raise ValueError("theta must contain at least one value")
+            raise MirtValidationError(
+                "theta must contain at least one value", parameter="theta"
+            )
         if not np.all(np.isfinite(values)):
-            raise ValueError("theta must contain only finite values")
+            raise MirtValidationError(
+                "theta must contain only finite values", parameter="theta"
+            )
         return values
-
-    def _validate_responses(self, responses: NDArray[np.int_]) -> NDArray[np.int_]:
-        raw_responses = np.asarray(responses)
-        if raw_responses.ndim != 2:
-            raise ValueError("responses must be a two-dimensional matrix")
-        if raw_responses.shape[1] != self.n_items:
-            raise ValueError(
-                f"responses has {raw_responses.shape[1]} items, expected {self.n_items}"
-            )
-        if raw_responses.dtype.kind not in "biuf":
-            raise ValueError("responses must contain numeric values")
-        values = np.asarray(raw_responses, dtype=np.float64)
-        if not np.all(np.isfinite(values)):
-            raise ValueError("responses must contain only finite values")
-        observed = values >= 0.0
-        if np.any(observed & (values != 0.0) & (values != 1.0)):
-            raise ValueError(
-                "responses must contain only 0, 1, or negative missing values"
-            )
-        return np.where(observed, values, -1.0).astype(np.int_, copy=False)
 
     def _linear_predictor(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         with np.errstate(over="ignore", invalid="ignore"):
@@ -1510,10 +1868,25 @@ class HigherOrderCDM(BaseCDM):
     ) -> NDArray[np.float64]:
         return self._base_cdm.probability(self._valid_patterns, item_idx)
 
+    def _profile_patterns(self) -> NDArray[np.int_]:
+        return self._valid_patterns
+
+    def _pattern_response_probabilities(
+        self,
+        alpha: NDArray[np.int_] | None = None,
+    ) -> NDArray[np.float64]:
+        patterns = self._valid_patterns if alpha is None else alpha
+        return np.asarray(self._base_cdm.probability(patterns), dtype=np.float64)
+
+    def _default_pattern_prior(self) -> NDArray[np.float64]:
+        points, weights = _higher_order_quadrature(self._n_quad)
+        prior = weights @ self.pattern_probability(points)
+        return prior / np.sum(prior)
+
     def attribute_probability(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute attribute mastery probabilities given theta.
 
-        P(alpha_k = 1 | theta) = Phi(lambda_k * (theta - tau_k))
+        P(alpha_k = 1 | theta) = 1 / (1 + exp(-lambda_k * (theta - tau_k)))
 
         Parameters
         ----------
@@ -1523,10 +1896,32 @@ class HigherOrderCDM(BaseCDM):
         Returns
         -------
         NDArray
-            Probabilities (n_persons, n_attributes).
+            Probabilities (n_persons, n_attributes), before any hierarchy
+            restriction.
         """
         theta_values = self._validate_theta(theta)
         return np.asarray(sigmoid(self._linear_predictor(theta_values)))
+
+    def _log_pattern_probability(
+        self,
+        theta_values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Log-probability of each valid pattern at validated theta values."""
+        predictor = self._linear_predictor(theta_values)
+        log_mastery = -np.logaddexp(0.0, -predictor)
+        log_nonmastery = -np.logaddexp(0.0, predictor)
+        patterns = self._valid_patterns
+        log_pattern_probability = (
+            log_mastery @ patterns.T + log_nonmastery @ (1 - patterns).T
+        )
+        # Shift before normalizing: near the float limit, adding log(2) to a
+        # huge negative maximum is lost to rounding.
+        log_pattern_probability -= np.max(
+            log_pattern_probability, axis=1, keepdims=True
+        )
+        return log_pattern_probability - np.log(
+            np.sum(np.exp(log_pattern_probability), axis=1, keepdims=True)
+        )
 
     def pattern_probability(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute probability of each valid attribute pattern given theta.
@@ -1542,18 +1937,7 @@ class HigherOrderCDM(BaseCDM):
             Pattern probabilities (n_persons, n_valid_patterns).
         """
         theta_values = self._validate_theta(theta)
-        predictor = self._linear_predictor(theta_values)
-        log_mastery = -np.logaddexp(0.0, -predictor)
-        log_nonmastery = -np.logaddexp(0.0, predictor)
-        patterns = self._valid_patterns
-        log_pattern_probability = (
-            log_mastery @ patterns.T + log_nonmastery @ (1 - patterns).T
-        )
-        log_pattern_probability -= np.max(
-            log_pattern_probability, axis=1, keepdims=True
-        )
-        pattern_probability = np.exp(log_pattern_probability)
-        return pattern_probability / np.sum(pattern_probability, axis=1, keepdims=True)
+        return np.exp(self._log_pattern_probability(theta_values))
 
     def probability(
         self,
@@ -1572,7 +1956,9 @@ class HigherOrderCDM(BaseCDM):
         Returns
         -------
         NDArray
-            Response probabilities.
+            Response probabilities ``sum_alpha P(alpha | theta) P_j(alpha)``.
+            Items are not independent given theta, so these marginal curves
+            do not multiply into the likelihood; see :meth:`log_likelihood`.
         """
         index = None if item_idx is None else self._validate_item_index(item_idx)
         pattern_probability = self.pattern_probability(theta)
@@ -1607,38 +1993,81 @@ class HigherOrderCDM(BaseCDM):
         """Compute eta using base CDM."""
         return self._base_cdm.eta(alpha, item_idx)
 
+    def _theta_grid_log_likelihoods(
+        self,
+        response_values: NDArray[np.int_],
+        theta_values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Marginal log-likelihood of every response row at every theta."""
+        pattern_log_likelihoods = self.pattern_log_likelihoods(response_values)
+        shift = np.max(pattern_log_likelihoods, axis=1, keepdims=True)
+        likelihoods = np.exp(pattern_log_likelihoods - shift) @ (
+            self.pattern_probability(theta_values).T
+        )
+        with np.errstate(divide="ignore"):
+            return np.log(likelihoods) + shift
+
     def log_likelihood(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Compute log-likelihood for each person."""
+        """Compute each person's log-likelihood given theta.
+
+        The likelihood marginalizes the shared mastery pattern,
+        ``log sum_alpha P(alpha | theta) prod_j P(X_j | alpha)``.
+
+        Parameters
+        ----------
+        responses : ndarray of shape (n_persons, n_items)
+            Binary responses; negative values are missing.
+        theta : ndarray
+            One higher-order ability per person, or one value for all.
+
+        Returns
+        -------
+        ndarray of shape (n_persons,)
+            Log-likelihood of each response row.
+        """
         response_values = self._validate_responses(responses)
         theta_values = self._validate_theta(theta)
         if theta_values.size not in (1, response_values.shape[0]):
-            raise ValueError("responses and theta must have compatible row counts")
+            raise MirtValidationError(
+                "responses and theta must have compatible row counts"
+            )
 
-        probs = self.probability(theta_values)
-        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-        valid = response_values >= 0
-        values = np.where(valid, response_values, 0)
-        ll = np.where(
-            valid,
-            values * np.log(probs) + (1 - values) * np.log1p(-probs),
-            0.0,
-        )
-
-        return ll.sum(axis=1)
+        pattern_log_likelihoods = self.pattern_log_likelihoods(response_values)
+        log_prior = self._log_pattern_probability(theta_values)
+        return logsumexp(pattern_log_likelihoods + log_prior, axis=1)
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute Fisher information."""
-        probs = self.probability(theta, item_idx)
-        return probs * (1 - probs)
+        """Fisher information about theta in each item's marginal response.
+
+        Returns ``(dP_j / dtheta)**2 / (P_j (1 - P_j))`` for the marginal
+        curve ``P_j(theta)`` of :meth:`probability`. Because items share the
+        mastery pattern, these item informations do not add up to the
+        information of the whole response vector.
+        """
+        index = None if item_idx is None else self._validate_item_index(item_idx)
+        theta_values = self._validate_theta(theta)
+        pattern_probability = self.pattern_probability(theta_values)
+        patterns = self._valid_patterns
+        # d log P(alpha | theta) / dtheta = sum_k lambda_k (alpha_k - E[alpha_k]),
+        # with the expectation under the (hierarchy-normalized) pattern law.
+        expected_mastery = pattern_probability @ patterns
+        score = (
+            patterns @ self._loadings
+            - (expected_mastery @ self._loadings)[:, np.newaxis]
+        )
+        conditional = self._conditional_response_probability(index)
+        marginal = pattern_probability @ conditional
+        derivative = (pattern_probability * score) @ conditional
+        variance = np.clip(marginal * (1.0 - marginal), PROB_EPSILON, None)
+        return derivative**2 / variance
 
     def estimate_theta(
         self,
@@ -1655,7 +2084,9 @@ class HigherOrderCDM(BaseCDM):
         method : str
             Estimation method ('EAP' or 'MLE').
         n_quad : int
-            Number of quadrature points for EAP.
+            Number of equally spaced grid points on [-4, 4]. EAP uses a
+            standard normal prior; MLE returns the grid point with the
+            largest likelihood.
 
         Returns
         -------
@@ -1664,27 +2095,13 @@ class HigherOrderCDM(BaseCDM):
         """
         response_values = self._validate_responses(responses)
         if method not in ("EAP", "MLE"):
-            raise ValueError("method must be 'EAP' or 'MLE'")
-        if (
-            isinstance(n_quad, (bool, np.bool_))
-            or not isinstance(n_quad, (int, np.integer))
-            or n_quad <= 0
-        ):
-            raise ValueError("n_quad must be a positive integer")
+            raise MirtValidationError(
+                "method must be 'EAP' or 'MLE'", parameter="method"
+            )
+        n_quad = _validate_quadrature_count(n_quad)
 
         quad_points = np.linspace(-4, 4, n_quad)
-        probabilities = np.clip(
-            self.probability(quad_points),
-            PROB_EPSILON,
-            1.0 - PROB_EPSILON,
-        )
-        observed = response_values >= 0
-        values = np.where(observed, response_values, 0).astype(np.float64, copy=False)
-        observed_values = observed.astype(np.float64)
-        log_likes = (
-            values @ np.log(probabilities).T
-            + (observed_values - values) @ np.log1p(-probabilities).T
-        )
+        log_likes = self._theta_grid_log_likelihoods(response_values, quad_points)
 
         if method == "MLE":
             best_idx = np.argmax(log_likes, axis=1)
@@ -1709,17 +2126,71 @@ class HigherOrderCDM(BaseCDM):
             q_matrix=self._q_matrix.copy(),
             hierarchy=self._hierarchy,
             item_names=self.item_names.copy() if self.item_names else None,
+            reduced_models=self._base_cdm.reduced_models,
         )
 
         new_model._loadings = self._loadings.copy()
         new_model._thresholds = self._thresholds.copy()
         new_model._base_cdm = self._base_cdm.copy()
         new_model._valid_patterns = self._valid_patterns.copy()
+        new_model._n_quad = self._n_quad
         new_model._is_fitted = self._is_fitted
         new_model._sync_parameter_cache()
 
         self._copy_parameter_restrictions_to(new_model)
+        self._copy_cdm_state_to(new_model)
         return new_model
+
+
+def _gdina_item_design(
+    model: GDINA,
+    patterns: NDArray[np.int_],
+) -> tuple[list[NDArray[np.int_]], list[NDArray[np.int_]]]:
+    """Latent group of each pattern and required-attribute group patterns."""
+    group_indices = [
+        model._latent_group_idx_from_alpha(patterns, item_idx)
+        for item_idx in range(model.n_items)
+    ]
+    group_patterns = [
+        model._required_group_patterns(item_idx) for item_idx in range(model.n_items)
+    ]
+    return group_indices, group_patterns
+
+
+def _gdina_item_m_step(
+    model: GDINA,
+    posterior: NDArray[np.float64],
+    correct: NDArray[np.float64],
+    observed: NDArray[np.float64],
+    group_indices: list[NDArray[np.int_]],
+    group_patterns: list[NDArray[np.int_]],
+) -> None:
+    """Refit every item to the expected latent-group counts of one E-step."""
+    # Two GEMMs give every item's expected totals and successes per pattern;
+    # each item then pools its patterns into its latent groups.
+    pattern_totals = observed.T @ posterior
+    pattern_successes = correct.T @ posterior
+    for item_idx in range(model.n_items):
+        n_groups = group_patterns[item_idx].shape[0]
+        item_totals = np.bincount(
+            group_indices[item_idx],
+            weights=pattern_totals[item_idx],
+            minlength=n_groups,
+        )
+        item_successes = np.bincount(
+            group_indices[item_idx],
+            weights=pattern_successes[item_idx],
+            minlength=n_groups,
+        )
+        parameters, _, _ = model._fit_reduced_parameters(
+            model._reduced_models[item_idx],
+            group_patterns[item_idx],
+            item_successes,
+            item_totals,
+            model._delta_params[item_idx],
+        )
+        model._delta_params[item_idx] = parameters
+    model._sync_parameter_cache()
 
 
 def fit_gdina(
@@ -1729,13 +2200,16 @@ def fit_gdina(
     max_iter: int = 100,
     tol: float = 1e-4,
     verbose: bool = False,
-) -> tuple[GDINA, NDArray[np.float64]]:
+    *,
+    hierarchy: AttributeHierarchy | None = None,
+) -> CDMResult[GDINA]:
     """Fit G-DINA model using EM algorithm.
 
     Parameters
     ----------
     responses : NDArray
-        Response matrix (n_persons, n_items).
+        Response matrix (n_persons, n_items). Negative values are missing;
+        every item needs at least one observed response.
     q_matrix : NDArray
         Q-matrix (n_items, n_attributes).
     reduced_models : list of str, optional
@@ -1743,129 +2217,303 @@ def fit_gdina(
     max_iter : int
         Maximum EM iterations.
     tol : float
-        Convergence tolerance.
+        Convergence tolerance on the change in marginal log-likelihood.
     verbose : bool
         Whether to print progress.
+    hierarchy : AttributeHierarchy, optional
+        Attribute hierarchy restricting the latent classes. Patterns in which
+        an attribute is mastered without all of its prerequisites keep zero
+        class probability.
 
     Returns
     -------
-    tuple
-        (fitted_model, class_probabilities)
+    CDMResult
+        Fitted model, estimated class probabilities, log-likelihood,
+        information criteria and convergence information. The fitted model
+        stores the class probabilities as the default prior of its scoring
+        methods. The result unpacks as ``(fitted_model, class_probabilities)``.
     """
-    raw_responses = np.asarray(responses)
-    if raw_responses.ndim != 2:
-        raise ValueError("responses must be a two-dimensional matrix")
-    if raw_responses.shape[0] == 0 or raw_responses.shape[1] == 0:
-        raise ValueError("responses must contain at least one person and one item")
-    raw_q_matrix = np.asarray(q_matrix)
-    if raw_q_matrix.ndim != 2:
-        raise ValueError("q_matrix must be a two-dimensional matrix")
-    if (
-        isinstance(max_iter, (bool, np.bool_))
-        or not isinstance(max_iter, (int, np.integer))
-        or max_iter <= 0
-    ):
-        raise ValueError("max_iter must be a positive integer")
-    if (
-        isinstance(tol, (bool, np.bool_))
-        or not isinstance(tol, (int, float, np.integer, np.floating))
-        or not np.isfinite(tol)
-        or tol <= 0.0
-    ):
-        raise ValueError("tol must be a positive finite number")
-
-    n_items = raw_responses.shape[1]
-    n_attributes = raw_q_matrix.shape[1]
+    max_iter, tol = _validate_fit_configuration(max_iter, tol, verbose)
+    raw_responses, raw_q_matrix = _validate_fit_inputs(responses, q_matrix)
+    n_persons, n_items = raw_responses.shape
 
     model = GDINA(
         n_items=n_items,
-        n_attributes=n_attributes,
+        n_attributes=raw_q_matrix.shape[1],
         q_matrix=raw_q_matrix,
         reduced_models=reduced_models,
     )
-    response_values = model._validate_responses(raw_responses)
+    response_values = model._validate_responses(raw_responses, require_observed=True)
 
-    patterns = model.attribute_patterns
+    patterns = model._attribute_patterns
     n_patterns = len(patterns)
-    observed = response_values >= 0
-    response_float = np.where(observed, response_values, 0).astype(
-        np.float64,
-        copy=False,
-    )
-    observed_float = observed.astype(np.float64)
-    group_indices = [
-        model._latent_group_idx(patterns, item_idx) for item_idx in range(n_items)
-    ]
-    required_attributes = [
-        np.flatnonzero(model._q_matrix[item_idx] == 1) for item_idx in range(n_items)
-    ]
-    group_patterns = [
-        model._latent_groups[item_idx][:, required_attributes[item_idx]]
-        for item_idx in range(n_items)
-    ]
+    permissible = _hierarchy_pattern_mask(hierarchy, model.n_attributes, patterns)
+    correct, incorrect, observed = _response_indicators(response_values)
+    group_indices, group_patterns = _gdina_item_design(model, patterns)
 
-    class_probs = np.full(n_patterns, 1.0 / n_patterns, dtype=np.float64)
+    if permissible is None:
+        class_probs = np.full(n_patterns, 1.0 / n_patterns, dtype=np.float64)
+    else:
+        class_probs = permissible / np.sum(permissible)
     prev_ll = -np.inf
+    converged = False
+    n_iterations = max_iter
 
     for iteration in range(max_iter):
-        probabilities = np.asarray(model.probability(patterns), dtype=np.float64)
-        if not np.all(np.isfinite(probabilities)):
-            raise ValueError("model probabilities must contain only finite values")
-        probabilities = np.clip(
-            probabilities,
-            PROB_EPSILON,
-            1.0 - PROB_EPSILON,
+        log_like_matrix = _pattern_log_likelihood_matrix(
+            correct, incorrect, model.probability(patterns)
         )
-        log_correct = np.log(probabilities)
-        log_incorrect = np.log1p(-probabilities)
-        log_like_matrix = (
-            response_float @ log_correct.T
-            + (observed_float - response_float) @ log_incorrect.T
-        )
-        log_posterior = log_like_matrix + np.log(class_probs)
-        log_sum = np.logaddexp.reduce(log_posterior, axis=1, keepdims=True)
-        posterior = np.exp(log_posterior - log_sum)
-        current_ll = float(np.sum(log_sum))
+        posterior, current_ll = _class_posterior(log_like_matrix, class_probs)
 
         if verbose:
             print(f"Iteration {iteration + 1}: LL = {current_ll:.4f}")
 
         if iteration > 0 and abs(current_ll - prev_ll) < tol:
+            converged = True
+            n_iterations = iteration
             break
 
         class_probs = np.maximum(np.mean(posterior, axis=0), PROB_EPSILON)
+        if permissible is not None:
+            class_probs[~permissible] = 0.0
         class_probs /= np.sum(class_probs)
 
-        for item_idx in range(n_items):
-            item_observed = observed[:, item_idx]
-            observed_posterior = posterior[item_observed]
-            pattern_totals = np.sum(observed_posterior, axis=0)
-            pattern_successes = np.sum(
-                observed_posterior
-                * response_float[item_observed, item_idx, np.newaxis],
-                axis=0,
-            )
-            n_groups = group_patterns[item_idx].shape[0]
-            item_totals = np.bincount(
-                group_indices[item_idx],
-                weights=pattern_totals,
-                minlength=n_groups,
-            )
-            item_successes = np.bincount(
-                group_indices[item_idx],
-                weights=pattern_successes,
-                minlength=n_groups,
-            )
-            parameters, _, _ = model._fit_reduced_parameters(
-                model._reduced_models[item_idx],
-                group_patterns[item_idx],
-                item_successes,
-                item_totals,
-            )
-            model._delta_params[item_idx] = parameters
-
+        _gdina_item_m_step(
+            model, posterior, correct, observed, group_indices, group_patterns
+        )
         prev_ll = current_ll
+    else:
+        # The last M-step followed the last E-step; evaluate its estimates.
+        _, current_ll = _class_posterior(
+            _pattern_log_likelihood_matrix(
+                correct, incorrect, model.probability(patterns)
+            ),
+            class_probs,
+        )
+
+    model._sync_parameter_cache()
+    model._class_probabilities = class_probs.copy()
+    model._permissible_patterns = None if permissible is None else permissible.copy()
+    model._is_fitted = True
+    n_classes = n_patterns if permissible is None else int(np.sum(permissible))
+    return CDMResult(
+        model=model,
+        class_probabilities=class_probs.copy(),
+        log_likelihood=current_ll,
+        n_parameters=model.n_parameters + n_classes - 1,
+        n_observations=n_persons,
+        n_iterations=n_iterations,
+        converged=converged,
+    )
+
+
+def _fit_higher_order_structure(
+    expected_counts: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    patterns: NDArray[np.int_],
+    loadings: NDArray[np.float64],
+    thresholds: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Maximize the expected latent-regression log-likelihood.
+
+    ``expected_counts[q, a]`` is the expected number of respondents at grid
+    node ``q`` with pattern ``a``. The optimizer works on slopes and
+    intercepts ``-loading * threshold`` and returns loadings and thresholds.
+    """
+    n_attributes = patterns.shape[1]
+    pattern_values = patterns.astype(np.float64)
+    mastered_counts = expected_counts @ pattern_values
+    node_totals = np.sum(expected_counts, axis=1)
+
+    def objective(
+        parameters: NDArray[np.float64],
+    ) -> tuple[float, NDArray[np.float64]]:
+        slopes = parameters[:n_attributes]
+        intercepts = parameters[n_attributes:]
+        predictor = quad_points[:, np.newaxis] * slopes + intercepts
+        log_mastery = -np.logaddexp(0.0, -predictor)
+        log_nonmastery = -np.logaddexp(0.0, predictor)
+        unnormalized = (
+            log_mastery @ pattern_values.T + log_nonmastery @ (1.0 - pattern_values).T
+        )
+        # The normalizer is one without a hierarchy; with one, it renormalizes
+        # P(alpha | theta) over the valid patterns.
+        log_normalizer = logsumexp(unnormalized, axis=1)
+        value = float(
+            np.sum(expected_counts * unnormalized)
+            - np.sum(node_totals * log_normalizer)
+        )
+        conditional = np.exp(unnormalized - log_normalizer[:, np.newaxis])
+        predictor_gradient = mastered_counts - node_totals[:, np.newaxis] * (
+            conditional @ pattern_values
+        )
+        gradient = np.concatenate(
+            (quad_points @ predictor_gradient, np.sum(predictor_gradient, axis=0))
+        )
+        return -value, -gradient
+
+    bounds = [_HIGHER_ORDER_LOADING_BOUNDS] * n_attributes + [
+        _HIGHER_ORDER_INTERCEPT_BOUNDS
+    ] * n_attributes
+    lower, upper = np.array(bounds).T
+    start = np.clip(np.concatenate((loadings, -loadings * thresholds)), lower, upper)
+    start_value, _ = objective(start)
+    result = minimize(
+        objective,
+        start,
+        method="L-BFGS-B",
+        jac=True,
+        bounds=bounds,
+        options={"ftol": 1e-12, "maxiter": 200},
+    )
+    parameters = np.asarray(result.x, dtype=np.float64)
+    if not np.all(np.isfinite(parameters)) or float(result.fun) > start_value + 1e-10:
+        parameters = start
+    slopes = parameters[:n_attributes].copy()
+    return slopes, -parameters[n_attributes:] / slopes
+
+
+def fit_higher_order_cdm(
+    responses: NDArray[np.int_],
+    q_matrix: NDArray[np.int_],
+    reduced_models: list[ReducedModelType] | None = None,
+    max_iter: int = 100,
+    tol: float = 1e-4,
+    verbose: bool = False,
+    *,
+    hierarchy: AttributeHierarchy | None = None,
+    n_quad: int = _DEFAULT_HIGHER_ORDER_QUADRATURE,
+) -> CDMResult[HigherOrderCDM]:
+    """Fit a higher-order G-DINA model by marginal maximum likelihood EM.
+
+    The E-step computes each respondent's posterior over the mastery
+    patterns. The M-step refits every item's reduced G-DINA model to the
+    expected latent-group counts, as :func:`fit_gdina` does, and refits the
+    logistic latent regression of the attributes on a standard normal
+    higher-order trait to the expected pattern counts at each node of an
+    equally spaced grid on [-4, 4] (de la Torre & Douglas, 2004).
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items). Negative values are missing;
+        every item needs at least one observed response.
+    q_matrix : NDArray
+        Q-matrix (n_items, n_attributes).
+    reduced_models : list of str, optional
+        Reduced G-DINA model of each item. Default is 'saturated'.
+    max_iter : int
+        Maximum EM iterations.
+    tol : float
+        Convergence tolerance on the change in marginal log-likelihood.
+    verbose : bool
+        Whether to print progress.
+    hierarchy : AttributeHierarchy, optional
+        Attribute hierarchy restricting the mastery patterns to
+        ``hierarchy.valid_patterns()``.
+    n_quad : int, default=31
+        Number of grid nodes integrating the higher-order trait.
+
+    Returns
+    -------
+    CDMResult
+        Fitted :class:`HigherOrderCDM`, the class probabilities of its
+        ``valid_patterns`` implied by the fitted latent regression,
+        log-likelihood, information criteria and convergence information.
+
+    Notes
+    -----
+    Loadings are kept in [0.1, 5] and intercepts ``-loading * threshold`` in
+    [-10, 10]; an estimate on a bound signals weak identification. With two
+    loadings and thresholds per attribute, the higher-order model needs at
+    least three attributes to be identified; with fewer it has more
+    parameters than the ``2**K - 1`` free class probabilities.
+    """
+    max_iter, tol = _validate_fit_configuration(max_iter, tol, verbose)
+    n_quad = _validate_quadrature_count(n_quad)
+    raw_responses, raw_q_matrix = _validate_fit_inputs(responses, q_matrix)
+    n_persons, n_items = raw_responses.shape
+
+    model = HigherOrderCDM(
+        n_items=n_items,
+        n_attributes=raw_q_matrix.shape[1],
+        q_matrix=raw_q_matrix,
+        hierarchy=hierarchy,
+        reduced_models=reduced_models,
+    )
+    model._n_quad = n_quad
+    response_values = model._validate_responses(raw_responses, require_observed=True)
+
+    item_model = model._base_cdm
+    patterns = model._valid_patterns
+    correct, incorrect, observed = _response_indicators(response_values)
+    group_indices, group_patterns = _gdina_item_design(item_model, patterns)
+    quad_points, quad_weights = _higher_order_quadrature(n_quad)
+
+    prev_ll = -np.inf
+    converged = False
+    n_iterations = max_iter
+
+    for iteration in range(max_iter):
+        # Joint prior mass w_q P(alpha | theta_q) of each node and pattern.
+        joint_prior = quad_weights[:, np.newaxis] * model.pattern_probability(
+            quad_points
+        )
+        class_probs = np.sum(joint_prior, axis=0)
+        log_like_matrix = _pattern_log_likelihood_matrix(
+            correct, incorrect, item_model.probability(patterns)
+        )
+        posterior, current_ll = _class_posterior(log_like_matrix, class_probs)
+
+        if verbose:
+            print(f"Iteration {iteration + 1}: LL = {current_ll:.4f}")
+
+        if iteration > 0 and abs(current_ll - prev_ll) < tol:
+            converged = True
+            n_iterations = iteration
+            break
+
+        _gdina_item_m_step(
+            item_model, posterior, correct, observed, group_indices, group_patterns
+        )
+        # Theta is independent of the responses given alpha, so each
+        # pattern's posterior mass splits across the nodes in proportion to
+        # its joint prior mass.
+        pattern_mass = np.sum(posterior, axis=0)
+        node_share = np.divide(
+            pattern_mass,
+            class_probs,
+            out=np.zeros_like(pattern_mass),
+            where=class_probs > 0.0,
+        )
+        loadings, thresholds = _fit_higher_order_structure(
+            joint_prior * node_share[np.newaxis, :],
+            quad_points,
+            patterns,
+            model._loadings,
+            model._thresholds,
+        )
+        model._loadings = loadings
+        model._thresholds = thresholds
+        prev_ll = current_ll
+    else:
+        # The last M-step followed the last E-step; evaluate its estimates.
+        class_probs = model._default_pattern_prior()
+        _, current_ll = _class_posterior(
+            _pattern_log_likelihood_matrix(
+                correct, incorrect, item_model.probability(patterns)
+            ),
+            class_probs,
+        )
 
     model._sync_parameter_cache()
     model._is_fitted = True
-    return model, class_probs
+    return CDMResult(
+        model=model,
+        class_probabilities=model._default_pattern_prior(),
+        log_likelihood=current_ll,
+        n_parameters=model.n_parameters,
+        n_observations=n_persons,
+        n_iterations=n_iterations,
+        converged=converged,
+    )

@@ -1,4 +1,8 @@
-"""Ordered graded-response thresholds in the itemwise free-parameter layout."""
+"""Ordered graded-response thresholds in the itemwise free-parameter layout.
+
+Graded response items store increasing thresholds; graded bifactor items
+store R's decreasing intercepts, whose negations are the thresholds.
+"""
 
 from __future__ import annotations
 
@@ -35,12 +39,16 @@ class GradedOrder:
         Current threshold values; fixed thresholds keep theirs.
     item : int
         Item index, for error messages.
+    sign : float, default=1.0
+        The thresholds are ``sign`` times the stored coordinates: ``-1`` for
+        the decreasing intercepts of graded bifactor items.
     """
 
     constraint: LinearConstraint
     positions: NDArray[np.intp]
     values: NDArray[np.float64]
     item: int
+    sign: float = 1.0
 
     def satisfied(self, params: NDArray[np.float64]) -> bool:
         """Return whether ``params`` keep the thresholds ordered."""
@@ -67,6 +75,21 @@ class GradedOrder:
             If fixed thresholds or the box leave a run of free thresholds no
             ordered values.
         """
+        if self.sign < 0:
+            # Project the negated intercepts, which are increasing thresholds.
+            flip = np.ones(len(params))
+            flip[self.positions[self.positions >= 0]] = -1.0
+            thresholds = GradedOrder(
+                LinearConstraint(
+                    self.constraint.A * flip, self.constraint.lb, self.constraint.ub
+                ),
+                self.positions,
+                self.values,
+                self.item,
+            )
+            low = np.where(flip > 0, lower, -np.asarray(upper))
+            high = np.where(flip > 0, upper, -np.asarray(lower))
+            return flip * thresholds.project(flip * np.asarray(params), low, high)
         raw = np.asarray(params, dtype=np.float64)
         x = np.clip(raw, lower, upper)
         if self.satisfied(x):
@@ -131,8 +154,9 @@ def graded_order(
     Parameters
     ----------
     model : BaseItemModel
-        Model owning the item; models other than graded response models have
-        no ordering.
+        Model owning the item. Graded response models order their thresholds
+        and graded bifactor models their decreasing intercepts; other models
+        have no ordering.
     item_idx : int
         Item index.
     n_parameters : int
@@ -150,9 +174,14 @@ def graded_order(
     MirtValidationError
         If two adjacent fixed thresholds are out of order.
     """
+    from mirt.models.bifactor import GradedBifactorModel
     from mirt.models.polytomous import GradedResponseModel
 
-    if not isinstance(model, GradedResponseModel):
+    if isinstance(model, GradedResponseModel):
+        stored, orientation = "thresholds", 1.0
+    elif isinstance(model, GradedBifactorModel):
+        stored, orientation = "intercepts", -1.0
+    else:
         return None
     n_thresholds = model.n_categories[item_idx] - 1
     if n_thresholds < 2:
@@ -165,8 +194,9 @@ def graded_order(
         if not model._item_indexed(name):
             continue
         indices = np.flatnonzero(np.asarray(free_masks[name][item_idx]).reshape(-1))
-        if name == "thresholds":
+        if name == stored:
             values = np.asarray(array[item_idx], dtype=np.float64).reshape(-1)
+            values = orientation * values
             values = values[:n_thresholds].copy()
             for column, index in enumerate(indices):
                 if index < n_thresholds:
@@ -186,14 +216,22 @@ def graded_order(
                 fixed_difference += sign * values[index]
         if not np.any(row):
             if fixed_difference < 0:
-                raise MirtValidationError("fixed GRM thresholds must be ordered")
+                raise MirtValidationError(
+                    "fixed GRM thresholds must be ordered"
+                    if orientation > 0
+                    else f"fixed intercepts of graded item {item_idx} must decrease",
+                    parameter=stored,
+                )
             continue
         rows.append(row)
         lower.append(THRESHOLD_GAP - fixed_difference)
     if not rows:
         return None
-    constraint = LinearConstraint(np.asarray(rows), np.asarray(lower), np.inf)
-    return GradedOrder(constraint, positions, values, item_idx)
+    # Rows act on the thresholds, which are orientation times the coordinates.
+    constraint = LinearConstraint(
+        orientation * np.asarray(rows), np.asarray(lower), np.inf
+    )
+    return GradedOrder(constraint, positions, values, item_idx, orientation)
 
 
 def graded_threshold_constraint(

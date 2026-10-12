@@ -1,15 +1,98 @@
 """Bounded likelihood reductions for person-specific Monte Carlo draws."""
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import ndtri
+from scipy.stats import qmc
 
 from mirt._model_defaults import original_model_hook
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtValidationError
 from mirt.models.base import BaseItemModel, DichotomousItemModel, PolytomousItemModel
 
 _MAX_MC_LIKELIHOOD_ELEMENTS = 131_072
+# Scrambled Sobol points (2**12) integrating the prior where EM has no
+# default grid, beyond six factors.
+_PRIOR_QMC_EXPONENT = 12
+
+
+@dataclass(frozen=True)
+class PriorGrid:
+    """Nodes and weights that integrate against a Gaussian ability prior.
+
+    Attributes
+    ----------
+    nodes : ndarray of shape (n_nodes, n_factors)
+        Ability points.
+    weights : ndarray of shape (n_nodes,)
+        Positive prior mass of each node, summing to one.
+    """
+
+    nodes: NDArray[np.float64]
+    weights: NDArray[np.float64]
+
+    @property
+    def n_total_points(self) -> int:
+        """Number of nodes."""
+        return len(self.weights)
+
+
+def prior_grid(
+    prior_mean: NDArray[np.float64],
+    cholesky: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> PriorGrid:
+    """Return EM's default quadrature grid carried onto a Gaussian prior.
+
+    Up to six factors, the standard-normal grid that ``EMEstimator`` uses by
+    default (:func:`~mirt.estimation.quadrature.default_quadpts` points per
+    dimension on the rule of
+    :func:`~mirt.estimation.quadrature.build_quadrature`) is mapped through
+    ``prior_mean + cholesky @ z``, so marginal log-likelihoods on it match
+    EM's at the same parameters. More factors, which have no default grid,
+    use 4,096 scrambled Sobol points with equal mass, scrambled from ``rng``.
+
+    Parameters
+    ----------
+    prior_mean : ndarray of shape (n_factors,)
+        Prior mean.
+    cholesky : ndarray of shape (n_factors, n_factors)
+        Lower Cholesky factor of the prior covariance.
+    rng : numpy.random.Generator
+        Scrambles the quasi-Monte Carlo points; unused up to six factors.
+
+    Returns
+    -------
+    PriorGrid
+        Read-only nodes and weights.
+    """
+    from mirt.estimation.quadrature import build_quadrature, default_quadpts
+
+    n_factors = len(prior_mean)
+    try:
+        n_points = default_quadpts(n_factors)
+    except MirtValidationError:
+        sampler = qmc.Sobol(d=n_factors, scramble=True, seed=rng)
+        uniforms = np.clip(
+            sampler.random_base2(_PRIOR_QMC_EXPONENT),
+            np.nextafter(0.0, 1.0),
+            np.nextafter(1.0, 0.0),
+        )
+        standard = ndtri(uniforms)
+        weights = np.full(len(standard), 1.0 / len(standard))
+    else:
+        quadrature = build_quadrature(n_points, n_factors)
+        standard, weights = quadrature.nodes, quadrature.weights
+    nodes = standard @ cholesky.T
+    nodes += prior_mean
+    nodes.setflags(write=False)
+    weights.setflags(write=False)
+    return PriorGrid(nodes, weights)
+
+
 _DEFAULT_BINARY_LIKELIHOOD = original_model_hook(DichotomousItemModel, "log_likelihood")
 _DEFAULT_BINARY_VALIDATION = original_model_hook(
     DichotomousItemModel, "_validate_dichotomous_responses"

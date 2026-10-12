@@ -1,9 +1,12 @@
 """Tests for item, score, and delta-method confidence intervals."""
 
+import base64
+
 import numpy as np
 import pytest
 from scipy import stats
 
+import mirt
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.exceptions import MirtDataError, MirtEstimationError, MirtValidationError
 from mirt.models.dichotomous import (
@@ -35,7 +38,69 @@ def response_matrix():
     return np.tile(np.array([[1, 1], [1, 0], [0, 1], [0, 0]]), (8, 1))
 
 
+# The responses of mirt.simdata(model="2PL", n_persons=500, n_items=10,
+# seed=11) with the native backend, on which the R references below were
+# computed, as row-major packed bits. Without the native backend, simdata
+# draws other responses for the same seed.
+_PLCI_RESPONSES = (
+    "AvqxveiqkofgLXLQj7yqKp+3KatKwwalBqLAA3mpAA6JBTwCJyjPKQJJJi2bO6vzQYv0k66s"
+    "CQCQIEhDaqiMaWpMhjptEdzDtAIrMASwZEL0gJbMs5bSuvhvSoi37/4Acl18ogALtKOqf9Ag"
+    "Ikhre7WPAoqP671Kdl+VSwJCk77sUiLAkTHzNMiWfL//zScsiPP+8QmhUtJPKYhypvTvu2J6"
+    "MASC59IM74v+n7aMKEDNKCyHH8qqgQliUA2vqxdA9umvPP+//shKjrS966re5CTDApqnL+n6"
+    "3rN8OlKi8ycyAM6YAXtyiKHlCm5IsgGdHsiSQUMivXAIlhrohCOtKqsy7A92ZL28AiqFoAkr"
+    "d03yAunyAiapIGgBgD0IAgCvv9sqJKMsANpf/M16+gZwA8O6SB1/70Krvax6Hp+TfbtY1gyr"
+    "/5LYISwITteCC2LU2ITcOgAGs62qdino+Kpi3Kpp6hTaFvyyRoyhHmpUmpgB+1KgAKmJioCt"
+    "r/8CE7Qh6wJkjywr68lLb98iAKZvivWdMCGK7+fwADYCE7Ai+77H8O7B+kn2PYtvy7XqED6Q"
+    "pAKbdpKupt1SwIFuK37bvWwIQhm2C39K0oSJd2LX0g0TupizIbJgkI34Sbvxs4DIcKvUjFJq"
+    "AqGcSmjMi21oXP+3PfvqwImsqGiPqm//6s6fru5/k6SJ6jLdNWUCYkAODEI6HLHNAW/+sivf"
+    "aozQoIt6WLJAKgIEg+gIzoSTP/4qVIQYz2b+J/k7Mdm0IWNBP//9eCrEBy+/Ut2xzYj83Zet"
+    "CFvAr3nKYDszLIAWAD1pAP7RHrzBQrynrIMKHvYtKg=="
+)
+
+
+@pytest.fixture(scope="module")
+def plci_fit():
+    bits = np.frombuffer(base64.b64decode(_PLCI_RESPONSES), dtype=np.uint8)
+    responses = np.unpackbits(bits)[:5000].reshape(500, 10).astype(np.int_)
+    fit = mirt.fit_mirt(responses, model="2PL", compute_standard_errors=False)
+    return responses, fit
+
+
 class TestParameterIntervals:
+    def test_default_interval_matches_r_profile_likelihood(self, plci_fit):
+        # Regression: the default held the other item parameters at their
+        # estimates, giving (0.839, 1.296) for item 1, about 40% narrower
+        # than R. Reference: R mirt 1.48, PLCI.mirt(mirt(y, 1, "2PL",
+        # TOL = 1e-6), parnum = c(1, 13)) on the same responses.
+        responses, fit = plci_fit
+        for item, expected in ((0, (0.7101, 1.4655)), (3, (0.5221, 1.1246))):
+            interval = PLCI(fit, responses, item)
+
+            assert interval.method == "profile"
+            assert interval.converged
+            assert not interval.used_profile_callback
+            assert interval.log_likelihood == pytest.approx(
+                fit.log_likelihood, abs=1e-2
+            )
+            assert (interval.lower, interval.upper) == pytest.approx(expected, abs=2e-3)
+
+    def test_conditional_interval_holds_other_parameters(self, plci_fit):
+        responses, fit = plci_fit
+        conditional = PLCI(fit, responses, 0, method="conditional")
+
+        assert conditional.method == "conditional"
+        assert (conditional.lower, conditional.upper) == pytest.approx(
+            (0.8389, 1.2964), abs=2e-3
+        )
+
+    def test_profile_rejects_a_fixed_parameter(self, two_pl, response_matrix):
+        model = two_pl.copy().set_free_parameter_masks(
+            {"discrimination": np.array([False, True])}
+        )
+
+        with pytest.raises(MirtValidationError, match="fixed"):
+            PLCI(model, response_matrix, 0, "discrimination")
+
     def test_profile_callback_recovers_known_interval(self, two_pl, response_matrix):
         center = float(two_pl.difficulty[0])
         scale = 0.4
@@ -139,6 +204,15 @@ class TestParameterIntervals:
             ({"param_idx": 0, "n_quadpts": 0}, MirtValidationError),
             (
                 {"param_idx": 0, "profile_log_likelihood": 3.0},
+                MirtValidationError,
+            ),
+            ({"param_idx": 0, "method": "slice"}, MirtValidationError),
+            (
+                {
+                    "param_idx": 0,
+                    "method": "conditional",
+                    "profile_log_likelihood": lambda value: 0.0,
+                },
                 MirtValidationError,
             ),
         ],

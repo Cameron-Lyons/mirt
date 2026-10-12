@@ -235,13 +235,16 @@ def test_invalid_minimum_cell_size_is_rejected(minimum):
         sibtest(data, groups, [4], min_cell_size=minimum)
 
 
-@pytest.mark.parametrize("missing", [-1, np.nan, np.inf])
-def test_missing_matching_or_suspect_responses_fail_clearly(missing):
+@pytest.mark.parametrize(
+    ("missing", "message"),
+    [(-1, "na_rm=True"), (np.nan, "na_rm=True"), (np.inf, "finite")],
+)
+def test_missing_matching_or_suspect_responses_fail_clearly(missing, message):
     data, groups = _cell_responses([[(10, 5)], [(10, 5)]])
     for item in (0, 4):
         incomplete = data.astype(float)
         incomplete[0, item] = missing
-        with pytest.raises(ValueError, match="binary|finite"):
+        with pytest.raises(ValueError, match=message):
             sibtest(incomplete, groups, [4])
 
 
@@ -302,3 +305,308 @@ def test_missing_group_labels_are_rejected(missing):
     incomplete[0] = missing
     with pytest.raises(ValueError, match="missing labels"):
         sibtest(data, incomplete, [4])
+
+
+def _lcg_uniforms(shape, seed):
+    """Platform-independent uniforms from a 31-bit linear congruential generator."""
+    state = seed
+    values = np.empty(int(np.prod(shape)))
+    for index in range(values.size):
+        state = (1103515245 * state + 12345) % 2**31
+        values[index] = state / 2**31
+    return values.reshape(shape)
+
+
+def _graded_groups(n_per_group, shifts, dif, n_items=8, n_categories=3):
+    """Deterministic graded responses with group impact and DIF in item 0.
+
+    The R mirt references below were computed from these exact matrices.
+    """
+    thresholds = np.linspace(-1.2, 1.2, n_items)[:, None] + np.linspace(
+        -0.8, 0.8, n_categories - 1
+    )
+    slopes = np.linspace(0.8, 1.6, n_items)
+    quantiles = stats.norm.ppf((np.arange(n_per_group) + 0.5) / n_per_group)
+    blocks = []
+    for group, shift in enumerate(shifts):
+        offsets = np.zeros(n_items)
+        offsets[0] = dif[group]
+        cumulative = expit(
+            slopes[:, None]
+            * (quantiles[:, None, None] + shift - thresholds - offsets[:, None])
+        )
+        uniforms = _lcg_uniforms((n_per_group, n_items, 1), 7 + group)
+        blocks.append(np.sum(uniforms < cumulative, axis=2))
+    return np.vstack(blocks), np.repeat(np.arange(len(shifts)), n_per_group)
+
+
+# R mirt 1.48 SIBTEST (default Jmin = 5) on _graded_groups data: uniform
+# (beta, SE, X2, p) and crossing (beta, X2, df, p).
+_R_TWO_GROUP = {
+    "polytomous": (
+        [0],
+        None,
+        {},
+        (0.105251336964041, 0.0519593238233166, 4.10325267206551, 0.0428007967675301),
+        (0.105251336964041, 4.10325267206551, 1, 0.0428007967675301),
+    ),
+    "polytomous_crossing": (
+        [3],
+        None,
+        {},
+        (
+            0.00679494792728665,
+            0.0476344205288476,
+            0.0203484106240151,
+            0.886568300853015,
+        ),
+        (0.0212115212203227, 0.240968697114743, 2, 0.886490962099232),
+    ),
+    "polytomous_bundle": (
+        [0, 1],
+        [2, 3, 4, 5, 6, 7],
+        {},
+        (0.15448514242394, 0.074116993021869, 4.34448050177081, 0.0371290928854748),
+        (0.15448514242394, 4.34448050177081, 1, 0.0371290928854748),
+    ),
+    "polytomous_uncorrected": (
+        [0],
+        None,
+        {"correction": False},
+        (0.145982904440789, 0.0519593238233166, 7.89363459600481, 0.00496090735868659),
+        (0.145982904440789, 7.89363459600481, 1, 0.00496090735868655),
+    ),
+}
+
+
+def _assert_matches_r(uniform, crossing, r_uniform, r_crossing):
+    np.testing.assert_allclose(
+        [uniform["beta"], uniform["beta_se"], uniform["chi2"], uniform["p_value"]],
+        r_uniform,
+        rtol=1e-10,
+    )
+    np.testing.assert_allclose(
+        [crossing["beta"], crossing["chi2"], crossing["p_value"]],
+        [r_crossing[0], r_crossing[1], r_crossing[3]],
+        rtol=1e-10,
+    )
+    assert crossing["df"] == r_crossing[2]
+
+
+@pytest.mark.parametrize("case", sorted(_R_TWO_GROUP))
+def test_polytomous_sibtest_matches_r_mirt(case):
+    suspect, matching, options, r_uniform, r_crossing = _R_TWO_GROUP[case]
+    data, groups = _graded_groups(500, (0.0, -0.4), (0.0, 0.5))
+    kwargs = {"convention": "mirt", "min_cell_size": 6, **options}
+    uniform = sibtest(data, groups, suspect, matching, **kwargs)
+    crossing = sibtest(data, groups, suspect, matching, method="crossing", **kwargs)
+    _assert_matches_r(uniform, crossing, r_uniform, r_crossing)
+    items = sibtest_items(data, groups, p_adjust="none", **kwargs)
+    if len(suspect) == 1 and matching is None:
+        assert items["beta"][suspect[0]] == pytest.approx(uniform["beta"], rel=1e-12)
+
+
+def test_mirt_convention_reproduces_r_binary_strata():
+    # R drops scores where a group's suspect response is constant; the
+    # default keeps them, so only the "mirt" convention reproduces R here.
+    data, groups = _graded_groups(
+        300, (0.0, -0.5), (0.0, 0.6), n_items=16, n_categories=2
+    )
+    references = {
+        0: (0.0910102620072115, 0.0396968794497025, 5.25615292613378),
+        15: (0.0433949347199252, 0.0417701053947591, 1.07931182838432),
+    }
+    for item, expected in references.items():
+        result = sibtest(data, groups, [item], convention="mirt", min_cell_size=6)
+        default = sibtest(data, groups, [item], min_cell_size=6)
+        np.testing.assert_allclose(
+            [result["beta"], result["beta_se"], result["chi2"]], expected, rtol=1e-10
+        )
+        assert default["n_strata"] > result["n_strata"]
+        assert default["beta_se"] != pytest.approx(expected[1], rel=1e-3)
+
+
+def test_missing_rows_are_removed_like_r_na_rm():
+    data, groups = _graded_groups(500, (0.0, -0.4), (0.0, 0.5))
+    incomplete = data.astype(float)
+    incomplete[::37, 3] = np.nan
+    incomplete[5::41, 0] = -1
+    complete = ~np.any(np.isnan(incomplete) | (incomplete < 0), axis=1)
+    kwargs = {"convention": "mirt", "min_cell_size": 6, "na_rm": True}
+    # R: SIBTEST(dat, group, suspect_set = 1 or 6, na.rm = TRUE).
+    references = {
+        0: (
+            (
+                0.100646186842685,
+                0.0533519316632745,
+                3.55872438976568,
+                0.0592332414947274,
+            ),
+            (0.100646186842685, 3.55872438976568, 1, 0.0592332414947274),
+        ),
+        5: (
+            (
+                -0.030291326026365,
+                0.0456824259841231,
+                0.439681560249509,
+                0.507276192710322,
+            ),
+            (0.0601706155078411, 1.77741886034685, 2, 0.411186074811173),
+        ),
+    }
+    for item, (r_uniform, r_crossing) in references.items():
+        uniform = sibtest(incomplete, groups, [item], **kwargs)
+        crossing = sibtest(incomplete, groups, [item], method="crossing", **kwargs)
+        _assert_matches_r(uniform, crossing, r_uniform, r_crossing)
+        dropped = sibtest(
+            data[complete], groups[complete], [item], **{**kwargs, "na_rm": False}
+        )
+        assert uniform["beta"] == dropped["beta"]
+    with pytest.raises(ValueError, match="na_rm=True"):
+        sibtest(incomplete, groups, [0])
+    with pytest.raises(ValueError, match="na_rm=True"):
+        sibtest_items(incomplete, groups)
+
+
+# R mirt 1.48 GSIBTEST with the default contrasts cbind(1, -diag(2)):
+# uniform (beta_1, beta_2, X2, p) and crossing (beta_1, beta_2, X2).
+_R_THREE_GROUP = {
+    0: (
+        (
+            -0.0247615683288925,
+            0.246193154313565,
+            25.1684627739829,
+            3.42560867405695e-06,
+        ),
+        (0.037830728689929, 0.246193154313565, 20.3444299550076),
+    ),
+    2: (
+        (
+            -0.00261889005908144,
+            -0.0873217943586553,
+            3.13144722272773,
+            0.208936769438345,
+        ),
+        (0.0315426890196253, 0.0873217943586553, 4.65851707366628),
+    ),
+    6: (
+        (-0.0335186028637701, -0.0599616820450589, 1.61167032301687, 0.446714691809551),
+        (0.0299891224186357, 0.059961682045059, 1.58637487425455),
+    ),
+}
+
+
+def test_multigroup_gsibtest_matches_r_mirt():
+    data, groups = _graded_groups(400, (0.0, 0.3, -0.3), (0.0, 0.0, 0.5))
+    kwargs = {"convention": "mirt", "min_cell_size": 6}
+    items = sibtest_items(data, groups, p_adjust="none", **kwargs)
+    for item, (r_uniform, r_crossing) in _R_THREE_GROUP.items():
+        uniform = sibtest(data, groups, [item], **kwargs)
+        crossing = sibtest(data, groups, [item], method="crossing", **kwargs)
+        np.testing.assert_allclose(
+            [*uniform["beta"], uniform["chi2"], uniform["p_value"]],
+            r_uniform,
+            rtol=1e-10,
+        )
+        np.testing.assert_allclose(
+            [*crossing["beta"], crossing["chi2"]], r_crossing, rtol=1e-10
+        )
+        assert uniform["df"] == 2
+        # R has no asymptotic multi-group crossing p-value either.
+        assert crossing["df"] == 0
+        assert np.isnan(crossing["p_value"])
+        np.testing.assert_allclose(items["beta"][item], uniform["beta"], rtol=1e-12)
+        assert items["p_value"][item] == pytest.approx(uniform["p_value"], rel=1e-12)
+    np.testing.assert_array_equal(uniform["group_labels"], [0, 1, 2])
+    np.testing.assert_array_equal(uniform["contrasts"], [[1, -1, 0], [1, 0, -1]])
+    np.testing.assert_allclose(
+        uniform["beta_se"], np.sqrt(np.diag(uniform["beta_covariance"]))
+    )
+
+    custom = sibtest(data, groups, [0], contrasts=[[0, 1, -1]], **kwargs)
+    # R: SIBTEST(dat, group, suspect_set = 1, C = matrix(c(0, 1, -1), 1)).
+    np.testing.assert_allclose(
+        [custom["beta"][0], custom["chi2"], custom["p_value"]],
+        [0.277125841112566, 20.8083213743503, 5.07619270906368e-06],
+        rtol=1e-10,
+    )
+
+
+def test_pairwise_tests_match_r_mirt():
+    data, groups = _graded_groups(400, (0.0, 0.3, -0.3), (0.0, 0.0, 0.5))
+    kwargs = {"convention": "mirt", "min_cell_size": 6}
+    result = sibtest(data, groups, [0], pairwise=True, **kwargs)
+    # R: SIBTEST(dat, group, suspect_set = 1, pairwise = TRUE).
+    assert result["pairs"] == [(0, 1), (0, 2), (1, 2)]
+    np.testing.assert_allclose(
+        result["beta"],
+        [-0.00332791411963066, 0.215837237759652, 0.279022215965407],
+        rtol=1e-10,
+    )
+    np.testing.assert_allclose(
+        result["beta_se"],
+        [0.0555980719525868, 0.0577180184569806, 0.0606320509358821],
+        rtol=1e-10,
+    )
+    for index, (reference, focal) in enumerate(result["pairs"]):
+        mask = np.isin(groups, [reference, focal])
+        two_group = sibtest(data[mask], groups[mask], [0], focal_group=focal, **kwargs)
+        assert result["p_value"][index] == two_group["p_value"]
+
+    items = sibtest_items(data, groups, pairwise=True, p_adjust="holm", **kwargs)
+    assert items["beta"].shape == items["p_value_adjusted"].shape == (8, 3)
+    for index, (reference, focal) in enumerate(items["pairs"]):
+        mask = np.isin(groups, [reference, focal])
+        two_group = sibtest_items(
+            data[mask], groups[mask], p_adjust="holm", focal_group=focal, **kwargs
+        )
+        np.testing.assert_array_equal(
+            items["p_value_adjusted"][:, index], two_group["p_value_adjusted"]
+        )
+
+
+def test_multigroup_uncorrected_contrasts_have_analytical_values():
+    cells = [
+        [(20, 10), (30, 21)],
+        [(25, 5), (25, 10)],
+        [(40, 12), (10, 2)],
+    ]
+    data, groups = _cell_responses(cells)
+    result = sibtest(data, groups, [4], correction=False)
+    counts = np.array([[count for count, _ in group] for group in cells])
+    means = np.array([[s / c for c, s in group] for group in cells])
+    variances = np.array([[_mean_variance(c, s) for c, s in group] for group in cells])
+    weights = counts.sum(axis=0) / counts.sum()
+    contrasts = np.array([[1.0, -1.0, 0.0], [1.0, 0.0, -1.0]])
+    beta = contrasts @ means @ weights
+    covariance = contrasts @ np.diag(variances @ weights**2) @ contrasts.T
+
+    np.testing.assert_allclose(result["beta"], beta)
+    np.testing.assert_allclose(result["beta_covariance"], covariance)
+    assert result["chi2"] == pytest.approx(beta @ np.linalg.solve(covariance, beta))
+    assert result["df"] == 2
+    assert result["p_value"] == pytest.approx(
+        stats.chi2.sf(result["chi2"], 2), rel=1e-12
+    )
+
+
+def test_crossing_permutation_p_value_matches_r_within_monte_carlo_error():
+    data, groups = _graded_groups(500, (0.0, -0.4), (0.0, 0.5))
+    kwargs = {"convention": "mirt", "min_cell_size": 6, "method": "crossing"}
+    asymptotic = sibtest(data, groups, [3], **kwargs)
+    permuted = sibtest(data, groups, [3], n_permutations=2000, random_state=0, **kwargs)
+    # R: set.seed(1); SIBTEST(..., suspect_set = 4, randomize = TRUE,
+    # permute = 10000) gives p = 0.8584.
+    assert permuted["p_value"] == pytest.approx(0.8584, abs=0.04)
+    assert permuted["beta"] == asymptotic["beta"]
+    assert permuted["beta_se"] == asymptotic["beta_se"]
+    assert np.isnan(permuted["chi2"])
+    assert permuted["df"] == 0
+    repeated = sibtest(data, groups, [3], n_permutations=2000, random_state=0, **kwargs)
+    assert repeated["p_value"] == permuted["p_value"]
+
+    data, groups = _graded_groups(400, (0.0, 0.3, -0.3), (0.0, 0.0, 0.5))
+    permuted = sibtest(data, groups, [2], n_permutations=2000, random_state=0, **kwargs)
+    # R with permute = 20000 gives 0.344 to 0.354 over seeds.
+    assert permuted["p_value"] == pytest.approx(0.35, abs=0.04)
+    assert permuted["chi2"] == pytest.approx(_R_THREE_GROUP[2][1][2], rel=1e-10)

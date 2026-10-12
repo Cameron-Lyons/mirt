@@ -145,13 +145,11 @@ def test_empirical_reliability_supports_polytomous_information():
     theta = np.linspace(-2.0, 2.0, 21)
     observed_variance = np.var(theta, ddof=1)
     error_variance = np.mean(1.0 / information_utils.testinfo(model, theta))
-    expected = np.clip(
-        observed_variance / (observed_variance + error_variance),
-        0.0,
-        1.0,
-    )
+    # Information-based errors belong to ML estimates (R's T_as_X = TRUE).
+    expected = np.clip(1.0 - error_variance / observed_variance, 0.0, 1.0)
 
-    assert empirical_rxx(model, theta) == pytest.approx(expected)
+    with pytest.warns(UserWarning, match="assumes ML or WLE"):
+        assert empirical_rxx(model, theta) == pytest.approx(expected)
     assert empirical_rxx(model, theta, method="information") == pytest.approx(expected)
 
 

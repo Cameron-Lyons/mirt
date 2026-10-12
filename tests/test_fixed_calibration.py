@@ -1,10 +1,11 @@
 import numpy as np
 import pytest
+from scipy.special import expit
 
+from mirt.estimation.quadrature import build_quadrature
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models import TwoParameterLogistic
-from mirt.utils import calibration as calibration_module
-from mirt.utils import fixed_calib
+from mirt.utils.calibration import fixed_calib, fixed_item_calibration
 
 
 @pytest.fixture
@@ -26,9 +27,9 @@ def calibration_data():
 
 def _expected_final_state(responses, anchor_model, result, n_quadpts):
     normalized = np.where(np.isnan(responses) | (responses < 0), -1, responses)
-    theta_grid = np.linspace(-4.0, 4.0, n_quadpts)
-    log_weights = -0.5 * theta_grid**2
-    log_weights -= np.log(np.exp(log_weights).sum())
+    quadrature = build_quadrature(n_quadpts, 1)
+    theta_grid = quadrature.nodes[:, 0]
+    log_weights = np.log(quadrature.weights)
 
     discrimination = np.concatenate(
         [anchor_model.discrimination, result.new_discrimination]
@@ -47,86 +48,96 @@ def _expected_final_state(responses, anchor_model, result, n_quadpts):
     return posterior @ theta_grid, log_likelihood
 
 
-def _scalar_m_step_reference(
-    responses,
-    posterior,
-    theta_grid,
-    discrimination,
-    difficulty,
-    disc_bounds,
-    diff_bounds,
-    prob_clamp,
-    min_count,
-    min_valid_points,
-):
-    valid = (responses >= 0).astype(float)
-    correct = (responses == 1).astype(float)
-    counts = valid.T @ posterior
-    correct_counts = correct.T @ posterior
-    updated_disc = discrimination.copy()
-    updated_diff = difficulty.copy()
-    for item_index, item_counts in enumerate(counts):
-        valid_points = item_counts > min_count
-        if np.count_nonzero(valid_points) < min_valid_points:
-            continue
-        proportions = correct_counts[item_index] / np.maximum(
-            item_counts, calibration_module.PROB_EPSILON
-        )
-        proportions = np.clip(proportions, *prob_clamp)
-        logits = np.log(proportions / (1.0 - proportions))
-        theta = theta_grid[valid_points]
-        item_logits = logits[valid_points]
-        item_weights = item_counts[valid_points]
-        mean_theta = np.average(theta, weights=item_weights)
-        mean_logit = np.average(item_logits, weights=item_weights)
-        centered_theta = theta - mean_theta
-        variance = np.average(centered_theta**2, weights=item_weights)
-        if variance <= calibration_module.PROB_EPSILON:
-            continue
-        covariance = np.average(
-            centered_theta * (item_logits - mean_logit), weights=item_weights
-        )
-        updated_disc[item_index] = np.clip(covariance / variance, *disc_bounds)
-        updated_diff[item_index] = np.clip(
-            mean_theta - mean_logit / updated_disc[item_index], *diff_bounds
-        )
-    return updated_disc, updated_diff
-
-
-@pytest.mark.parametrize("min_count", [0.0, 1.0, 4.0])
-def test_vectorized_m_step_matches_scalar_reference(min_count):
-    rng = np.random.default_rng(20260828)
-    responses = rng.integers(-1, 2, size=(80, 12), dtype=np.int32)
-    responses[:, 0] = -1
-    responses[1:, 1] = -1
-    posterior = rng.random((80, 17))
-    posterior /= posterior.sum(axis=1, keepdims=True)
-    theta_grid = np.linspace(-4.0, 4.0, 17)
-    discrimination = rng.uniform(0.5, 2.0, size=12)
-    difficulty = rng.uniform(-1.0, 1.0, size=12)
-    controls = ((0.2, 5.0), (-5.0, 5.0), (0.01, 0.99), min_count, 3)
-
-    expected = _scalar_m_step_reference(
-        responses,
-        posterior,
-        theta_grid,
-        discrimination,
-        difficulty,
-        *controls,
+@pytest.fixture(scope="module")
+def extreme_item_data():
+    """Twenty 2PL items, including new items with difficulties near -2.8."""
+    rng = np.random.default_rng(3)
+    discrimination = rng.lognormal(0.2, 0.3, 20)
+    difficulty = rng.normal(0.0, 1.0, 20)
+    theta = rng.standard_normal(3000)
+    probability = expit(discrimination * (theta[:, None] - difficulty))
+    responses = (rng.random(probability.shape) < probability).astype(float)
+    anchor_model = TwoParameterLogistic(n_items=10).set_parameters(
+        discrimination=discrimination[:10], difficulty=difficulty[:10]
     )
-    actual = calibration_module._fixed_calib_m_step(
+    return responses, anchor_model
+
+
+def test_new_items_match_r_mirt_fixed_population_mml(extreme_item_data):
+    responses, anchor_model = extreme_item_data
+
+    result = fixed_calib(responses, anchor_model, list(range(10)))
+
+    # R mirt 1.48: mirt(y, 1, "2PL", pars = sv, quadpts = 21, TOL = 1e-8) with
+    # the anchors and the N(0, 1) group parameters fixed, which is the
+    # estimator of fixedCalib(PAU = "NWU"). The former regression M-step put
+    # item 17 (true a = 1.41, b = -2.83) at a = 0.87, b = -4.40.
+    r_discrimination = [
+        1.18336, 1.06312, 1.15372, 1.01077, 0.86023,
+        1.02555, 1.38065, 1.17776, 1.59047, 1.02641,
+    ]  # fmt: skip
+    r_difficulty = [
+        -1.00472, -0.30814, 0.83909, 0.59071, 0.10612,
+        0.70319, -2.83582, 0.95155, -0.95027, -1.86618,
+    ]  # fmt: skip
+    np.testing.assert_allclose(result.new_discrimination, r_discrimination, atol=1e-3)
+    np.testing.assert_allclose(result.new_difficulty, r_difficulty, atol=1e-3)
+    assert result.converged
+    # R reports logLik -32592.3514 on the same 21-point grid.
+    assert result.log_likelihood == pytest.approx(-32592.3514, abs=1e-3)
+
+
+def test_fixed_calib_is_fixed_population_item_calibration(calibration_data):
+    responses, anchor_model = calibration_data
+
+    result = fixed_calib(responses, anchor_model, [0, 1], tol=1e-6)
+    reference = fixed_item_calibration(
         responses,
-        posterior,
-        theta_grid,
-        discrimination,
-        difficulty,
-        *controls,
+        TwoParameterLogistic(n_items=4),
+        [0, 1],
+        anchor_model,
+        estimate_mean=False,
+        estimate_cov=False,
+        tol=1e-6,
+        compute_standard_errors=False,
     )
 
-    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-13, atol=1e-13)
-    np.testing.assert_allclose(actual[1], expected[1], rtol=1e-13, atol=1e-13)
-    assert actual[0][0] == discrimination[0]
-    assert actual[1][0] == difficulty[0]
+    parameters = reference.new_item_parameters
+    np.testing.assert_allclose(
+        result.new_discrimination, parameters["discrimination"], rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        result.new_difficulty, parameters["difficulty"], rtol=1e-12
+    )
+    assert result.log_likelihood == pytest.approx(
+        reference.fit_result.log_likelihood, rel=1e-12
+    )
+    assert result.n_iterations == reference.fit_result.n_iterations
+
+
+def test_new_item_subset_ignores_other_columns(calibration_data):
+    responses, anchor_model = calibration_data
+
+    subset = fixed_calib(responses, anchor_model, [0, 1], new_items=[3])
+    reduced = fixed_calib(responses[:, [0, 1, 3]], anchor_model, [0, 1])
+
+    np.testing.assert_array_equal(subset.new_discrimination, reduced.new_discrimination)
+    np.testing.assert_array_equal(subset.new_difficulty, reduced.new_difficulty)
+    np.testing.assert_array_equal(subset.theta, reduced.theta)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"prob_clamp": (0.01, 0.99)}, {"min_count": 1.0}, {"min_valid_points": 3}],
+)
+def test_regression_controls_are_deprecated_and_ignored(calibration_data, kwargs):
+    responses, anchor_model = calibration_data
+    expected = fixed_calib(responses, anchor_model, [0, 1])
+
+    with pytest.warns(DeprecationWarning, match="deprecated and ignored"):
+        result = fixed_calib(responses, anchor_model, [0, 1], **kwargs)
+
+    np.testing.assert_array_equal(result.new_difficulty, expected.new_difficulty)
 
 
 def test_negative_and_nan_missing_codes_are_equivalent(calibration_data):
@@ -141,7 +152,6 @@ def test_negative_and_nan_missing_codes_are_equivalent(calibration_data):
         anchor_model,
         anchor_items=[0, 1],
         new_items=[2, 3],
-        use_rust=False,
         max_iter=8,
     )
     nan_result = fixed_calib(
@@ -149,7 +159,6 @@ def test_negative_and_nan_missing_codes_are_equivalent(calibration_data):
         anchor_model,
         anchor_items=[0, 1],
         new_items=[2, 3],
-        use_rust=False,
         max_iter=8,
     )
 
@@ -163,26 +172,22 @@ def test_negative_and_nan_missing_codes_are_equivalent(calibration_data):
     assert negative_result.log_likelihood == pytest.approx(nan_result.log_likelihood)
 
 
-@pytest.mark.parametrize("use_rust", [False, True])
+@pytest.mark.parametrize("n_quadpts", [7, 15])
 def test_returned_scores_and_likelihood_use_final_parameters(
-    calibration_data, use_rust
+    calibration_data, n_quadpts
 ):
-    if use_rust and not calibration_module.RUST_AVAILABLE:
-        pytest.skip("native backend is not installed")
-
     responses, anchor_model = calibration_data
     result = fixed_calib(
         responses,
         anchor_model,
         anchor_items=[0, 1],
         new_items=[2, 3],
-        n_quadpts=15,
+        n_quadpts=n_quadpts,
         max_iter=1,
         tol=1e-12,
-        use_rust=use_rust,
     )
     expected_theta, expected_log_likelihood = _expected_final_state(
-        responses, anchor_model, result, n_quadpts=15
+        responses, anchor_model, result, n_quadpts=n_quadpts
     )
 
     np.testing.assert_allclose(result.theta, expected_theta, rtol=1e-10, atol=1e-10)
@@ -192,44 +197,20 @@ def test_returned_scores_and_likelihood_use_final_parameters(
     assert result.n_iterations == 1
 
 
-def test_native_and_python_results_match(calibration_data):
-    if not calibration_module.RUST_AVAILABLE:
-        pytest.skip("native backend is not installed")
-
+def test_use_rust_does_not_change_the_estimator(calibration_data):
     responses, anchor_model = calibration_data
     python_result = fixed_calib(
-        responses,
-        anchor_model,
-        anchor_items=[0, 1],
-        use_rust=False,
-        max_iter=10,
+        responses, anchor_model, anchor_items=[0, 1], use_rust=False
     )
-    native_result = fixed_calib(
-        responses,
-        anchor_model,
-        anchor_items=[0, 1],
-        use_rust=True,
-        max_iter=10,
-    )
+    native_result = fixed_calib(responses, anchor_model, anchor_items=[0, 1])
 
-    np.testing.assert_allclose(
-        native_result.new_discrimination,
-        python_result.new_discrimination,
-        rtol=1e-10,
-        atol=1e-10,
+    np.testing.assert_array_equal(
+        native_result.new_discrimination, python_result.new_discrimination
     )
-    np.testing.assert_allclose(
-        native_result.new_difficulty,
-        python_result.new_difficulty,
-        rtol=1e-10,
-        atol=1e-10,
+    np.testing.assert_array_equal(
+        native_result.new_difficulty, python_result.new_difficulty
     )
-    np.testing.assert_allclose(
-        native_result.theta, python_result.theta, rtol=1e-10, atol=1e-10
-    )
-    assert native_result.log_likelihood == pytest.approx(
-        python_result.log_likelihood, rel=1e-10, abs=1e-10
-    )
+    np.testing.assert_array_equal(native_result.theta, python_result.theta)
 
 
 def test_extreme_anchor_likelihood_remains_finite():
@@ -246,13 +227,12 @@ def test_extreme_anchor_likelihood_remains_finite():
         new_items=[10],
         n_quadpts=5,
         max_iter=1,
-        min_count=0,
-        min_valid_points=2,
-        use_rust=False,
     )
 
     assert np.isfinite(result.log_likelihood)
     assert np.all(np.isfinite(result.theta))
+    # Every person answers correctly, so the estimate is clipped to the bound.
+    np.testing.assert_array_equal(result.new_difficulty, [-5.0])
 
 
 @pytest.mark.parametrize(
@@ -268,7 +248,7 @@ def test_invalid_responses_raise_data_error(responses, message):
     anchor_model = TwoParameterLogistic(n_items=1)
 
     with pytest.raises(MirtDataError, match=message):
-        fixed_calib(responses, anchor_model, [0], [1], use_rust=False)
+        fixed_calib(responses, anchor_model, [0], [1])
 
 
 @pytest.mark.parametrize(
@@ -276,12 +256,12 @@ def test_invalid_responses_raise_data_error(responses, message):
     [
         ({"model_type": "3PL"}, "only the 2PL"),
         ({"max_iter": 0}, "max_iter"),
-        ({"n_quadpts": 1}, "n_quadpts"),
+        ({"n_quadpts": 4}, "n_quadpts"),
         ({"tol": 0}, "tol"),
         ({"tol": "fast"}, "finite number"),
         ({"disc_bounds": (0, 2)}, "strictly positive"),
-        ({"prob_clamp": (0, 0.9)}, "strictly between"),
-        ({"min_valid_points": 22}, "must not exceed"),
+        ({"init_disc": 6.0}, "within disc_bounds"),
+        ({"use_rust": "yes"}, "use_rust"),
     ],
 )
 def test_invalid_controls_raise_validation_error(calibration_data, kwargs, message):
@@ -293,7 +273,6 @@ def test_invalid_controls_raise_validation_error(calibration_data, kwargs, messa
             anchor_model,
             [0, 1],
             [2, 3],
-            use_rust=False,
             **kwargs,
         )
 
@@ -318,7 +297,6 @@ def test_invalid_item_sets_raise_validation_error(
             anchor_model,
             anchor_items,
             new_items,
-            use_rust=False,
         )
 
 
@@ -332,5 +310,4 @@ def test_anchor_model_size_must_match_anchor_items(calibration_data):
             anchor_model,
             anchor_items=[0, 1],
             new_items=[2, 3],
-            use_rust=False,
         )

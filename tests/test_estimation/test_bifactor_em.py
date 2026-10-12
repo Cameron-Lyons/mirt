@@ -20,7 +20,7 @@ from mirt.estimation.em import EMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.standard_errors import _flatten_parameters, _posterior_from_model
 from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
-from mirt.models.bifactor import BifactorModel
+from mirt.models.bifactor import BifactorModel, GradedBifactorModel
 from mirt.models.multidimensional import MultidimensionalModel
 
 
@@ -505,15 +505,18 @@ def test_em_warns_before_building_a_large_product_grid(monkeypatch) -> None:
     def stop(*args, **kwargs):
         raise Stop
 
-    monkeypatch.setattr(em_module, "GaussHermiteQuadrature", stop)
+    monkeypatch.setattr(em_module, "build_quadrature", stop)
     responses = np.zeros((4, 8), dtype=int)
 
     with pytest.warns(RuntimeWarning, match=r"4,084,101 nodes.*mirt\.bfactor"):
         with pytest.raises(Stop):
-            EMEstimator().fit(BifactorModel(8, np.arange(8) % 4), responses)
+            EMEstimator(n_quadpts=21).fit(BifactorModel(8, np.arange(8) % 4), responses)
     with pytest.warns(RuntimeWarning, match=r"1,048,576 nodes.*reduce n_quadpts"):
         with pytest.raises(Stop):
             EMEstimator(n_quadpts=16).fit(MultidimensionalModel(8, 5), responses)
+    graded = GradedBifactorModel(8, np.arange(8) % 4, n_categories=3)
+    with pytest.warns(RuntimeWarning, match=r"4,084,101 nodes.*mirt\.bfactor"):
+        em_module._warn_large_grid(graded, 21, 4)
     # 21 ** 15 wraps to a negative value in 64-bit NumPy integer arithmetic.
     with pytest.warns(RuntimeWarning, match=r"68,122,318,582,951,682,301 nodes"):
         with pytest.raises(Stop):
@@ -524,3 +527,76 @@ def test_em_warns_before_building_a_large_product_grid(monkeypatch) -> None:
         warnings.simplefilter("error")
         with pytest.raises(Stop):
             EMEstimator().fit(BifactorModel(8, np.arange(8) % 3), responses)
+
+
+def _testlet_responses(seed, n_persons, membership):
+    from mirt.models.testlet import TestletModel
+
+    rng = np.random.default_rng(seed)
+    n_items = len(membership)
+    model = TestletModel(n_items, membership)
+    model.set_parameters(
+        discrimination=rng.uniform(0.8, 1.6, n_items),
+        testlet_loadings=np.where(np.asarray(membership) >= 0, 0.9, 0.0),
+        difficulty=rng.normal(0.0, 0.8, n_items),
+    )
+    probability = model.probability(rng.standard_normal((n_persons, model.n_factors)))
+    return (rng.random(probability.shape) < probability).astype(int)
+
+
+@pytest.mark.parametrize("kind", ["loadings", "common", "variances"])
+def test_testlet_errors_match_the_product_grid_information(kind) -> None:
+    from mirt.models.testlet import (
+        BifactorTestletModel,
+        RandomTestletEffectsModel,
+        TestletModel,
+    )
+
+    membership = [0, 0, 0, 1, 1, 1, -1]
+    # Both testlet variances lie well inside their box for this sample.
+    responses = _testlet_responses(1, 500, membership)
+
+    def build():
+        if kind == "loadings":
+            return TestletModel(7, membership)
+        if kind == "common":
+            return BifactorTestletModel(7, membership, constrain_testlet_loadings=True)
+        model = RandomTestletEffectsModel(7, membership)
+        model.set_parameters(testlet_loadings=np.r_[np.ones(6), 0.0])
+        model.set_free_parameter_masks({"testlet_loadings": np.zeros(7, dtype=bool)})
+        return model
+
+    reduced = BifactorEMEstimator(n_quadpts=7, tol=1e-8, max_iter=2000).fit(
+        build(), responses
+    )
+    model = build().set_parameters(**reduced.model.parameters)
+    # SQUAREM keeps EM on the product grid, whose errors difference the
+    # marginal likelihood of the same Gauss-Hermite rule.
+    product = EMEstimator(
+        n_quadpts=7,
+        max_iter=1,
+        quadrature="gauss-hermite",
+        accelerate="squarem",
+        se_method="oakes",
+    ).fit(model, responses, start="model")
+
+    assert reduced.se_method == product.se_method == "oakes"
+    np.testing.assert_allclose(
+        reduced.log_likelihood, product.log_likelihood, rtol=0, atol=1e-4
+    )
+    for name, errors in reduced.standard_errors.items():
+        np.testing.assert_allclose(
+            errors, product.standard_errors[name], rtol=1e-3, atol=1e-5
+        )
+    np.testing.assert_allclose(reduced.vcov, product.vcov, rtol=2e-3, atol=1e-5)
+
+
+def test_bifactor_estimator_refuses_customized_testlet_models() -> None:
+    from mirt.models.testlet import TestletModel
+
+    model = TestletModel(4, [0, 0, 1, 1])
+    model.probability = lambda theta, item_idx=None: TestletModel.probability(
+        model, theta, item_idx
+    )
+    with pytest.raises(MirtModelError, match="built-in BifactorModel or testlet"):
+        BifactorEMEstimator().fit(model, np.zeros((5, 4), dtype=int))

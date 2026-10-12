@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import pytest
 
@@ -10,7 +12,11 @@ import mirt.estimation._louis_information as louis
 from mirt.estimation.base import _parameter_bounds
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.latent_density import GaussianDensity
-from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.quadrature import (
+    GaussHermiteQuadrature,
+    build_quadrature,
+    default_quadpts,
+)
 from mirt.estimation.se_methods import compute_se
 from mirt.estimation.standard_errors import (
     _finite_difference_information,
@@ -28,6 +34,7 @@ from mirt.estimation.standard_errors import (
 from mirt.exceptions import MirtValidationError
 from mirt.models.base import PolytomousItemModel
 from mirt.models.bifactor import BifactorModel
+from mirt.models.custom import CustomItemModel, create_item_type
 from mirt.models.dichotomous import (
     ComplementaryLogLog,
     FourParameterLogistic,
@@ -178,10 +185,24 @@ CURVE_PRODUCT_TYPES = [
 ]
 
 
+def _guessing_curve(theta, a, b, c):
+    return c + (1.0 - c) / (1.0 + np.exp(-a * (theta - b)))
+
+
+GUESSING_TYPE = create_item_type(
+    "guessing",
+    _guessing_curve,
+    par_bounds={"a": (0.1, 5.0), "b": (-6.0, 6.0), "c": (0.0, 0.5)},
+    par_defaults={"a": 1.0, "b": 0.0, "c": 0.2},
+)
+
+
 def _curve_product_model(factory, rng):
     """Return a built-in model with interior, item-specific parameters."""
     if factory is BifactorModel:
         model = factory(4, specific_factors=[0, 0, 1, 1])
+    elif factory is CustomItemModel:
+        model = factory(4, GUESSING_TYPE)
     elif issubclass(factory, PolytomousItemModel):
         model = factory(4, n_categories=3)
     else:
@@ -431,7 +452,7 @@ def test_coordinates_on_bounds_are_held_fixed():
     rng = np.random.default_rng(3)
     model = _binary_model(TwoParameterLogistic, rng)
     discrimination = model.parameters["discrimination"]
-    discrimination[1] = _parameter_bounds(model, "discrimination")[1]
+    discrimination[1] = _parameter_bounds(model, "discrimination")[0]
     model.set_parameters(discrimination=discrimination)
     responses = _responses(model, rng, 2000)
     quadrature = GaussHermiteQuadrature(15)
@@ -481,7 +502,7 @@ def test_compute_se_matches_the_fitted_matrix_errors_at_bounds(method):
     guessing = result.model.parameters["guessing"]
     low = _parameter_bounds(result.model, "guessing")[0]
     assert np.any(np.abs(guessing - low) <= 1e-6)
-    quadrature = GaussHermiteQuadrature(21)
+    quadrature = build_quadrature(default_quadpts(1), 1)
     posterior = _posterior_from_model(result.model, data, quadrature)
 
     errors = compute_se(result.model, data, quadrature, posterior, method=method)
@@ -494,7 +515,7 @@ def test_compute_se_matches_mixed_format_fits_at_bounds():
     data = _guessing_at_bound_data(seed=2)
     result = mirt.fit_mirt(data, model=["3PL"] * 4 + ["2PL"] * 4, se_method="oakes")
     assert np.any(np.isnan(result.standard_errors["3PL.guessing"]))
-    quadrature = GaussHermiteQuadrature(21)
+    quadrature = build_quadrature(default_quadpts(1), 1)
     posterior = _posterior_from_model(result.model, data, quadrature)
 
     errors = compute_se(result.model, data, quadrature, posterior, method="oakes")
@@ -577,14 +598,31 @@ def test_em_default_reports_observed_information_and_covariance(name, use_rust):
         use_rust=use_rust,
         tol=1e-7,
     )
-    quadrature = GaussHermiteQuadrature(21)
+    quadrature = build_quadrature(default_quadpts(1), 1)
     posterior = _posterior_from_model(result.model, responses, quadrature)
     expected = compute_oakes_se(result.model, responses, posterior, quadrature)
+    if name == "PCM":
+        # The common slope is one parameter: J' I J for the tying matrix J.
+        from mirt.estimation._shared_step import resolve_equality_constraints
+        from mirt.estimation.base import _with_family_ties
+
+        tied = resolve_equality_constraints(
+            _with_family_ties((), result.model), result.model
+        )
+        expected = estimate_covariance(
+            result.model, responses, quadrature, quadrature.weights, "oakes", tied=tied
+        ).standard_errors
 
     assert result.se_method == "oakes"
     assert result.vcov is not None
-    assert result.vcov.shape == (result.model.n_parameters,) * 2
-    assert len(result.vcov_labels) == result.model.n_parameters
+    # One row per free coordinate; the common slope of a PCM fills one per
+    # item but counts once in n_parameters.
+    n_free = sum(
+        int(np.count_nonzero(mask))
+        for mask in result.model.free_parameter_masks.values()
+    )
+    assert result.vcov.shape == (n_free,) * 2
+    assert len(result.vcov_labels) == n_free
     for parameter, values in expected.items():
         np.testing.assert_allclose(result.standard_errors[parameter], values, rtol=1e-6)
     np.testing.assert_allclose(
@@ -628,26 +666,149 @@ def test_em_uses_the_fitted_latent_prior_mass():
         np.testing.assert_allclose(result.standard_errors[name], values, rtol=1e-9)
 
 
-def test_complete_data_and_unsupported_models_keep_labelled_complete_data():
-    rng = np.random.default_rng(19)
-    model, _ = _model_and_data("NRM", rng)
-    responses = _fit_data(model, rng, 300)
-    nominal = mirt.fit_mirt(
-        responses, model="NRM", n_categories=CATEGORIES, max_iter=60
+def _auto_case(name):
+    """Return fit_mirt data and options for an ``se_method="auto"`` case."""
+    graded = mirt.simdata(
+        model="GRM", n_persons=400, n_items=6, n_categories=3, n_factors=2, seed=3
     )
-    assert nominal.se_method == "complete_data"
-    assert nominal.vcov is None
-    explicit = mirt.fit_mirt(
-        responses,
-        model="NRM",
-        n_categories=CATEGORIES,
-        max_iter=60,
-        se_method="oakes",
+    binary = mirt.simdata(model="2PL", n_persons=400, n_items=6, n_factors=2, seed=3)
+    spec = "F1 = 1-3\nF2 = 4-6"
+    cases = {
+        "NRM": (graded, {"model": "NRM"}),
+        "GRM spec": (graded, {"model": "GRM", "spec": spec, "n_quadpts": 9}),
+        "GPCM spec": (graded, {"model": "GPCM", "spec": spec, "n_quadpts": 9}),
+        "2PL spec": (binary, {"model": "2PL", "spec": spec, "n_quadpts": 9}),
+        "mixed 2PL and NRM": (
+            np.column_stack((binary[:, :3], graded[:, 3:])),
+            {"model": ["2PL"] * 3 + ["NRM"] * 3},
+        ),
+    }
+    return cases[name]
+
+
+@pytest.mark.parametrize(
+    "name", ["NRM", "GRM spec", "GPCM spec", "2PL spec", "mixed 2PL and NRM"]
+)
+def test_auto_uses_exact_observed_information_for_every_supported_model(name):
+    # Regression: "auto" gave complete-data errors, 0.2-0.8 times the
+    # observed-information ones, to nominal, multidimensional and
+    # model-syntax fits, although their exact information is available.
+    data, options = _auto_case(name)
+    options = {"max_iter": 60, **options}
+    auto = mirt.fit_mirt(data, **options)
+    explicit = mirt.fit_mirt(data, se_method="oakes", **options)
+    complete = mirt.fit_mirt(data, se_method="complete_data", **options)
+
+    assert auto.se_method == "oakes"
+    assert auto.vcov is not None
+    for parameter, values in explicit.standard_errors.items():
+        np.testing.assert_allclose(auto.standard_errors[parameter], values, rtol=1e-12)
+    ratios = np.concatenate(
+        [
+            np.ravel(complete.standard_errors[parameter])[np.ravel(mask)]
+            / np.ravel(auto.standard_errors[parameter])[np.ravel(mask)]
+            for parameter, mask in auto.model.free_parameter_masks.items()
+        ]
     )
-    assert explicit.se_method == "oakes"
-    assert explicit.vcov.shape == (explicit.model.n_parameters,) * 2
+    assert np.nanmedian(ratios) < 0.95
+
+
+def test_exploratory_errors_hold_the_rotation_anchors():
+    # Regression: an exploratory multi-factor fit got finite complete-data
+    # errors, although its rotation, and so its information, is singular.
+    data = mirt.simdata(model="2PL", n_persons=600, n_items=6, n_factors=2, seed=4)
+    estimator = EMEstimator(n_quadpts=9, tol=1e-6)
+    result = estimator.fit(TwoParameterLogistic(6, n_factors=2), data)
+    errors = result.standard_errors["discrimination"]
+
+    assert result.se_method == "oakes"
+    # The upper triangle of the first item's slopes identifies the rotation.
+    assert np.isnan(errors[0, 1])
+    assert np.all(np.isfinite(np.delete(errors.ravel(), 1)))
+    assert np.all(np.isfinite(result.standard_errors["difficulty"]))
+    mass = estimator._prior_mass(result.model, data, np.ones((1, 1)))
+    _, layouts = _flatten_parameters(result.model)
+    information = louis.louis_information(
+        result.model, data, estimator._quadrature.nodes, mass, layouts
+    ).information
+    active = np.arange(information.shape[0]) != 1
+    np.testing.assert_allclose(
+        result.vcov[np.ix_(active, active)],
+        np.linalg.inv(information[np.ix_(active, active)]),
+        rtol=1e-8,
+    )
+
+
+def test_custom_item_models_report_observed_information():
+    # Regression: custom item models got complete-data errors, about 0.43
+    # times those of the equivalent built-in 2PL.
+    def curve(theta, a, b):
+        return 1.0 / (1.0 + np.exp(-a * (theta - b)))
+
+    item_type = create_item_type(
+        "logistic",
+        curve,
+        par_bounds={"a": (0.1, 20.0), "b": (-30.0, 30.0)},
+        par_defaults={"a": 1.0, "b": 0.0},
+    )
+    data = mirt.simdata(model="2PL", n_persons=600, n_items=5, seed=8)
+    custom = EMEstimator(tol=1e-8).fit(CustomItemModel(5, item_type), data)
+    builtin = EMEstimator(tol=1e-8, use_rust=False).fit(TwoParameterLogistic(5), data)
+
+    assert custom.se_method == "oakes"
+    assert custom.vcov is not None
+    np.testing.assert_allclose(
+        custom.standard_errors["a"],
+        builtin.standard_errors["discrimination"],
+        rtol=2e-3,
+    )
+    np.testing.assert_allclose(
+        custom.standard_errors["b"], builtin.standard_errors["difficulty"], rtol=2e-3
+    )
+
+
+def test_custom_curves_are_differenced_inside_their_bounds():
+    # A custom curve may reject values outside its type's bounds: at a
+    # guessing value of 0 the stencil must not try a negative one.
+    rng = np.random.default_rng(4)
+    model = CustomItemModel(4, GUESSING_TYPE).set_parameters(
+        a=np.array([2.5, 1.0, 1.4, 0.8]),
+        b=np.array([1.5, -0.5, 0.3, 0.8]),
+        c=np.array([0.0, 0.15, 0.2, 0.1]),
+    )
+    responses = _responses(model, rng, 400, missing=0.0)
+    quadrature = GaussHermiteQuadrature(15)
+    mass = quadrature.weights / quadrature.weights.sum()
+    _, layouts = _flatten_parameters(model)
+
+    information = louis.louis_information(
+        model, responses, quadrature.nodes, mass, layouts
+    ).information
+    # Without the guessing value on its bound, the other coordinates'
+    # information is the marginal finite-difference information.
+    interior = copy.deepcopy(model)
+    interior.set_free_parameter_masks({"c": np.array([False, True, True, True])})
+    reference, _ = _finite_difference_information(
+        interior, responses, quadrature, mass, 1e-4
+    )
+    active = np.arange(12) != 8
+    np.testing.assert_allclose(
+        information[np.ix_(active, active)],
+        reference,
+        rtol=0,
+        atol=1e-5 * np.max(np.abs(reference)),
+    )
+
+
+def test_unsupported_models_and_complete_data_keep_labelled_complete_data():
+    class Subclass(TwoParameterLogistic):
+        """A subclass, whose hooks the exact information cannot vouch for."""
 
     data = mirt.simdata(model="2PL", n_persons=400, n_items=5, seed=2)
+    unsupported = EMEstimator(max_iter=60).fit(Subclass(5), data)
+    assert unsupported.se_method == "complete_data"
+    assert unsupported.vcov is None
+
     complete = mirt.fit_mirt(data, se_method="complete_data")
     observed = mirt.fit_mirt(data)
     assert complete.se_method == "complete_data"
@@ -662,7 +823,7 @@ def test_complete_data_and_unsupported_models_keep_labelled_complete_data():
 def test_em_score_based_methods(method):
     data = mirt.simdata(model="GRM", n_persons=500, n_items=5, n_categories=4, seed=8)
     result = mirt.fit_mirt(data, model="GRM", se_method=method, tol=1e-7)
-    quadrature = GaussHermiteQuadrature(21)
+    quadrature = build_quadrature(default_quadpts(1), 1)
     posterior = _posterior_from_model(result.model, data, quadrature)
     if method == "crossprod":
         expected = compute_crossprod_se(result.model, data, posterior, quadrature)

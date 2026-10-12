@@ -9,6 +9,7 @@ from mirt.estimation.sparse_bayesian import (
     SpikeSlabLassoPrior,
 )
 from mirt.models.dichotomous import TwoParameterLogistic
+from mirt.models.multidimensional import MultidimensionalModel
 
 
 class TestSpikeSlabLassoPrior:
@@ -154,7 +155,10 @@ class TestSparseBayesianEstimator:
         result = estimator.fit(model, responses)
 
         assert isinstance(result, SparseBayesianResult)
-        assert result.model is model
+        assert isinstance(result.model, MultidimensionalModel)
+        assert result.model.is_fitted and model.is_fitted
+        np.testing.assert_array_equal(result.model.slopes, result.sparse_loadings)
+        np.testing.assert_array_equal(result.model.intercepts, result.intercepts)
         assert result.elbo < 0
         assert result.n_iterations > 0
         assert result.loadings.shape == (n_items, k_max)

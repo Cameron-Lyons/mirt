@@ -1,14 +1,14 @@
-"""Scalar-reference coverage for shared LD tables and bounded probability calls."""
+"""Scalar-reference coverage for the shared Chen-Thissen LD tables."""
 
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
 
-from mirt._local_dependence import ld_pair_statistics
-from mirt.constants import PROB_EPSILON
+from mirt._local_dependence import _goodman_kruskal_gamma, marginal_ld_statistics
 
 
-def _reference(responses, probabilities):
+def _marginal_reference(responses, n_categories, node_probabilities, weights):
+    """Loop over pairs, persons and nodes to build each pair's two tables."""
     n_items = responses.shape[1]
     chi2 = np.full((n_items, n_items), np.nan)
     g2 = np.full_like(chi2, np.nan)
@@ -17,111 +17,124 @@ def _reference(responses, probabilities):
             valid = (responses[:, first] >= 0) & (responses[:, second] >= 0)
             if valid.sum() < 10:
                 continue
-            observed = np.zeros((2, 2))
-            expected = np.zeros((2, 2))
+            observed = np.zeros((n_categories[first], n_categories[second]))
             for row in np.flatnonzero(valid):
-                left, right = probabilities[row, [first, second]]
-                observed[
-                    int(responses[row, first] > 0), int(responses[row, second] > 0)
-                ] += 1
-                expected += np.outer([1.0 - left, left], [1.0 - right, right])
-            expected = np.maximum(expected, 0.5)
+                observed[responses[row, first], responses[row, second]] += 1
+            expected = np.zeros_like(observed)
+            for node, weight in enumerate(weights):
+                expected += weight * np.outer(
+                    node_probabilities[node, first, : n_categories[first]],
+                    node_probabilities[node, second, : n_categories[second]],
+                )
+            expected *= valid.sum()
             chi2[first, second] = chi2[second, first] = np.sum(
                 (observed - expected) ** 2 / expected
             )
-            g2[first, second] = g2[second, first] = np.sum(
-                2.0 * observed * np.log(observed / expected + PROB_EPSILON)
+            positive = observed > 0
+            g2[first, second] = g2[second, first] = 2.0 * np.sum(
+                observed[positive] * np.log(observed[positive] / expected[positive])
             )
     return chi2, g2
 
 
-@pytest.mark.parametrize("chunk_size", [1, 7, 100])
-@pytest.mark.parametrize("missing", ["none", "random", "mixed_blocks"])
-@pytest.mark.parametrize("compute_g2", [False, True])
-def test_matches_scalar_tables(chunk_size, missing, compute_g2):
-    rng = np.random.default_rng(702)
-    # Strided inputs, pooled polytomous responses, and probabilities at boundaries.
-    responses = rng.integers(0, 4, size=(86, 12))[::2, ::2]
-    probabilities = rng.uniform(size=(86, 12))[::2, ::2]
-    probabilities[:, 0] = 0.0
-    probabilities[:, 1] = 1.0
-    if missing == "random":
-        responses[rng.random(responses.shape) < 0.2] = -3
-        responses[9:, -1] = -1
-    elif missing == "mixed_blocks":
-        responses[14:28, ::2] = -1
-    probabilities[responses < 0] = np.nan
-    original_responses = responses.copy()
-    original_probabilities = probabilities.copy()
-    responses.flags.writeable = False
-    probabilities.flags.writeable = False
+def _random_category_probabilities(rng, n_nodes, n_categories):
+    width = max(n_categories)
+    values = rng.uniform(0.1, 1.0, size=(n_nodes, len(n_categories), width))
+    values[:, np.arange(width)[None, :] >= np.array(n_categories)[:, None]] = 0.0
+    return values / values.sum(axis=2, keepdims=True)
 
-    expected_chi2, expected_g2 = _reference(responses, probabilities)
-    chi2, g2 = ld_pair_statistics(
-        responses, probabilities, compute_g2=compute_g2, chunk_size=chunk_size
+
+@pytest.mark.parametrize("chunk_size", [1, 6, None])
+def test_marginal_tables_match_scalar_reference(chunk_size):
+    rng = np.random.default_rng(904)
+    n_categories = [2, 4, 3, 5, 2]
+    n_nodes = 13
+    node_probabilities = _random_category_probabilities(rng, n_nodes, n_categories)
+    weights = rng.uniform(size=n_nodes)
+    weights /= weights.sum()
+    responses = np.column_stack(
+        [rng.integers(0, count, size=60) for count in n_categories]
     )
-
-    assert_allclose(chi2, expected_chi2, rtol=1e-12, atol=1e-12)
-    assert_allclose(chi2, chi2.T, rtol=0, atol=0)
-    if compute_g2:
-        assert_allclose(g2, expected_g2, rtol=1e-12, atol=1e-12)
-    else:
-        assert g2 is None
-    assert_array_equal(responses, original_responses)
-    assert_array_equal(probabilities, original_probabilities)
-
-
-def test_probability_callback_uses_bounded_slices_and_accumulates_before_flooring():
-    responses = np.zeros((23, 4), dtype=np.int32)
-    responses[:, 0] = 1
-    responses[9:, 2] = -1
-    responses[10:, 3] = -1
-    probabilities = np.full(responses.shape, 0.2)
+    responses[rng.random(responses.shape) < 0.2] = -1
+    responses[12:, 4] = -2  # Item 4 shares at most 12 responses with any item.
     seen = []
 
-    def probability_block(rows):
+    def probabilities(rows):
         seen.append(rows)
-        return probabilities[rows]
+        return node_probabilities[rows]
 
-    expected_chi2, expected_g2 = _reference(responses, probabilities)
-    chi2, g2 = ld_pair_statistics(responses, probability_block, chunk_size=4)
-
-    assert seen == [slice(start, min(start + 4, 23)) for start in range(0, 23, 4)]
-    assert_allclose(chi2, expected_chi2, rtol=1e-12, atol=1e-12)
-    assert_allclose(g2, expected_g2, rtol=1e-12, atol=1e-12)
-    assert np.isnan(chi2[0, 2])  # Nine shared responses are insufficient.
-    assert np.isfinite(chi2[0, 3])  # Ten shared responses are eligible.
-
-
-def test_small_expected_cells_avoid_subtractive_cancellation():
-    n_persons = 20_000
-    responses = np.ones((n_persons, 2), dtype=np.int32)
-    responses[::1000, 0] = 0
-    p = 1.0 - 1e-4
-    probabilities = np.full(responses.shape, p)
-    observed = np.array([0, 20, 0, n_persons - 20])
-    expected = np.maximum(
-        n_persons * np.array([(1 - p) ** 2, (1 - p) * p, p * (1 - p), p**2]),
-        0.5,
+    expected_chi2, expected_g2 = _marginal_reference(
+        responses, n_categories, node_probabilities, weights
     )
-    chi2, g2 = ld_pair_statistics(responses, probabilities, chunk_size=137)
-
-    assert_allclose(
-        chi2[0, 1], np.sum((observed - expected) ** 2 / expected), rtol=1e-12
-    )
-    assert_allclose(
-        g2[0, 1],
-        np.sum(2.0 * observed * np.log(observed / expected + PROB_EPSILON)),
-        # The near-unit ratio in the large 11 cell amplifies summation rounding.
-        atol=2e-10,
-        rtol=1e-12,
+    result = marginal_ld_statistics(
+        responses,
+        np.array(n_categories),
+        probabilities,
+        weights,
+        chunk_size=chunk_size,
     )
 
+    assert_allclose(result.chi2, expected_chi2, rtol=1e-12, equal_nan=True)
+    assert_allclose(result.g2, expected_g2, rtol=1e-11, atol=1e-12, equal_nan=True)
+    assert_array_equal(np.isnan(result.chi2), np.isnan(expected_chi2))
+    assert np.all(np.isnan(np.diag(result.chi2)))
+    assert_array_equal(
+        result.pair_counts,
+        (responses >= 0).astype(int).T @ (responses >= 0).astype(int),
+    )
+    counts = np.array(n_categories)
+    degrees = np.multiply.outer(counts - 1, counts - 1).astype(float)
+    np.fill_diagonal(degrees, np.nan)
+    assert_allclose(result.df, degrees, equal_nan=True)
+    if chunk_size is not None:
+        assert all(rows.stop - rows.start <= chunk_size for rows in seen)
 
-@pytest.mark.parametrize("shape", [(0, 3), (9, 3), (20, 0), (20, 1), (20, 3)])
-def test_empty_or_ineligible_pairs_remain_nan(shape):
-    responses = np.full(shape, -1)
-    chi2, g2 = ld_pair_statistics(responses, np.full(shape, np.nan), chunk_size=3)
-    assert chi2.shape == g2.shape == (shape[1], shape[1])
-    assert np.all(np.isnan(chi2))
-    assert np.all(np.isnan(g2))
+
+def test_pairs_below_the_minimum_count_are_undefined():
+    responses = np.zeros((12, 3), dtype=int)
+    responses[::2, :] = 1
+    responses[9:, 2] = -1
+    probabilities = np.full((5, 3, 2), 0.5)
+
+    result = marginal_ld_statistics(
+        responses, np.full(3, 2), lambda rows: probabilities[rows], np.full(5, 0.2)
+    )
+
+    assert np.isfinite(result.chi2[0, 1])
+    assert np.isnan(result.chi2[0, 2]) and np.isnan(result.cramers_v[1, 2])
+    assert result.pair_counts[0, 2] == 9
+
+
+def test_gamma_matches_pair_counting_and_signs_cramers_v():
+    rng = np.random.default_rng(55)
+    tables = rng.integers(0, 9, size=(20, 3, 4)).astype(float)
+    expected = []
+    for table in tables:
+        concordant = discordant = 0.0
+        for k in range(3):
+            for m in range(4):
+                for other_k in range(k + 1, 3):
+                    for other_m in range(4):
+                        product = table[k, m] * table[other_k, other_m]
+                        if other_m > m:
+                            concordant += product
+                        elif other_m < m:
+                            discordant += product
+        expected.append((concordant - discordant) / (concordant + discordant))
+    assert_allclose(_goodman_kruskal_gamma(tables), expected, rtol=1e-13)
+    assert np.isnan(_goodman_kruskal_gamma(np.array([[3.0, 4.0], [0.0, 0.0]])))
+
+    # Positive dependence: agreeing responses are more frequent than expected.
+    responses = np.repeat([[0, 0], [1, 1], [0, 1], [1, 0]], [40, 40, 10, 10], axis=0)
+    probabilities = np.full((1, 2, 2), 0.5)
+    positive = marginal_ld_statistics(
+        responses, np.full(2, 2), lambda rows: probabilities[rows], np.ones(1)
+    )
+    negative = marginal_ld_statistics(
+        responses[:, ::-1] * [1, -1] + [0, 1],
+        np.full(2, 2),
+        lambda rows: probabilities[rows],
+        np.ones(1),
+    )
+    assert positive.cramers_v[0, 1] == pytest.approx(0.6)
+    assert negative.cramers_v[0, 1] == pytest.approx(-0.6)

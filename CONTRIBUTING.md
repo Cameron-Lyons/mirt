@@ -44,7 +44,10 @@ Prefer public APIs and `mirt.should_use_rust()` over private `_rust_backend` sym
 
 Every function registered in `mirt_rs` must be called as `mirt_rs.<name>` by
 package code, and every such call must resolve; `tests/test_native_registry.py`
-enforces both. Crate modules are private, so rustc reports unused helpers.
+enforces both. Every wrapper exported from `mirt.backends.rust` must also have
+a caller outside the backend package, which
+`tests/test_lazy_rust_backend_api.py` checks. Crate modules are private, so
+rustc reports unused helpers.
 
 ## Rust checks
 
@@ -324,16 +327,16 @@ model fitting and probability evaluation. Each workload also records a separate
 OPENBLAS_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite diagnostics --persons 20000 --items 150 --repeats 7 --warmups 1 --backend numpy --json /tmp/mirt-diagnostics.json
 ```
 
-Residual utilities, local-dependence diagnostics, testlet Q3, and the native
-backend's NumPy fallback share the correlation kernel. It processes bounded row
-blocks and skips missing-data matrix products for complete blocks. Each caller
-retains its minimum pair count, undefined-value, and diagonal conventions.
+Residual utilities, local-dependence diagnostics, and testlet Q3 share the
+correlation kernel. It processes bounded row blocks and skips missing-data
+matrix products for complete blocks. Each caller retains its minimum pair
+count, undefined-value, and diagonal conventions.
 
-LD statistics and the native backend's NumPy fallback also share a bounded-row
-kernel. It reuses transposed cross-classification cells and derives observed
-cells from margins in complete blocks. Expected cells use direct probability
-products to preserve accuracy near zero and one; expected-count floors and
-pair eligibility are applied after all blocks have accumulated.
+LD statistics share a bounded-memory kernel in `mirt._local_dependence`. It
+accumulates every pair's observed cross-classification table from bounded row
+blocks of category indicators, and the model-implied tables from one weighted
+product of category probabilities over bounded node blocks. Pair eligibility
+is applied after all blocks have accumulated.
 
 The `misfit` benchmark suite measures `identify_misfitting_patterns` on complete
 and incomplete 2PL/GRM data. It includes probability evaluation, fit totals,

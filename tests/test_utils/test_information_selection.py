@@ -3,11 +3,23 @@
 import numpy as np
 import pytest
 
+import mirt.scoring._common as scoring_common
 from mirt import _information
+from mirt.exceptions import MirtValidationError
+from mirt.models import MultidimensionalModel
 from mirt.models.dichotomous import TwoParameterLogistic
-from mirt.models.polytomous import GeneralizedPartialCredit
+from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
+from mirt.results.fit_result import FitResult
 from mirt.utils import information as information_utils
-from mirt.utils.information import areainfo, expected_score, iteminfo, probtrace
+from mirt.utils.information import (
+    areainfo,
+    expected_score,
+    gen_difficulty,
+    information_intervals,
+    iteminfo,
+    probtrace,
+    theta_for_score,
+)
 
 
 def test_sparse_polytomous_selection_evaluates_only_requested_items(monkeypatch):
@@ -332,3 +344,216 @@ def test_probability_only_models_produce_bounded_expected_scores(
     np.testing.assert_allclose(
         expected_score(model, np.arange(17), [2, 0, 2]), expected
     )
+
+
+def _two_factor_model() -> MultidimensionalModel:
+    model = MultidimensionalModel(n_items=3, n_factors=2)
+    model.set_parameters(
+        slopes=np.array([[1.5, 0.0], [0.0, 1.2], [0.8, 0.8]]),
+        intercepts=np.array([0.3, -0.2, 0.1]),
+    )
+    return model
+
+
+_TWO_FACTOR_THETA = np.array([[0.0, 0.0], [0.5, -1.0]])
+
+
+@pytest.mark.parametrize("rank_one", [True, False])
+def test_directional_information_matches_r_degrees(monkeypatch, rank_one) -> None:
+    # R mirt 1.48: testinfo(mod, Theta, degrees = ...) and
+    # iteminfo(extract.item(mod, 3), Theta, multidim_matrix = TRUE).
+    model = _two_factor_model()
+    if not rank_one:
+        # Exercise the general path through each item's Fisher matrices.
+        monkeypatch.setattr(scoring_common, "_rank_one_slopes", lambda model: None)
+
+    along_first = information_utils.testinfo(model, _TWO_FACTOR_THETA, degrees=[0, 90])
+    diagonal = information_utils.testinfo(model, _TWO_FACTOR_THETA, degrees=[45, 45])
+    matrices = iteminfo(model, _TWO_FACTOR_THETA, 2, return_matrix=True)
+
+    np.testing.assert_allclose(along_first, [0.709631867028, 0.588515077311])
+    np.testing.assert_allclose(diagonal, [0.772428864452, 0.643190644075])
+    np.testing.assert_allclose(
+        matrices,
+        np.array([0.159600665723, 0.156453319482])[:, None, None] * np.ones((2, 2)),
+    )
+
+
+def test_information_matrices_have_the_default_information_as_trace() -> None:
+    model = _two_factor_model()
+
+    test_matrices = information_utils.testinfo(
+        model, _TWO_FACTOR_THETA, return_matrix=True
+    )
+    item_matrices = iteminfo(model, _TWO_FACTOR_THETA, [2, 0], return_matrix=True)
+    item_directional = iteminfo(model, _TWO_FACTOR_THETA, degrees=[0, 90])
+
+    assert test_matrices.shape == (2, 2, 2)
+    assert item_matrices.shape == (2, 2, 2, 2)
+    np.testing.assert_allclose(
+        np.trace(test_matrices, axis1=1, axis2=2),
+        information_utils.testinfo(model, _TWO_FACTOR_THETA),
+    )
+    np.testing.assert_allclose(
+        item_matrices[:, 0], model.item_information_matrix(_TWO_FACTOR_THETA, 2)
+    )
+    np.testing.assert_allclose(
+        item_directional,
+        iteminfo(model, _TWO_FACTOR_THETA, return_matrix=True)[:, :, 0, 0],
+    )
+    np.testing.assert_allclose(item_directional.sum(axis=1), test_matrices[:, 0, 0])
+
+
+def test_polytomous_directional_information_projects_the_slopes() -> None:
+    model = GradedResponseModel(n_items=3, n_categories=4, n_factors=2)
+    direction = np.array([np.cos(np.radians(30.0)), np.cos(np.radians(60.0))])
+
+    matrices = information_utils.testinfo(model, _TWO_FACTOR_THETA, return_matrix=True)
+    directional = information_utils.testinfo(model, _TWO_FACTOR_THETA, degrees=[30, 60])
+
+    np.testing.assert_allclose(
+        directional, np.einsum("nfg,f,g->n", matrices, direction, direction)
+    )
+
+
+def test_unidimensional_degrees_and_matrices_keep_information() -> None:
+    model = TwoParameterLogistic(n_items=4)
+    theta = np.linspace(-2.0, 2.0, 5)
+
+    np.testing.assert_allclose(
+        information_utils.testinfo(model, theta, degrees=[0]),
+        information_utils.testinfo(model, theta),
+    )
+    np.testing.assert_allclose(
+        information_utils.testinfo(model, theta, return_matrix=True)[:, 0, 0],
+        information_utils.testinfo(model, theta),
+    )
+    np.testing.assert_allclose(
+        iteminfo(model, theta, 1, degrees=0), iteminfo(model, theta, 1)
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"degrees": [0, 90, 90]}, "one finite angle per factor"),
+        ({"degrees": [0, np.nan]}, "one finite angle per factor"),
+        ({"degrees": [90, 90]}, "describe a direction"),
+        ({"degrees": ["a", "b"]}, "numeric angles"),
+        ({"degrees": [0, 90], "return_matrix": True}, "cannot be combined"),
+        ({"return_matrix": "yes"}, "must be boolean"),
+    ],
+)
+def test_directional_information_validates_options(kwargs, message) -> None:
+    model = _two_factor_model()
+
+    for function in (information_utils.testinfo, iteminfo):
+        with pytest.raises(MirtValidationError, match=message):
+            function(model, _TWO_FACTOR_THETA, **kwargs)
+
+
+def test_areainfo_details_match_r_total_information() -> None:
+    # R mirt 1.48 areainfo(mod, c(-2, 2)) for a fitted graded model.
+    slopes = np.array([0.8762755, 1.2927007, 0.9729110, 1.7112577])
+    intercepts = np.array(
+        [
+            [0.5759162, 0.5430597, -0.0264919],
+            [0.9394861, -0.0812595, -0.3460659],
+            [1.4380613, 0.7360791, -0.2817478],
+            [0.5258856, 0.3216703, -1.2716378],
+        ]
+    )
+    model = GradedResponseModel(n_items=4, n_categories=4)
+    model.set_parameters(
+        discrimination=slopes, thresholds=-intercepts / slopes[:, None]
+    )
+
+    details = areainfo(model, (-2.0, 2.0), n_points=2001, return_details=True)
+    selected = areainfo(model, (-2.0, 2.0), item_idx=[2, 0], return_details=True)
+
+    assert details["info"] == areainfo(model, (-2.0, 2.0), n_points=2001)
+    assert details["lower_bound"] == -2.0 and details["upper_bound"] == 2.0
+    assert details["n_items"] == 4
+    assert details["proportion"] == pytest.approx(
+        details["info"] / details["total_info"]
+    )
+    # Two-parameter logistic items integrate to their slope over the real line.
+    logistic = TwoParameterLogistic(n_items=3)
+    logistic.set_parameters(
+        discrimination=np.array([0.5, 1.0, 2.0]), difficulty=np.array([-1.0, 0.0, 2.0])
+    )
+    logistic_details = areainfo(logistic, item_idx=[0, 2], return_details=True)
+    np.testing.assert_allclose(logistic_details["total_info"], [0.5, 2.0], rtol=1e-4)
+    assert logistic_details["n_items"] == 2
+    assert selected["info"].shape == selected["total_info"].shape == (2,)
+    np.testing.assert_array_less(selected["proportion"], 1.0)
+    single = areainfo(logistic, item_idx=1, return_details=True)
+    assert isinstance(single["total_info"], float) and single["n_items"] == 1
+    with pytest.raises(MirtValidationError, match="return_details"):
+        areainfo(logistic, return_details="yes")  # type: ignore[arg-type]
+
+
+def test_areainfo_details_match_r_for_test_information() -> None:
+    slopes = np.array(
+        [0.876275501193737, 1.292700705539029, 0.972910961061323, 1.711257703491664]
+        + [1.310953935918054, 1.208224320879997, 1.538350273515113, 1.321798405174920]
+    )
+    intercepts = np.array(
+        [
+            [0.5759162399376601, 0.5430596510006076, -0.0264918522304576],
+            [0.9394861159545415, -0.08125945336339897, -0.3460659348771987],
+            [1.4380613295845570, 0.73607912180030555, -0.2817478245880934],
+            [0.5258856113325339, 0.32167032088545289, -1.2716377870268567],
+            [0.7925955224673941, -0.56964247986016858, -0.6698218527784708],
+            [0.9379201390167902, 0.55988823302469704, -2.3686726101047828],
+            [1.4728281870474278, 1.26438422312999998, 0.1299017875040820],
+            [0.0961653864246133, -0.00118904071022761, -1.8769479883953437],
+        ]
+    )
+    model = GradedResponseModel(n_items=8, n_categories=4)
+    model.set_parameters(
+        discrimination=slopes, thresholds=-intercepts / slopes[:, None]
+    )
+
+    details = areainfo(model, (-2.0, 2.0), n_points=2001, return_details=True)
+
+    # R: Info 12.097715145, TotalInfo 15.5696992345, Proportion 0.777003779125.
+    assert details["info"] == pytest.approx(12.097715145, rel=1e-6)
+    assert details["total_info"] == pytest.approx(15.5696992345, rel=1e-6)
+    assert details["proportion"] == pytest.approx(0.777003779125, rel=1e-6)
+    assert details["n_items"] == 8
+
+
+def test_information_utilities_accept_fit_results() -> None:
+    model = TwoParameterLogistic(n_items=4)
+    fit = FitResult(model, -1.0, 1, True, {}, 4.0, 5.0)
+    theta = np.linspace(-1.0, 1.0, 3)
+
+    np.testing.assert_array_equal(
+        information_utils.testinfo(fit, theta), information_utils.testinfo(model, theta)
+    )
+    np.testing.assert_array_equal(iteminfo(fit, theta), iteminfo(model, theta))
+    assert areainfo(fit) == areainfo(model)
+    np.testing.assert_array_equal(probtrace(fit, theta), probtrace(model, theta))
+    np.testing.assert_array_equal(
+        expected_score(fit, theta), expected_score(model, theta)
+    )
+    np.testing.assert_array_equal(gen_difficulty(fit), gen_difficulty(model))
+    assert theta_for_score(fit, 2.0) == theta_for_score(model, 2.0)
+    np.testing.assert_array_equal(
+        information_intervals(fit, 0.5), information_intervals(model, 0.5)
+    )
+    with pytest.raises(MirtValidationError, match="item model or a FitResult"):
+        information_utils.testinfo(object(), theta)  # type: ignore[arg-type]
+
+
+def test_directional_information_matches_plotted_factor_curves() -> None:
+    from mirt.plotting import _factor_test_information
+
+    model = GradedResponseModel(n_items=4, n_categories=3, n_factors=2)
+
+    for factor, degrees in ((0, [0, 90]), (1, [90, 0])):
+        np.testing.assert_allclose(
+            information_utils.testinfo(model, _TWO_FACTOR_THETA, degrees=degrees),
+            _factor_test_information(model, _TWO_FACTOR_THETA, factor),
+        )

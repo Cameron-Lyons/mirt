@@ -10,7 +10,12 @@ Fitting a built-in tree
 
 The built-in specifications are ``"bockenholt"``, ``"extreme_midpoint"``,
 and ``"direction_intensity"``. Each specification defines its own decision
-nodes and latent traits.
+nodes and latent traits. ``"bockenholt"`` is Böckenholt's (2012)
+midpoint-direction-intensity tree: the first node chooses between the
+neutral midpoint and a directional response (the ``Midpoint`` trait, a
+midpoint response style), the second between disagreeing and agreeing
+(``Direction``), and the last between a mild and an extreme response
+(``Intensity``).
 
 .. code-block:: python
 
@@ -47,7 +52,7 @@ Inspecting estimates and uncertainty
 ------------------------------------
 
 The fitted result keeps item estimates on ``result.model`` and exposes the
-estimated latent distribution and person scores directly:
+latent distribution and person scores directly:
 
 .. code-block:: python
 
@@ -62,6 +67,15 @@ estimated latent distribution and person scores directly:
    person_eap = result.theta_estimates
    person_standard_error = result.theta_se
    item_standard_error = result.standard_errors
+
+Every decision node has its own slope and location, so the location and
+scale of each trait are not identified by the data. The estimator therefore
+fixes the trait means at zero and the variances at one, as R mirt does for
+multidimensional models, and estimates only the trait correlations:
+``result.trait_means`` is zero and ``result.trait_covariance`` equals
+``result.trait_correlations``. AIC and BIC count two parameters per node and
+item plus ``n_traits * (n_traits - 1) / 2`` correlations, which matches
+``model.n_parameters``.
 
 Item standard errors use the expected complete-data information matrix. They
 are useful as local uncertainty approximations; bootstrap inference remains a
@@ -102,10 +116,10 @@ memory tuning does not change a reproducible simulation.
 Fixing the trait distribution
 -----------------------------
 
-Set ``estimate_correlations=False`` on the estimator to hold the latent mean
-at zero and covariance at the identity matrix. A model created with
-``correlated_traits=False`` also keeps that fixed distribution and does not
-store a trait-correlation matrix:
+Set ``estimate_correlations=False`` on the estimator to also hold the trait
+correlations at zero, so the covariance is the identity matrix. A model
+created with ``correlated_traits=False`` also keeps that fixed distribution
+and does not store a trait-correlation matrix:
 
 .. code-block:: python
 

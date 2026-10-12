@@ -8,6 +8,7 @@ counts, and item names are validated identically everywhere.
 from __future__ import annotations
 
 import importlib
+import warnings
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +32,9 @@ ITEM_MODEL_FAMILIES: dict[str, tuple[str, str]] = {
     "NRM": ("mirt.models.polytomous", "NominalResponseModel"),
 }
 POLYTOMOUS_FAMILIES = frozenset({"GRM", "GPCM", "PCM", "NRM"})
+# R mirt's itemtype="Rasch" is the "1PL" family: one common discrimination,
+# equivalent to unit slopes with an estimated latent variance.
+FAMILY_ALIASES: dict[str, str] = {"Rasch": "1PL"}
 
 
 def item_model_class(name: str) -> type[BaseItemModel]:
@@ -52,7 +56,7 @@ def item_model_class(name: str) -> type[BaseItemModel]:
             expected=", ".join(ITEM_MODEL_FAMILIES),
         )
     try:
-        module_name, class_name = ITEM_MODEL_FAMILIES[name]
+        module_name, class_name = ITEM_MODEL_FAMILIES[FAMILY_ALIASES.get(name, name)]
     except (KeyError, TypeError):
         raise MirtModelError(
             f"Unknown model: {name}",
@@ -131,6 +135,86 @@ def resolve_category_counts(
     return int(counts) if counts.ndim == 0 else counts.tolist()
 
 
+def _item_labels(
+    items: Sequence[int] | NDArray[np.intp], item_names: Sequence[str] | None
+) -> str:
+    """Name items by their labels, or as ``Item_j`` numbered from one."""
+    return ", ".join(
+        f"Item_{item + 1}" if item_names is None else str(item_names[item])
+        for item in items
+    )
+
+
+def check_observed_categories(
+    responses: NDArray[np.int_],
+    item_names: Sequence[str] | None = None,
+) -> None:
+    """Reject single-category items and warn about unused interior categories.
+
+    Parameters
+    ----------
+    responses : ndarray of shape (n_persons, n_items)
+        Validated responses with missing values coded as negative numbers.
+    item_names : sequence of str, optional
+        Item labels for the messages.
+
+    Raises
+    ------
+    MirtDataError
+        If an item's observed responses all fall in one category. Its
+        parameters are not identified, and R mirt stops with the same
+        message. Items without any observed response are allowed; they keep
+        their starting values.
+
+    Warns
+    -----
+    UserWarning
+        If a category below an item's highest observed code is never
+        observed. The thresholds or steps next to it are not identified and
+        the fit runs into a degenerate boundary solution. R mirt recodes
+        such an item to consecutive categories, which
+        :func:`mirt.utils.recode_responses` does before fitting.
+    """
+    n_items = responses.shape[1]
+    constant: list[int] = []
+    gaps: list[tuple[int, NDArray[np.int_]]] = []
+    for item in range(n_items):
+        column = responses[:, item]
+        observed = np.unique(column[column >= 0])
+        if observed.size == 1:
+            constant.append(item)
+        elif observed.size and observed.size <= observed[-1]:
+            gaps.append((item, observed))
+    if constant:
+        raise MirtDataError(
+            "The following items have only one observed response category "
+            "and cannot be estimated: "
+            f"{_item_labels(constant, item_names)}",
+            n_persons=responses.shape[0],
+            n_items=n_items,
+        )
+    for item, observed in gaps:
+        highest = int(observed[-1])
+        unused = np.setdiff1d(np.arange(highest), observed).tolist()
+        recode = {
+            int(code): position
+            for position, code in enumerate(observed)
+            if code != position
+        }
+        warnings.warn(
+            f"{_item_labels([item], item_names)} never uses "
+            f"categor{'y' if len(unused) == 1 else 'ies'} "
+            f"{', '.join(map(str, unused))} below its highest observed category "
+            f"{highest}; the thresholds or steps next to an empty category are "
+            "not identified, so their estimates and standard errors are "
+            "degenerate. R mirt recodes such items to consecutive categories; "
+            "recode before fitting, for example with "
+            f"mirt.utils.recode_responses(data, {recode}, items=[{item}])",
+            UserWarning,
+            stacklevel=4,
+        )
+
+
 def build_item_model(
     name: str,
     n_items: int,
@@ -139,6 +223,7 @@ def build_item_model(
     n_categories: int | Sequence[int] | None = None,
     item_names: Sequence[str] | None = None,
     responses: NDArray[np.int_] | None = None,
+    estimate_discrimination: bool = False,
 ) -> BaseItemModel:
     """Construct a built-in item model with validated structure.
 
@@ -158,7 +243,13 @@ def build_item_model(
         Item labels.
     responses : ndarray of shape (n_persons, n_items), optional
         Validated responses with missing values coded as negative numbers.
-        When supplied, observed codes are checked against the model family.
+        When supplied, observed codes are checked against the model family
+        and by :func:`check_observed_categories`.
+    estimate_discrimination : bool, default=False
+        For "1PL" and "PCM", whether the discrimination common to all items
+        is a free parameter (see
+        :class:`~mirt.models.dichotomous.OneParameterLogistic`). Other
+        families ignore it.
 
     Returns
     -------
@@ -172,7 +263,13 @@ def build_item_model(
     MirtValidationError
         If ``n_factors`` or ``n_categories`` is invalid.
     MirtDataError
-        If ``responses`` contains codes outside the model's categories.
+        If ``responses`` contains codes outside the model's categories, or an
+        item whose observed responses all fall in one category.
+
+    Warns
+    -----
+    UserWarning
+        If an item never uses a category below its highest observed one.
     """
     model_class = item_model_class(name)
     n_factors = validate_n_factors(n_factors)
@@ -205,6 +302,10 @@ def build_item_model(
             n_persons=responses.shape[0],
             n_items=responses.shape[1],
         )
+    if responses is not None:
+        check_observed_categories(responses, item_names)
+    if estimate_discrimination and name in ("1PL", "PCM"):
+        kwargs["estimate_discrimination"] = True
 
     return model_class(**kwargs)
 
@@ -222,7 +323,8 @@ def validate_item_types(item_types: Any, n_items: int | None = None) -> str | li
     Returns
     -------
     str or list of str
-        The family name, or the per-item names as a list.
+        The family name, or the per-item names as a list, with the alias
+        "Rasch" resolved to "1PL".
 
     Raises
     ------
@@ -233,7 +335,7 @@ def validate_item_types(item_types: Any, n_items: int | None = None) -> str | li
     """
     if isinstance(item_types, str):
         item_model_class(item_types)
-        return item_types
+        return FAMILY_ALIASES.get(item_types, item_types)
     if isinstance(item_types, (bytes, Mapping)) or not isinstance(
         item_types, (Sequence, np.ndarray)
     ):
@@ -265,7 +367,7 @@ def validate_item_types(item_types: Any, n_items: int | None = None) -> str | li
             value=len(names),
             expected=str(n_items),
         )
-    return names
+    return [FAMILY_ALIASES.get(name, name) for name in names]
 
 
 def single_item_family(item_types: Any, n_items: int, *, operation: str) -> str:

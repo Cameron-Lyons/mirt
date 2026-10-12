@@ -97,12 +97,12 @@ def test_wle_batched_path_reuses_normalized_response_patterns(
     responses[3, 0] = -4
     captured: list[np.ndarray] = []
 
-    def fake_batch(response_patterns: np.ndarray, *args: object, **kwargs: object):
+    def fake_batch(self: WLEScorer, model: object, response_patterns: np.ndarray):
         captured.append(response_patterns.copy())
         count = response_patterns.shape[0]
         return np.arange(count, dtype=float), np.arange(count, dtype=float) + 1.0
 
-    monkeypatch.setattr("mirt.backends.rust.scoring.compute_wle_scores", fake_batch)
+    monkeypatch.setattr(WLEScorer, "_estimate_unidimensional_batch", fake_batch)
 
     result = WLEScorer().score(model, responses)
 

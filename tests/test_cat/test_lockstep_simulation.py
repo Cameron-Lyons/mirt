@@ -18,7 +18,6 @@ from mirt.models import (
     FourParameterLogistic,
     GeneralizedPartialCredit,
     GradedResponseModel,
-    MultidimensionalModel,
     NominalResponseModel,
     OneParameterLogistic,
     PartialCreditModel,
@@ -477,11 +476,6 @@ class _Selection(MaxFisherInformation):
             ),
         ),
         _custom_stop_engine,
-        lambda model: CATEngine(
-            model, stopping_rule=StandardErrorStop(0.3), min_items=5, max_items=4
-        ),
-        lambda model: CATEngine(model, max_items=4, n_quadpts=4),
-        lambda model: CATEngine(model, max_items=4, n_quadpts=21.0),
         lambda model: CATEngine(model, max_items=4, initial_theta=np.nan),
         _instance_hook_engine,
     ],
@@ -493,9 +487,6 @@ class _Selection(MaxFisherInformation):
         "exposure",
         "content",
         "custom-stop",
-        "min-above-max",
-        "few-quadpts",
-        "float-quadpts",
         "nan-start",
         "instance-hook",
     ],
@@ -516,17 +507,41 @@ def test_customized_configurations_keep_the_sequential_path(monkeypatch, factory
         engine.run_batch_simulation([0.0])
 
 
-@pytest.mark.parametrize(
-    "model",
-    [
-        NominalResponseModel(n_items=4, n_categories=3),
-        MultidimensionalModel(n_items=4, n_factors=2),
-    ],
-    ids=["unsupported-family", "multidimensional"],
-)
-def test_unsupported_models_keep_the_sequential_path(model):
+def test_unsupported_models_keep_the_sequential_path():
+    model = NominalResponseModel(n_items=4, n_categories=3)
     model._is_fitted = True
     assert not lockstep.supports_lockstep(CATEngine(model, max_items=3))
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda model: CATEngine(
+            model, stopping_rule=StandardErrorStop(0.3), min_items=5, max_items=4
+        ),
+        lambda model: CATEngine(model, max_items=4, n_quadpts=4),
+        lambda model: CATEngine(model, max_items=4, n_quadpts=21.0),
+    ],
+    ids=["min-above-max", "few-quadpts", "float-quadpts"],
+)
+def test_invalid_configurations_are_rejected_before_simulation(factory):
+    with pytest.raises(ValueError, match="min_items|n_quadpts"):
+        factory(_model("2PL"))
+
+
+def test_scoring_prior_matches_independent_sessions():
+    model = _model("2PL")
+    options = dict(n_quadpts=15, max_items=6, min_items=6, prior_mean=0.4, prior_sd=0.7)
+    lockstep_results = CATEngine(model, seed=3, **options).run_batch_simulation(
+        [-1.0, 0.5], n_replications=3, use_rust=False
+    )
+    loop_results = CATEngine(model, seed=3, **options).run_batch_simulation(
+        [-1.0, 0.5], n_replications=3, use_rust=False, vectorized=False
+    )
+    for actual, expected in zip(lockstep_results, loop_results, strict=True):
+        assert actual.items_administered == expected.items_administered
+        assert_allclose(actual.theta, expected.theta, atol=1e-12)
+        assert_allclose(actual.standard_error, expected.standard_error, atol=1e-12)
 
 
 def test_customized_model_subclass_keeps_the_sequential_path():

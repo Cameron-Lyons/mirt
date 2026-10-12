@@ -7,8 +7,10 @@ from types import ModuleType
 import mirt
 
 
-def test_lazy_equating_symbol_resolution() -> None:
+def test_lazy_equating_symbol_resolution(monkeypatch) -> None:
     """Heavy equating symbols should resolve lazily via __getattr__."""
+    # Tests that ran earlier may have resolved and cached the symbol.
+    monkeypatch.delitem(mirt.__dict__, "link", raising=False)
     assert "link" not in mirt.__dict__
     link_fn = mirt.link
     assert callable(link_fn)

@@ -1,5 +1,6 @@
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Self
 
 import numpy as np
 from numpy.typing import NDArray
@@ -7,7 +8,6 @@ from numpy.typing import NDArray
 from mirt._logistic import (
     _logistic_probability,
     _scaled_information,
-    _sigmoid_derivative,
 )
 from mirt._model_defaults import record_model_base as _record_model_base
 from mirt._model_defaults import register_builtin_model as _register_builtin_model
@@ -243,7 +243,13 @@ def _logistic_information(
     *,
     norm_factor: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Preserve both logistic tails and defer slope scaling until after reduction."""
+    """Preserve both logistic tails and defer slope scaling until after reduction.
+
+    For several factors ``discrimination`` is each slope vector's largest
+    absolute entry and ``norm_factor`` the squared norm of the vector scaled
+    by it, so the information is ``discrimination**2 * norm_factor`` times
+    the unit-slope information, with or without asymptotes.
+    """
     if guessing is None:
         return _scaled_information(logits, discrimination, norm_factor=norm_factor)
 
@@ -280,6 +286,11 @@ def _logistic_information(
             else np.broadcast_to(upper, logits.shape)[exceptional],
             np.ones_like(z),
         )
+    if norm_factor is not None:
+        # Both branches above scale by the largest slope only. The factor is
+        # between one and n_factors, so applying it last cannot underflow.
+        with np.errstate(over="ignore"):
+            information *= norm_factor
     return information
 
 
@@ -291,31 +302,19 @@ def _unipolar_curve(
     information: bool,
     item_indices: NDArray[np.intp] | None = None,
 ) -> NDArray[np.float64]:
+    """Evaluate the unipolar log-logistic curve on the log-trait scale.
+
+    ``theta`` is ``log(tau)`` for the unipolar trait ``tau``, so the logit
+    ``eta * log(tau) + log(lambda)`` equals ``a * (theta - b)``.
+    """
     logits = _unidimensional_logits(
         theta, discrimination, difficulty, item_indices=item_indices
     )
-    result = _sigmoid_derivative(logits)
-    # Division can round a nearly maximal probability one ulp above 0.25.
-    np.minimum(result, 0.25, out=result)
     if not information:
-        return result
+        return _logistic_probability(logits, None, None)
     if item_indices is not None:
         discrimination = discrimination[item_indices]
-    exceptional = (result < np.finfo(float).tiny) & np.isfinite(logits)
-    with np.errstate(over="ignore", under="ignore"):
-        # I = a² P tanh²(z/2) / (1-P). The tanh form retains the small
-        # derivative near z=0, where 1-2*sigmoid(z) would cancel to zero.
-        scaled_slope = logits * 0.5
-        np.tanh(scaled_slope, out=scaled_slope)
-        scaled_slope *= discrimination
-        result /= 1.0 - result
-        result *= scaled_slope
-        result *= scaled_slope
-        if np.any(exceptional):
-            # In either far tail, I = a² exp(-|z|) to float precision.
-            a = np.broadcast_to(discrimination, logits.shape)[exceptional]
-            result[exceptional] = np.exp(2.0 * np.log(a) - np.abs(logits[exceptional]))
-    return result
+    return _scaled_information(logits, discrimination)
 
 
 def _log_powered_sigmoid(
@@ -744,6 +743,8 @@ class TwoParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "2PL"
     n_params_per_item = 2
     supports_multidimensional = True
+    _rotatable_slopes = "discrimination"
+    _slope_sum_locations = ("difficulty",)
 
     def _initialize_parameters(self) -> None:
         if self.n_factors == 1:
@@ -756,9 +757,67 @@ class TwoParameterLogistic(_ParameterizedDichotomousModel):
 
 @_register_builtin_model
 class OneParameterLogistic(TwoParameterLogistic):
+    """One-parameter logistic model with a discrimination common to all items.
+
+    ``P_j(theta) = 1 / (1 + exp(-a (theta - b_j)))`` with one slope ``a`` for
+    every item. By default ``a`` is held at 1, the Rasch model for a
+    standard-normal trait, and only the difficulties are free. With
+    ``estimate_discrimination=True`` the common slope is estimated as one
+    parameter, so the model has ``n_items + 1`` parameters and is equivalent
+    to R mirt's ``itemtype="Rasch"``, which fixes the slopes and estimates the
+    latent variance instead: the common slope is the latent standard
+    deviation, and ``b_j`` is R's difficulty divided by it.
+    ``fit_mirt(model="1PL")`` fits that model.
+
+    Parameters
+    ----------
+    n_items : int
+        Number of items.
+    n_factors : int, default=1
+        Number of latent factors; only one is supported.
+    item_names : list of str, optional
+        Item labels.
+    estimate_discrimination : bool, default=False
+        Whether the common discrimination is a free parameter. It is stored
+        once per item, like a 2PL slope, and held equal by estimation:
+        :class:`~mirt.estimation.em.EMEstimator` ties the items' slopes, as
+        ``constraints=[("discrimination", items)]`` does for a 2PL, starting
+        from their mean, and fit diagnostics count the tie as one parameter.
+        Estimators without equality constraints raise ``MirtModelError``
+        unless the slope is held fixed with ``set_free_parameter_masks``.
+    """
+
     model_name = "1PL"
     n_params_per_item = 1
     supports_multidimensional = False
+
+    def __init__(
+        self,
+        n_items: int,
+        n_factors: int = 1,
+        item_names: list[str] | None = None,
+        *,
+        estimate_discrimination: bool = False,
+    ) -> None:
+        if not isinstance(estimate_discrimination, (bool, np.bool_)):
+            raise MirtValidationError(
+                "estimate_discrimination must be a boolean",
+                parameter="estimate_discrimination",
+                value=estimate_discrimination,
+                expected="bool",
+            )
+        self._estimate_discrimination = bool(estimate_discrimination)
+        super().__init__(n_items, n_factors=n_factors, item_names=item_names)
+
+    @property
+    def estimate_discrimination(self) -> bool:
+        """Whether the common discrimination is a free parameter."""
+        return self._estimate_discrimination
+
+    @property
+    def _tied_parameters(self) -> tuple[str, ...]:
+        """Per-item parameters that estimation keeps equal across items."""
+        return ("discrimination",) if self._estimate_discrimination else ()
 
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items)
@@ -767,8 +826,43 @@ class OneParameterLogistic(TwoParameterLogistic):
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
-        masks["discrimination"] = np.zeros_like(self.discrimination, dtype=np.bool_)
+        masks["discrimination"] = np.full(
+            self.discrimination.shape, self._estimate_discrimination, dtype=np.bool_
+        )
         return self._apply_free_parameter_restrictions(masks)
+
+    @property
+    def n_parameters(self) -> int:
+        """Number of free parameters, counting a free common slope once."""
+        masks = self.free_parameter_masks
+        count = sum(int(np.count_nonzero(mask)) for mask in masks.values())
+        return count - max(int(np.count_nonzero(masks["discrimination"])) - 1, 0)
+
+    def set_free_parameter_masks(
+        self, masks: Mapping[str, NDArray[np.bool_]] | None
+    ) -> Self:
+        """Restrict free coordinates; a common slope is fixed for all items or none.
+
+        Raises
+        ------
+        MirtValidationError
+            If a mask fixes the common discrimination for some items only.
+        """
+        if masks is not None and isinstance(masks, Mapping):
+            mask = masks.get("discrimination")
+            if mask is not None:
+                values = np.asarray(mask)
+                if (
+                    values.dtype == np.bool_
+                    and values.size
+                    and values.any() != values.all()
+                ):
+                    raise MirtValidationError(
+                        "the common 1PL discrimination is free or fixed for every "
+                        "item together",
+                        parameter="masks",
+                    )
+        return super().set_free_parameter_masks(masks)
 
     def _canonical_parameter_values(
         self,
@@ -776,12 +870,12 @@ class OneParameterLogistic(TwoParameterLogistic):
         values: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         canonical = super()._canonical_parameter_values(name, values)
-        if name == "discrimination":
+        if name == "discrimination" and not self._estimate_discrimination:
             canonical.fill(1.0)
         return canonical
 
     def set_parameters(self, **params: NDArray[np.float64]) -> "OneParameterLogistic":
-        if "discrimination" in params:
+        if "discrimination" in params and not self._estimate_discrimination:
             raise ValueError("Cannot set discrimination in 1PL model (fixed to 1)")
         return super().set_parameters(**params)
 
@@ -791,13 +885,24 @@ class OneParameterLogistic(TwoParameterLogistic):
         param_name: str,
         value: float | NDArray[np.float64],
     ) -> None:
-        if param_name == "discrimination":
+        if param_name == "discrimination" and not self._estimate_discrimination:
             self._validate_item_index(item_idx)
             value_array = np.asarray(value, dtype=np.float64)
             if value_array.ndim == 0 and float(value_array) == 1.0:
                 return
             raise ValueError("Cannot set discrimination in 1PL model (fixed to 1)")
         super().set_item_parameter(item_idx, param_name, value)
+
+    def copy(self) -> Self:
+        new_model = self.__class__(
+            n_items=self.n_items,
+            item_names=self.item_names.copy(),
+            estimate_discrimination=self._estimate_discrimination,
+        )
+        new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
+        self._copy_parameter_restrictions_to(new_model)
+        new_model._is_fitted = self._is_fitted
+        return new_model
 
 
 @_register_builtin_model
@@ -900,11 +1005,14 @@ class _UnidimensionalCurveModel(_ParameterizedDichotomousModel):
 
 
 class UnipolarLogLogistic(_UnidimensionalCurveModel):
-    """Unipolar Log-Logistic (ULL) model for dichotomous items.
+    """Unipolar log-logistic (ULL) model of Lucke (2015) for dichotomous items.
 
-    This implementation uses a symmetric, bell-shaped response curve.
-    Endorsement is greatest at the item location and declines in either
-    direction. The maximum response probability is 0.25.
+    The model describes a unipolar trait ``tau > 0``, such as the severity of
+    a symptom that is absent at ``tau = 0``, as R mirt's ``itemtype = "ULL"``
+    does. Every estimator, scorer and simulator in this package integrates
+    against a standard normal density, so the model's ``theta`` is the log
+    trait ``log(tau)``. A standard normal ``theta`` is then the log-normal(0,
+    1) trait density that R mirt uses for this item type.
 
     Parameters
     ----------
@@ -916,22 +1024,52 @@ class UnipolarLogLogistic(_UnidimensionalCurveModel):
     Attributes
     ----------
     discrimination : ndarray
-        Item discrimination parameters (must be positive)
+        Lucke's power parameter ``eta``, which must be positive.
     difficulty : ndarray
-        Item difficulty/location parameters
+        Log trait at which the response probability is 0.5,
+        ``-log(lambda) / eta``.
+    eta, log_lambda : ndarray
+        The item parameters in R mirt's parameterization.
 
     Notes
     -----
-    The ULL probability function is:
+    The ULL probability function of the unipolar trait is
 
-        P(X=1|θ) = exp(a(θ - b)) / (1 + exp(a(θ - b)))^2
+        P(X=1|tau) = lambda * tau^eta / (1 + lambda * tau^eta),
 
-    This is the derivative of the logistic sigmoid with respect to its
-    logit. Its peak is at θ = b, and it approaches zero in both tails.
+    which increases from 0 at ``tau = 0`` towards 1. With ``theta = log(tau)``
+    it is the logistic curve
+
+        P(X=1|theta) = 1 / (1 + exp(-eta * (theta - b))),  b = -log(lambda) / eta,
+
+    whose Fisher information about ``theta`` is ``eta^2 P (1 - P)``. The
+    information about ``tau`` is that value divided by ``tau^2``. To match R
+    mirt parameters, set ``discrimination=eta`` and
+    ``difficulty=-log_lambda / eta``, and evaluate at ``theta = log(tau)``.
+    Marginal maximum likelihood on this scale integrates exactly over the
+    log-normal trait, while R mirt uses a coarse grid on ``(0.01, 36)``, so
+    fitted estimates can differ slightly from R's.
+
+    References
+    ----------
+    Lucke, J. F. (2015). Unipolar item response models. In S. P. Reise &
+        D. A. Revicki (Eds.), Handbook of item response theory modeling:
+        Applications to typical performance assessment (pp. 272-284).
+        Routledge.
     """
 
     model_name = "ULL"
     _requires_positive_discrimination = True
+
+    @property
+    def eta(self) -> NDArray[np.float64]:
+        """Lucke's power parameter, R mirt's ``eta``."""
+        return self._parameters["discrimination"].copy()
+
+    @property
+    def log_lambda(self) -> NDArray[np.float64]:
+        """Log of Lucke's scale parameter, R mirt's ``log_lambda``."""
+        return -self._parameters["discrimination"] * self._parameters["difficulty"]
 
     def _evaluate_block(
         self,

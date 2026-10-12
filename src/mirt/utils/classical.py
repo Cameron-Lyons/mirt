@@ -4,18 +4,28 @@ Provides functions for computing traditional CTT statistics
 from response data.
 """
 
-from dataclasses import dataclass
-from typing import Any
+import math
+import warnings
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt._categorical import item_category_frequencies
-from mirt._classical import _alpha_if_deleted_numpy, _sample_variance
+from mirt._classical import (
+    _alpha_if_deleted_numpy,
+    _complete_case_alpha,
+    _complete_case_alpha_if_deleted,
+    _pairwise_covariance_sums,
+    _sample_variance,
+    _standardized_alpha,
+)
 from mirt.backends.rust._helpers import RUST_AVAILABLE, rust_enabled
 from mirt.backends.rust.polytomous import (
     compute_alpha_if_deleted as _rust_alpha_if_deleted,
 )
+from mirt.exceptions import MirtValidationError
 
 _ITEM_FIT_CHUNK_ELEMENTS = 1_000_000
 _RESPONSE_VALIDATION_CHUNK_ELEMENTS = 1_000_000
@@ -61,21 +71,7 @@ def _clean_response_matrix(
     return values, missing
 
 
-def _cronbach_alpha(responses: NDArray[np.float64]) -> float:
-    n_items = responses.shape[1]
-    if n_items < 2:
-        return 0.0
-
-    item_variances = np.asarray(_sample_variance(responses, axis=0))
-    total_scores = np.nansum(responses, axis=1)
-    total_scores[np.all(np.isnan(responses), axis=1)] = np.nan
-    total_variance = float(_sample_variance(total_scores))
-    if total_variance <= 0.0:
-        return 0.0
-    return float(
-        (n_items / (n_items - 1))
-        * (1.0 - float(np.sum(item_variances)) / total_variance)
-    )
+TraditionalMissing = Literal["complete", "pairwise"]
 
 
 @dataclass
@@ -85,9 +81,11 @@ class TraditionalStats:
     Attributes
     ----------
     difficulty : NDArray[np.float64]
-        Item difficulty (proportion correct). Shape: (n_items,).
+        Mean item score: the proportion correct for dichotomous items.
+        Shape: (n_items,).
     discrimination : NDArray[np.float64]
-        Item-total correlation. Shape: (n_items,).
+        Item-total correlation, or item-rest correlation when corrected.
+        Shape: (n_items,).
     alpha : float
         Cronbach's alpha reliability coefficient.
     n_persons : int
@@ -100,6 +98,18 @@ class TraditionalStats:
         Standard deviation of total scores.
     alpha_if_deleted : NDArray[np.float64]
         Alpha if each item is deleted. Shape: (n_items,).
+    item_sd : NDArray[np.float64]
+        Sample standard deviation of each item's observed responses.
+    std_alpha : float
+        Standardized alpha, from the inter-item correlations.
+    sem_alpha : float
+        Standard error of measurement of the total score,
+        ``sd_score * sqrt(1 - alpha)``.
+    n_complete : int or None
+        Number of respondents who answered every item.
+    missing : {"complete", "pairwise"}
+        Missing-data treatment used for the reliability and total-score
+        statistics.
     """
 
     difficulty: NDArray[np.float64]
@@ -110,6 +120,13 @@ class TraditionalStats:
     mean_score: float
     sd_score: float
     alpha_if_deleted: NDArray[np.float64]
+    item_sd: NDArray[np.float64] = field(
+        default_factory=lambda: np.array([], dtype=np.float64)
+    )
+    std_alpha: float = math.nan
+    sem_alpha: float = math.nan
+    n_complete: int | None = None
+    missing: str = "complete"
 
 
 def _traditional_moments(
@@ -123,7 +140,7 @@ def _traditional_moments(
     NDArray[np.float64],
     NDArray[np.intp],
 ]:
-    """Share binary moments and compute centered item-total correlations."""
+    """Share item moments and compute centered item-total correlations."""
     n_persons, n_items = responses.shape
     rows_per_block = max(1, _TRADITIONAL_CHUNK_ELEMENTS // n_items)
     counts = np.zeros(n_items, dtype=np.intp)
@@ -141,11 +158,6 @@ def _traditional_moments(
         raise ValueError("traditional requires at least two respondents with data")
 
     difficulty = np.divide(item_sums, counts, out=np.zeros(n_items), where=counts > 0)
-    # Binary item moments need no second response pass or squared-response array.
-    item_square_sums = difficulty * (counts - item_sums)
-    item_variances = np.divide(
-        item_square_sums, counts - 1, out=np.zeros(n_items), where=counts > 1
-    )
     total_sums = np.zeros(n_items)
     for start in range(0, n_persons, rows_per_block):
         rows = slice(start, start + rows_per_block)
@@ -159,12 +171,13 @@ def _traditional_moments(
     total_means = np.divide(total_sums, counts, out=total_sums, where=counts > 0)
 
     covariance = np.zeros(n_items)
+    item_square_sums = np.zeros(n_items)
     total_square_sums = np.zeros(n_items)
     for start in range(0, n_persons, rows_per_block):
         rows = slice(start, start + rows_per_block)
         response_block = responses[rows]
-        # Subtract the binary item before centering so constant corrected
-        # totals remain exactly constant, even on very long tests.
+        # Subtract the item before centering so constant corrected totals
+        # remain exactly constant, even on very long tests.
         if corrected:
             total_deviations = total_scores[rows, None] - response_block
             total_deviations -= total_means
@@ -174,8 +187,12 @@ def _traditional_moments(
         np.copyto(item_deviations, 0.0, where=missing[rows])
         np.copyto(total_deviations, 0.0, where=missing[rows])
         covariance += np.einsum("ij,ij->j", item_deviations, total_deviations)
+        item_square_sums += np.einsum("ij,ij->j", item_deviations, item_deviations)
         total_square_sums += np.einsum("ij,ij->j", total_deviations, total_deviations)
 
+    item_variances = np.divide(
+        item_square_sums, counts - 1, out=np.zeros(n_items), where=counts > 1
+    )
     denominator = np.sqrt(item_square_sums * total_square_sums)
     discrimination = np.divide(
         covariance, denominator, out=np.zeros(n_items), where=denominator > 0.0
@@ -185,42 +202,138 @@ def _traditional_moments(
     return difficulty, discrimination, item_variances, total_scores, observed_counts
 
 
+def _pairwise_statistics(
+    responses: NDArray[np.float64],
+    missing: NDArray[np.bool_],
+    corrected: bool,
+) -> tuple[float, float, float, NDArray[np.float64], NDArray[np.float64]]:
+    """Alpha, total-score SD and item-total correlations from pairs.
+
+    Returns alpha, standardized alpha, the total-score standard deviation,
+    alpha if each item is deleted and the item-total correlations.
+
+    Every statistic comes from the pairwise-complete covariance matrix
+    ``C``: ``alpha = k / (k - 1) * (1 - tr(C) / sum(C))``, the total-score
+    variance ``sum(C)`` and the item-(rest) covariances from its row sums.
+    """
+    n_items = responses.shape[1]
+    variances, covariance_sums, correlation_sums = _pairwise_covariance_sums(
+        responses, missing
+    )
+    total_variance = float(np.sum(covariance_sums))
+    variance_sum = float(np.sum(variances))
+    factor = n_items / (n_items - 1)
+    alpha = (
+        factor * (1.0 - variance_sum / total_variance) if total_variance > 0.0 else 0.0
+    )
+    if not np.isfinite(total_variance):
+        alpha = math.nan
+    correlation_total = float(np.sum(correlation_sums))
+    std_alpha = (
+        factor * (1.0 - n_items / correlation_total)
+        if correlation_total > 0.0
+        else (math.nan if np.isnan(correlation_total) else 0.0)
+    )
+
+    remaining = n_items - 1
+    rest_variances = total_variance - 2.0 * covariance_sums + variances
+    alpha_if_deleted = np.zeros(n_items)
+    if remaining >= 2:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            alpha_if_deleted = np.where(
+                rest_variances > 0.0,
+                remaining
+                / (remaining - 1)
+                * (1.0 - (variance_sum - variances) / rest_variances),
+                np.where(np.isnan(rest_variances), np.nan, 0.0),
+            )
+
+    if corrected:
+        item_total = covariance_sums - variances
+        total_variances = rest_variances
+    else:
+        item_total = covariance_sums
+        total_variances = np.full(n_items, total_variance)
+    scale = np.sqrt(np.maximum(variances * total_variances, 0.0))
+    discrimination = np.zeros(n_items)
+    np.divide(item_total, scale, out=discrimination, where=scale > 0.0)
+    discrimination[~np.isfinite(scale)] = np.nan
+    np.clip(discrimination, -1.0, 1.0, out=discrimination)
+    sd_score = math.sqrt(total_variance) if total_variance >= 0.0 else math.nan
+    return alpha, std_alpha, sd_score, alpha_if_deleted, discrimination
+
+
 def traditional(
     responses: ArrayLike,
     use_corrected_correlation: bool = True,
     missing_code: float = -1,
+    missing: TraditionalMissing = "complete",
 ) -> TraditionalStats:
     """Compute classical test theory statistics.
+
+    Reports Cronbach's alpha, alpha if each item is deleted, standardized
+    alpha, the standard error of measurement and item-total correlations
+    for dichotomous and polytomous items, as R's ``mirt::itemstats`` does.
 
     Parameters
     ----------
     responses : array-like
         Response matrix. Shape: (n_persons, n_items).
-        Values must be 0/1 for dichotomous items. Negative values, NaN,
-        and ``missing_code`` are treated as missing.
+        Observed responses must be non-negative integer scores, such as 0/1
+        for dichotomous items or 0..K-1 for polytomous items. Negative
+        values, NaN, and ``missing_code`` are treated as missing.
     use_corrected_correlation : bool
         If True, use corrected item-total correlation
         (excludes the item from the total). Default True.
     missing_code : float, default=-1
         Additional value used to identify missing responses.
+    missing : {"complete", "pairwise"}, default="complete"
+        Treatment of missing responses in the reliability and total-score
+        statistics. ``"complete"`` matches R's ``itemstats``: alpha,
+        standardized alpha and the total-score mean and SD use the
+        respondents who answered every item, alpha if item ``j`` is deleted
+        uses those who answered every other item, and item-total
+        correlations use each item's respondents with their summed
+        observed responses. ``"pairwise"`` derives every statistic from the
+        pairwise-complete item covariance matrix ``C`` (alpha is
+        ``k / (k - 1) * (1 - tr(C) / sum(C))``, the total-score variance is
+        ``sum(C)`` and the mean is the sum of the item means), which uses
+        all responses and suits planned-missing designs. Both give the
+        same results on complete data, and are unbiased when responses are
+        missing completely at random. Items without responses are excluded
+        from both.
 
     Returns
     -------
     TraditionalStats
         Object containing CTT statistics.
 
+    Warns
+    -----
+    RuntimeWarning
+        With ``missing="complete"``, when fewer than two respondents answered
+        every item, so that alpha is undefined (NaN).
+
     Examples
     --------
     >>> stats = traditional(responses)
     >>> print(f"Cronbach's alpha: {stats.alpha:.3f}")
     >>> print(f"Mean difficulty: {np.mean(stats.difficulty):.3f}")
+    >>> likert = traditional(survey_responses, missing="pairwise")
     """
     if not isinstance(use_corrected_correlation, (bool, np.bool_)):
         raise ValueError("use_corrected_correlation must be boolean")
-    responses, missing = _clean_response_matrix(
+    if missing not in ("complete", "pairwise"):
+        raise MirtValidationError(
+            "missing must be 'complete' or 'pairwise'",
+            parameter="missing",
+            value=missing,
+            expected="'complete' or 'pairwise'",
+        )
+    responses, missing_mask = _clean_response_matrix(
         responses,
         missing_code=missing_code,
-        binary=True,
+        binary=False,
     )
     n_persons, n_items = responses.shape
     if n_persons < 2:
@@ -228,35 +341,81 @@ def traditional(
     if n_items < 2:
         raise ValueError("traditional requires at least two items")
     difficulty, discrimination, item_variances, total_scores, observed_counts = (
-        _traditional_moments(responses, missing, use_corrected_correlation)
+        _traditional_moments(responses, missing_mask, use_corrected_correlation)
     )
-    valid_scores = total_scores[observed_counts > 0]
-    score_variance = float(_sample_variance(valid_scores))
-    alpha = (
-        n_items / (n_items - 1) * (1.0 - float(np.sum(item_variances)) / score_variance)
-        if score_variance > 0.0
-        else 0.0
-    )
+    item_sd = np.sqrt(item_variances)
+    item_sd[np.isnan(difficulty)] = np.nan
+    n_complete = int(np.count_nonzero(observed_counts == n_items))
 
-    if RUST_AVAILABLE and rust_enabled():
-        alpha_if_deleted = _rust_alpha_if_deleted(responses)
-    else:
-        alpha_if_deleted = _alpha_if_deleted_numpy(
-            responses,
-            total_scores=total_scores,
-            observed_counts=observed_counts,
-            item_variances=item_variances,
+    if n_complete == n_persons:
+        score_variance = float(_sample_variance(total_scores))
+        alpha = (
+            n_items
+            / (n_items - 1)
+            * (1.0 - float(np.sum(item_variances)) / score_variance)
+            if score_variance > 0.0
+            else 0.0
         )
+        if RUST_AVAILABLE and rust_enabled():
+            alpha_if_deleted = _rust_alpha_if_deleted(responses)
+        else:
+            alpha_if_deleted = _alpha_if_deleted_numpy(
+                responses,
+                total_scores=total_scores,
+                observed_counts=observed_counts,
+                item_variances=item_variances,
+            )
+        std_alpha = _standardized_alpha(responses, item_variances)
+        mean_score = float(np.mean(total_scores))
+        sd_score = math.sqrt(score_variance)
+    else:
+        # R's itemstats drops items without responses before any analysis.
+        answered = ~np.isnan(difficulty)
+        if np.count_nonzero(answered) < 2:
+            raise ValueError("traditional requires at least two items with data")
+        kept_responses = responses[:, answered]
+        kept_missing = missing_mask[:, answered]
+        alpha_if_deleted = np.full(n_items, np.nan)
+        if missing == "pairwise":
+            alpha, std_alpha, sd_score, kept_deleted, kept_discrimination = (
+                _pairwise_statistics(
+                    kept_responses, kept_missing, use_corrected_correlation
+                )
+            )
+            discrimination[answered] = kept_discrimination
+            mean_score = float(np.sum(difficulty[answered]))
+        else:
+            kept_complete = ~np.any(kept_missing, axis=1)
+            alpha, std_alpha, mean_score, sd_score = _complete_case_alpha(
+                kept_responses[kept_complete]
+            )
+            if np.count_nonzero(kept_complete) < 2:
+                warnings.warn(
+                    "fewer than two respondents answered every item, so alpha "
+                    "is undefined with missing='complete'; use "
+                    "missing='pairwise' for designs where respondents skip items",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            kept_deleted = _complete_case_alpha_if_deleted(kept_responses, kept_missing)
+        kept_deleted[np.abs(kept_deleted) <= 4.0 * np.finfo(np.float64).eps] = 0.0
+        alpha_if_deleted[answered] = kept_deleted
 
+    sem_alpha = sd_score * math.sqrt(1.0 - alpha) if alpha <= 1.0 else math.nan
     return TraditionalStats(
         difficulty=difficulty,
         discrimination=discrimination,
         alpha=float(alpha),
         n_persons=n_persons,
         n_items=n_items,
-        mean_score=float(np.mean(valid_scores)),
-        sd_score=float(np.sqrt(score_variance)),
+        mean_score=float(mean_score),
+        sd_score=float(sd_score),
         alpha_if_deleted=alpha_if_deleted,
+        item_sd=item_sd,
+        std_alpha=float(std_alpha),
+        sem_alpha=float(sem_alpha),
+        n_complete=n_complete,
+        missing=missing,
     )
 
 
@@ -332,6 +491,15 @@ def item_fit_chisq(
     Groups examinees by ability and computes chi-square comparing
     observed and expected proportions.
 
+    .. deprecated::
+        ``item_fit_chisq`` is deprecated; use
+        ``mirt.itemfit(result, responses, statistics=["X2"])``, the binned
+        Bock/Yen X2 that groups on ability estimates and takes the
+        estimated item parameters out of its degrees of freedom. The
+        degrees of freedom here are one less than the number of
+        contributing groups, ignoring the estimated parameters, so the
+        p-values are too small for fitted items.
+
     Parameters
     ----------
     responses : array-like
@@ -356,6 +524,13 @@ def item_fit_chisq(
     p_values : NDArray[np.float64]
         P-values for each item.
     """
+    warnings.warn(
+        "item_fit_chisq is deprecated; use mirt.itemfit(result, responses, "
+        'statistics=["X2"]), whose degrees of freedom account for the '
+        "estimated item parameters",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     responses, missing = _clean_response_matrix(
         responses,
         missing_code=missing_code,

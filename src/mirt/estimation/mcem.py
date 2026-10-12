@@ -1,4 +1,4 @@
-"""Monte Carlo EM (MCEM) and Quasi-Monte Carlo EM (QMCEM) estimators.
+"""Monte Carlo EM (MCEM), Quasi-Monte Carlo EM (QMCEM) and stochastic EM.
 
 These estimation methods are useful for high-dimensional IRT models where
 Gauss-Hermite quadrature becomes computationally infeasible. They use
@@ -6,7 +6,8 @@ Monte Carlo integration in the E-step instead of numerical quadrature.
 
 MCEM uses standard pseudo-random sampling, while QMCEM uses low-discrepancy
 sequences (Quasi-Monte Carlo) for more uniform coverage of the integration
-space and faster convergence.
+space and faster convergence. Stochastic EM imputes a few posterior draws
+per person and averages its iterates.
 
 References:
     Wei, G. C., & Tanner, M. A. (1990). A Monte Carlo implementation of the
@@ -20,6 +21,17 @@ References:
     Caffo, B. S., Jank, W., & Jones, G. L. (2005). Ascent-based Monte Carlo
         expectation-maximization. Journal of the Royal Statistical Society:
         Series B, 67(2), 235-251.
+
+    Nielsen, S. F. (2000). The stochastic EM algorithm: Estimation and
+        asymptotic results. Bernoulli, 6(3), 457-489.
+
+    Jones, G. L., Haran, M., Caffo, B. S., & Neath, R. (2006). Fixed-width
+        output analysis for Markov chain Monte Carlo. Journal of the American
+        Statistical Association, 101(476), 1537-1547.
+
+    Louis, T. A. (1982). Finding the observed information matrix when using
+        the EM algorithm. Journal of the Royal Statistical Society: Series B,
+        44(2), 226-233.
 """
 
 from __future__ import annotations
@@ -44,7 +56,10 @@ from mirt._model_defaults import (
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._acceleration import FreeItemParameters
 from mirt.estimation._gaussian_kernel import gaussian_log_kernel
+from mirt.estimation._graded_order import GradedOrder, graded_order
 from mirt.estimation._mc_likelihood import (
+    PriorGrid,
+    prior_grid,
     sampled_log_likelihoods,
     uses_default_sample_likelihood,
 )
@@ -73,6 +88,9 @@ _MAX_QMC_COUNT_ELEMENTS = 1_000_000
 _ASCENT_Z = 0.6744897501960817
 _SAMPLE_GROWTH = 1.5
 _STALLED_ITERATIONS = 3
+# Stochastic EM judges the Monte Carlo error of its average by batch means
+# only once this many iterates have entered it.
+_SEM_MIN_AVERAGED = 50
 
 
 def _positive_integer(value: int, name: str, minimum: int = 1) -> int:
@@ -173,6 +191,61 @@ def _log_likelihood_change(
     return change, float(np.sqrt(np.sum(variance)))
 
 
+def _uses_builtin_batch_likelihood(model: BaseItemModel) -> bool:
+    """Whether ``log_likelihood_batch`` is a built-in reduction of item curves."""
+    return (
+        uses_original_model_hook(model, "log_likelihood_batch")
+        and type(model).log_likelihood_batch in _DEFAULT_QMC_BATCH_LIKELIHOODS
+    )
+
+
+def _ordered_item_step(
+    order: GradedOrder,
+    objective: Callable[
+        [NDArray[np.float64]], float | tuple[float, NDArray[np.float64]]
+    ],
+    bounds: list[tuple[float, float]],
+    start: NDArray[np.float64],
+    proposal: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return an ordered graded M-step that does not raise the item objective.
+
+    As in EM's M-step, an SLSQP proposal whose thresholds come closer than
+    the ordering gap is projected onto the ordered box and kept unless its
+    objective exceeds that of the start, which is projected as well.
+    """
+    lower, upper = np.asarray(bounds, dtype=np.float64).reshape(-1, 2).T
+    projected = None
+    if np.all(np.isfinite(proposal)):
+        projected = order.project(proposal, lower, upper)
+        if np.array_equal(projected, proposal):
+            return projected
+    start = order.project(start, lower, upper)
+    if projected is None:
+        return start
+
+    def value(point: NDArray[np.float64]) -> float:
+        result = objective(point)
+        return float(result[0] if isinstance(result, tuple) else result)
+
+    return projected if value(projected) <= value(start) else start
+
+
+def _batch_means_errors(iterates: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return batch-means Monte Carlo standard errors of the iterate means.
+
+    The latest iterates form about ``sqrt(n)`` consecutive batches of about
+    ``sqrt(n)`` iterates each (Jones et al., 2006); the spread of the batch
+    means estimates the variance of the mean of autocorrelated iterates.
+    """
+    n_iterates = len(iterates)
+    size = math.isqrt(n_iterates)
+    count = n_iterates // size
+    batches = iterates[n_iterates - count * size :].reshape(count, size, -1)
+    variance = size * np.var(batches.mean(axis=1), axis=0, ddof=1)
+    return np.sqrt(variance / n_iterates)
+
+
 class MCEMEstimator(BaseEstimator):
     """Monte Carlo EM estimator for IRT models.
 
@@ -195,8 +268,13 @@ class MCEMEstimator(BaseEstimator):
     seed : int or None
         Random seed for reproducibility.
     importance_sampling : bool
-        Whether to use importance sampling from the prior.
-        Improves efficiency when posterior differs from prior.
+        Whether to weight each person's draws from the prior by their
+        likelihood instead of sampling the person's posterior by Metropolis
+        chains.
+    compute_standard_errors : bool, default=False
+        Whether to estimate standard errors after fitting; see Notes.
+    se_step_size : float, default=1e-5
+        Positive finite differentiation step for standard errors.
     max_samples : int, optional
         Largest number of samples per person that sample-size growth may
         reach. Defaults to ten times ``n_samples``. Draws and their
@@ -209,6 +287,14 @@ class MCEMEstimator(BaseEstimator):
     - Quadrature-based EM is too slow
     - Exact integration is not required
 
+    Every person has draws of their own. With importance sampling they come
+    from the prior and are weighted by the person's likelihood; posterior
+    sampling (``importance_sampling=False``) instead runs ``n_samples``
+    Metropolis chains per person, which continue from one iteration's draws
+    to the next. Draws shared by all persons, as in R mirt's MCEM, would make
+    the M-step cheaper but leave every person with the same Monte Carlo
+    error, which then no longer averages out over persons.
+
     Convergence adapts ascent-based MCEM (Caffo, Jank and Jones, 2005).
     From the second iteration on, the change in marginal log-likelihood made
     by the previous M-step is estimated on the fresh draws, which are shared
@@ -217,12 +303,23 @@ class MCEMEstimator(BaseEstimator):
     is within Monte Carlo error. Unlike the original algorithm, which repeats
     such a step with more draws, the step is kept and the next iteration's
     sample grows by half, up to ``max_samples``. The fit converges once the
-    75% bounds lie within ``(-tol, tol)``. Once ``max_samples`` is reached, three consecutive changes
-    within Monte Carlo error stop the fit early with ``converged=False`` and a
-    warning, because more iterations cannot improve the precision.
-    When ``max_iter`` is reached, the last M-step is judged by the change in
-    the log-likelihood estimate on its own draws. ``sample_size_history``
-    records the sample size of every iteration.
+    75% bounds lie within ``(-tol, tol)``. Once ``max_samples`` is reached,
+    three consecutive changes within Monte Carlo error stop the fit early
+    with ``converged=False`` and a warning, because more iterations cannot
+    improve the precision. When ``max_iter`` is reached, the last M-step is
+    judged by the change in the log-likelihood estimate on its own draws.
+    ``sample_size_history`` records the sample size of every iteration.
+
+    Graded response items keep their thresholds ordered, at least ``1e-6``
+    apart, as in EM's M-step, so a sparse middle category cannot produce
+    negative category probabilities.
+
+    ``FitResult.log_likelihood``, AIC and BIC use the marginal
+    log-likelihood at the final estimates, integrated over the ability prior
+    on EM's default quadrature grid for up to six factors, so they match an
+    EM fit at the same parameters, and on 4,096 scrambled Sobol points for
+    more factors. ``convergence_history`` keeps the Monte Carlo estimates of
+    the iterations.
 
     Built-in logistic, affine, and polytomous items use shared analytic
     gradients. Small item sample blocks are prepared once; larger draws
@@ -232,19 +329,24 @@ class MCEMEstimator(BaseEstimator):
     against unexpanded responses. Custom likelihood and validation overrides
     retain their model-based evaluation path.
 
-    Set ``compute_standard_errors=True`` to estimate approximate diagonal
-    complete-data standard errors with the final draws and weights held fixed.
-    This excludes missing information, parameter covariances, and sampling
-    uncertainty. Built-in polytomous items use exact diagonal curvature;
-    logistic and affine items differentiate prepared gradients.
+    With ``compute_standard_errors=True``, unidimensional built-in 1PL-4PL,
+    GRM, GPCM and PCM fits report the observed information of the marginal
+    likelihood at the estimates (Louis, 1982), integrated on the grid above,
+    as ``se_method="oakes"`` with the covariance in ``FitResult.vcov``; they
+    match EM's default standard errors. Other models report approximate
+    diagonal complete-data standard errors with the final draws and weights
+    held fixed (``se_method="complete_data"``). These exclude missing
+    information, parameter covariances, and sampling uncertainty, so they
+    understate the uncertainty. Built-in polytomous items use exact diagonal
+    curvature; logistic and affine items differentiate prepared gradients.
     ``se_step_size`` controls finite differences (default 1e-5) and does not
     affect exact polytomous curvature.
     Standard errors remain disabled by default to preserve sampling costs.
     """
 
     _minimum_samples = 50
-    # QMCEM's shared grid makes its iterations deterministic, and stochastic EM
-    # keeps a fixed number of chains, so both use the plain change rule.
+    # QMCEM's shared grid makes its iterations deterministic, so it uses the
+    # plain change rule; stochastic EM averages its iterates instead.
     _adaptive_sample_size = True
 
     def __init__(
@@ -284,6 +386,9 @@ class MCEMEstimator(BaseEstimator):
             raise ValueError("se_step_size must be a finite positive number")
         self.se_step_size: float = float(se_step_size)
         self._rng: np.random.Generator | None = None
+        # Final posterior draws of the last E-step, where its Metropolis
+        # chains continue.
+        self._chain_state: NDArray[np.float64] | None = None
 
     @property
     def sample_size_history(self) -> list[int]:
@@ -295,6 +400,10 @@ class MCEMEstimator(BaseEstimator):
         if self._rng is None:
             raise RuntimeError("the estimator random generator is not initialized")
         return self._rng
+
+    def _start_draws(self) -> None:
+        """Forget draws carried over from an earlier fit."""
+        self._chain_state = None
 
     def fit(
         self,
@@ -335,118 +444,145 @@ class MCEMEstimator(BaseEstimator):
         from mirt.results.fit_result import FitResult
 
         start = _validate_start(start)
-        responses = self._validate_responses(responses, model.n_items)
+        responses = self._validate_responses(responses, model.n_items, model)
         self._check_shared_parameters(model)
         n_persons = responses.shape[0]
         n_factors = model.n_factors
 
         self._rng = np.random.default_rng(self.seed)
+        self._start_draws()
 
         prior_mean, cholesky = _validated_prior(prior_mean, prior_cov, n_factors)
 
         _apply_starting_values(model, start)
 
-        adaptive = self._adaptive_sample_size
-        free_parameters = FreeItemParameters(model) if adaptive else None
-        configured_samples = next_samples = self.n_samples
+        configured_samples = self.n_samples
         self._convergence_history = []
         self._sample_size_history = []
-        prev_ll = -np.inf
-        previous: NDArray[np.float64] | None = None
-        converged = False
-        stalled = 0
 
         try:
-            for iteration in range(self.max_iter):
-                self.n_samples = next_samples
-                theta_samples, weights, current_ll, sample_ll = (
-                    self._e_step_and_marginal_ll(
-                        model, responses, prior_mean, cholesky, n_factors
-                    )
-                )
-                self._convergence_history.append(current_ll)
-                self._sample_size_history.append(self.n_samples)
-
-                self._log_iteration(iteration, current_ll)
-
-                if free_parameters is None:
-                    converged = self._check_convergence(prev_ll, current_ll)
-                elif previous is not None:
-                    change, error = self._iterate_change(
-                        model,
-                        responses,
-                        theta_samples,
-                        weights,
-                        free_parameters,
-                        previous,
-                        current_values=sample_ll,
-                    )
-                    converged = self._monte_carlo_converged(change, error)
-                    if change - _ASCENT_Z * error > 0.0:
-                        stalled = 0
-                    elif self.n_samples < self.max_samples:
-                        next_samples = min(
-                            math.ceil(_SAMPLE_GROWTH * self.n_samples),
-                            self.max_samples,
-                        )
-                    else:
-                        stalled += 1
-                # The draws' likelihoods only serve the change estimate.
-                del sample_ll
-
-                if converged:
-                    if self.verbose:
-                        print(f"Converged at iteration {iteration}")
-                    break
-                if stalled >= _STALLED_ITERATIONS:
-                    warnings.warn(
-                        "MCEM stopped before convergence: log-likelihood changes "
-                        f"stayed within Monte Carlo error at max_samples="
-                        f"{self.max_samples}. Increase max_samples or tol.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    break
-
-                prev_ll = current_ll
-                if free_parameters is not None:
-                    previous = free_parameters.get(model)
-
-                self._m_step_mc(model, responses, theta_samples, weights)
-                if iteration + 1 < self.max_iter:
-                    # Release the previous draw before allocating its replacement.
-                    del theta_samples, weights
-            else:
-                current_ll, weights = self._refresh_mc_state(
-                    model, responses, theta_samples, weights
-                )
-                self._convergence_history.append(current_ll)
-                # Both estimates use the last draw, so they share its noise.
-                converged = self._check_convergence(prev_ll, current_ll)
-
+            n_iterations, converged, theta_samples, weights = self._run_iterations(
+                model, responses, prior_mean, cholesky, n_factors
+            )
             model._is_fitted = True
 
-            standard_errors = self._compute_standard_errors_mc(
-                model, responses, theta_samples, weights
+            grid = prior_grid(prior_mean, cholesky, self._random_generator())
+            standard_errors, se_method, covariance = self._fit_standard_errors(
+                model, responses, theta_samples, weights, grid
             )
+            del theta_samples, weights
+            log_likelihood = self._marginal_log_likelihood(model, responses, grid)
         finally:
             self.n_samples = configured_samples
+            self._chain_state = None
 
         n_params = model.n_parameters
-        aic = self._compute_aic(current_ll, n_params)
-        bic = self._compute_bic(current_ll, n_params, n_persons)
+        aic = self._compute_aic(log_likelihood, n_params)
+        bic = self._compute_bic(log_likelihood, n_params, n_persons)
 
         return FitResult(
             model=model,
-            log_likelihood=current_ll,
-            n_iterations=iteration + 1,
+            log_likelihood=log_likelihood,
+            n_iterations=n_iterations,
             converged=converged,
             standard_errors=standard_errors,
             aic=aic,
             bic=bic,
             n_observations=n_persons,
             n_parameters=n_params,
+            se_method=se_method,
+            vcov=covariance,
         )
+
+    def _run_iterations(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        cholesky: NDArray[np.float64],
+        n_factors: int,
+    ) -> tuple[int, bool, NDArray[np.float64], NDArray[np.float64]]:
+        """Run the EM iterations and leave the estimates in ``model``.
+
+        Returns the number of iterations, whether the fit converged, and the
+        final draws and weights at the estimates for standard errors.
+        """
+        adaptive = self._adaptive_sample_size
+        free_parameters = FreeItemParameters(model) if adaptive else None
+        next_samples = self.n_samples
+        prev_ll = -np.inf
+        previous: NDArray[np.float64] | None = None
+        converged = False
+        stalled = 0
+
+        for iteration in range(self.max_iter):
+            self.n_samples = next_samples
+            theta_samples, weights, current_ll, sample_ll = (
+                self._e_step_and_marginal_ll(
+                    model, responses, prior_mean, cholesky, n_factors
+                )
+            )
+            self._convergence_history.append(current_ll)
+            self._sample_size_history.append(self.n_samples)
+
+            self._log_iteration(iteration, current_ll)
+
+            if free_parameters is None:
+                converged = self._check_convergence(prev_ll, current_ll)
+            elif previous is not None:
+                change, error = self._iterate_change(
+                    model,
+                    responses,
+                    theta_samples,
+                    weights,
+                    free_parameters,
+                    previous,
+                    current_values=sample_ll,
+                )
+                converged = self._monte_carlo_converged(change, error)
+                if change - _ASCENT_Z * error > 0.0:
+                    stalled = 0
+                elif self.n_samples < self.max_samples:
+                    next_samples = min(
+                        math.ceil(_SAMPLE_GROWTH * self.n_samples),
+                        self.max_samples,
+                    )
+                else:
+                    stalled += 1
+            # The draws' likelihoods only serve the change estimate.
+            del sample_ll
+
+            if converged:
+                if self.verbose:
+                    print(f"Converged at iteration {iteration}")
+                break
+            if stalled >= _STALLED_ITERATIONS:
+                warnings.warn(
+                    "MCEM stopped before convergence: log-likelihood changes "
+                    f"stayed within Monte Carlo error at max_samples="
+                    f"{self.max_samples}. Increase max_samples or tol.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                break
+
+            prev_ll = current_ll
+            if free_parameters is not None:
+                previous = free_parameters.get(model)
+
+            self._m_step_mc(model, responses, theta_samples, weights)
+            if iteration + 1 < self.max_iter:
+                # Release the previous draw before allocating its replacement.
+                del theta_samples, weights
+        else:
+            current_ll, weights = self._refresh_mc_state(
+                model, responses, theta_samples, weights
+            )
+            self._convergence_history.append(current_ll)
+            # Both estimates use the last draw, so they share its noise.
+            converged = self._check_convergence(prev_ll, current_ll)
+
+        return iteration + 1, converged, theta_samples, weights
 
     def _iterate_change(
         self,
@@ -508,12 +644,30 @@ class MCEMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         theta_samples: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Evaluate person-specific samples in memory-bounded batches."""
+        """Evaluate person-specific samples in memory-bounded batches.
+
+        Draws shared by all persons are evaluated once by the built-in
+        ``log_likelihood_batch`` when it reduces the default likelihood.
+        """
         n_persons = responses.shape[0]
         expected_shape = (n_persons, self.n_samples, model.n_factors)
         samples = np.asarray(theta_samples)
         if samples.shape != expected_shape:
             raise ValueError(f"theta_samples must have shape {expected_shape}")
+        if (
+            n_persons > 0
+            and samples.strides[0] == 0
+            and uses_default_sample_likelihood(model)
+            and _uses_builtin_batch_likelihood(model)
+        ):
+            grid = np.asarray(samples[0], dtype=np.float64)
+            if not np.all(np.isfinite(grid)):
+                raise ValueError("theta_samples must contain only finite values")
+            values = self._validated_log_likelihoods(
+                model.log_likelihood_batch(responses, grid), expected_shape[:2]
+            )
+            # The MC sampler owns its output and may update accepted cells in place.
+            return np.array(values, dtype=np.float64, copy=True)
         prepared = sampled_log_likelihoods(model, responses, samples)
         if prepared is not None:
             return prepared
@@ -585,13 +739,29 @@ class MCEMEstimator(BaseEstimator):
         cholesky: NDArray[np.float64],
         n_factors: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        """Return posterior draws, weights, and their final likelihood values."""
+        """Return posterior draws, weights, and their final likelihood values.
+
+        The chains continue from the previous E-step's draws of the same
+        persons, reused in place, so that they track the posterior as the
+        parameters move instead of restarting at the prior. Chains added by
+        sample-size growth start at copies of existing ones.
+        """
         n_persons = responses.shape[0]
         rng = self._random_generator()
-        standard_normal = rng.standard_normal((n_persons, self.n_samples, n_factors))
-        current = np.einsum("ij,...j->...i", cholesky, standard_normal)
-        current += prior_mean
-        del standard_normal
+        state, self._chain_state = self._chain_state, None
+        if state is not None and state.shape[::2] == (n_persons, n_factors):
+            current = state
+            if state.shape[1] != self.n_samples:
+                current = state[:, np.arange(self.n_samples) % state.shape[1]]
+            del state
+        else:
+            del state
+            standard_normal = rng.standard_normal(
+                (n_persons, self.n_samples, n_factors)
+            )
+            current = np.einsum("ij,...j->...i", cholesky, standard_normal)
+            current += prior_mean
+            del standard_normal
         expected_shape = (n_persons, self.n_samples)
         # Custom callbacks may return cached views or read-only buffers, or
         # share scratch between likelihood and prior evaluation.
@@ -649,6 +819,7 @@ class MCEMEstimator(BaseEstimator):
             1.0 / self.n_samples,
             dtype=np.float64,
         )
+        self._chain_state = current
         return current, weights, current_ll
 
     def _e_step_mc(
@@ -714,11 +885,7 @@ class MCEMEstimator(BaseEstimator):
             and uses_default_sample_likelihood(model)
             and (
                 type(self) is not QMCEMEstimator
-                or (
-                    uses_original_model_hook(model, "log_likelihood_batch")
-                    and type(model).log_likelihood_batch
-                    in _DEFAULT_QMC_BATCH_LIKELIHOODS
-                )
+                or _uses_builtin_batch_likelihood(model)
             )
             and MCEMEstimator._sample_log_likelihoods is _DEFAULT_MC_SAMPLE_LIKELIHOODS
             and all(
@@ -947,21 +1114,30 @@ class MCEMEstimator(BaseEstimator):
         *,
         analytic: bool = False,
     ) -> None:
-        """Install a finite optimizer result, restoring the item after failures."""
+        """Install a finite optimizer result, restoring the item after failures.
+
+        Graded thresholds stay ordered. When the box-constrained L-BFGS-B
+        result brings adjacent free thresholds closer than the ordering gap,
+        or across each other, the item is solved again as in EM: SLSQP keeps
+        them the gap apart, and its result is projected onto the ordered box
+        when it misses the gap.
+        """
         installed = False
-        try:
+        options = {
+            "maxiter": 50,
+            # Loose relative-loss convergence leaves GRM slopes
+            # unstable; the next E-step magnifies those differences.
+            "ftol": 1e-10 if type(model) is GradedResponseModel else 1e-6,
+        }
+
+        def solve(start: NDArray[np.float64], **kwargs: object) -> NDArray[np.float64]:
             result = minimize(
                 objective,
-                x0=current_params,
-                method="L-BFGS-B",
+                x0=start,
                 jac=analytic,
                 bounds=bounds,
-                options={
-                    "maxiter": 50,
-                    # Loose relative-loss convergence leaves GRM slopes
-                    # unstable; the next E-step magnifies those differences.
-                    "ftol": 1e-10 if type(model) is GradedResponseModel else 1e-6,
-                },
+                options=options,
+                **kwargs,
             )
             candidate = np.asarray(result.x, dtype=np.float64)
             if (
@@ -970,6 +1146,24 @@ class MCEMEstimator(BaseEstimator):
                 or not np.isfinite(result.fun)
             ):
                 raise RuntimeError("item optimization returned invalid parameters")
+            return candidate
+
+        try:
+            candidate = solve(current_params, method="L-BFGS-B")
+            order = graded_order(model, item_idx, current_params.size)
+            if order is not None and not order.satisfied(candidate):
+                lower, upper = np.asarray(bounds, dtype=np.float64).reshape(-1, 2).T
+                candidate = _ordered_item_step(
+                    order,
+                    objective,
+                    bounds,
+                    current_params,
+                    solve(
+                        order.project(current_params, lower, upper),
+                        method="SLSQP",
+                        constraints=(order.constraint,),
+                    ),
+                )
             self._set_item_params(model, item_idx, candidate)
             installed = True
         finally:
@@ -1002,6 +1196,93 @@ class MCEMEstimator(BaseEstimator):
 
         return standard_errors
 
+    def _fit_standard_errors(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        theta_samples: NDArray[np.float64],
+        weights: NDArray[np.float64],
+        grid: PriorGrid,
+    ) -> tuple[dict[str, NDArray[np.float64]], str | None, NDArray[np.float64] | None]:
+        """Return standard errors, their method and the parameter covariance.
+
+        Models with exact item derivatives, whose likelihood the estimator
+        evaluates unchanged, use the observed information of the marginal
+        likelihood on ``grid``, as EM does by default. Others use diagonal
+        complete-data curvature on the final draws.
+        """
+        from mirt.estimation._louis_information import has_analytic_item_derivatives
+
+        if not self.compute_standard_errors:
+            placeholders = self._compute_standard_errors_mc(
+                model, responses, theta_samples, weights
+            )
+            return placeholders, None, None
+        if not (
+            has_analytic_item_derivatives(model)
+            and self._uses_default_sampling_methods(model)
+            and self._uses_default_item_methods()
+        ):
+            errors = self._compute_standard_errors_mc(
+                model, responses, theta_samples, weights
+            )
+            return errors, "complete_data", None
+
+        from mirt.estimation._patterns import (
+            compress_responses,
+            supports_pattern_compression,
+        )
+        from mirt.estimation.base import _parameter_bounds
+        from mirt.estimation.standard_errors import estimate_covariance
+
+        frequencies = None
+        if supports_pattern_compression(model):
+            responses, frequencies = compress_responses(responses)
+        estimate = estimate_covariance(
+            model,
+            responses,
+            grid,
+            grid.weights,
+            "oakes",
+            frequencies=frequencies,
+            h=self.se_step_size,
+            bounds=lambda name: _parameter_bounds(model, name),
+        )
+        return estimate.standard_errors, "oakes", estimate.covariance
+
+    def _marginal_log_likelihood(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        grid: PriorGrid,
+    ) -> float:
+        """Integrate the fitted likelihood over the ability prior on ``grid``.
+
+        Persons are evaluated in bounded blocks through the estimator's sample
+        likelihood, so custom likelihood hooks remain authoritative.
+        """
+        nodes = grid.nodes
+        n_nodes = len(nodes)
+        log_weights = np.log(grid.weights)
+        block = max(1, _MAX_LIKELIHOOD_ELEMENTS // n_nodes)
+        configured = self.n_samples
+        self.n_samples = n_nodes
+        total = 0.0
+        try:
+            for start in range(0, responses.shape[0], block):
+                rows = responses[start : start + block]
+                shape = (len(rows), n_nodes)
+                values = self._validated_log_likelihoods(
+                    self._sample_log_likelihoods(
+                        model, rows, np.broadcast_to(nodes, (*shape, nodes.shape[1]))
+                    ),
+                    shape,
+                )
+                total += float(np.sum(logsumexp(values + log_weights, axis=1)))
+        finally:
+            self.n_samples = configured
+        return total
+
     @staticmethod
     def _uses_default_information_model(model: BaseItemModel) -> bool:
         """Keep changed public model curves and parameter hooks authoritative."""
@@ -1018,19 +1299,22 @@ class QMCEMEstimator(MCEMEstimator):
     Parameters
     ----------
     n_samples : int
-        Number of QMC samples per person per iteration.
+        Number of QMC points, shared by all persons.
     max_iter : int
         Maximum number of EM iterations.
     tol : float
-        Convergence tolerance.
+        Convergence tolerance for the change in the log-likelihood estimate
+        between iterations.
     verbose : bool
         Whether to print progress.
     seed : int or None
-        Random seed for scrambling.
+        Random seed for scrambling. Without one, the scramble is drawn once
+        per fit from fresh entropy.
     sequence : str
         Type of low-discrepancy sequence: "sobol" or "halton".
     compute_standard_errors : bool
-        Estimate approximate diagonal complete-data standard errors. Default False.
+        Estimate standard errors after fitting, as for
+        :class:`MCEMEstimator`. Default False.
     se_step_size : float
         Positive finite differentiation step for standard errors. Default 1e-5.
 
@@ -1038,10 +1322,13 @@ class QMCEMEstimator(MCEMEstimator):
     -----
     QMCEM typically requires fewer samples than MCEM for the same accuracy
     because the quasi-random points fill the space more uniformly.
+    Every iteration of a fit uses the same scrambled grid, so the iterations
+    are deterministic and the log-likelihood estimate converges like EM's.
     Its shared ability grid also allows the M-step to aggregate expected
     response counts once, instead of evaluating each respondent's samples
     during every optimizer trial. Built-in logistic, affine, and polytomous
-    models use analytic gradients.
+    models use analytic gradients. The reported log-likelihood, threshold
+    ordering and standard errors are those of :class:`MCEMEstimator`.
 
     References
     ----------
@@ -1077,6 +1364,23 @@ class QMCEMEstimator(MCEMEstimator):
             raise ValueError("sequence must be 'sobol' or 'halton'")
 
         self.sequence = sequence
+        # Scramble seed of the current fit when ``seed`` is None.
+        self._grid_seed: int | None = None
+
+    def _start_draws(self) -> None:
+        """Forget draws and the grid scramble of an earlier fit."""
+        super()._start_draws()
+        self._grid_seed = None
+
+    def _scramble_seed(self) -> int:
+        """Return the scramble seed shared by every iteration of a fit."""
+        if self.seed is not None:
+            return self.seed
+        if self._grid_seed is None:
+            self._grid_seed = int(
+                self._random_generator().integers(np.iinfo(np.int64).max)
+            )
+        return self._grid_seed
 
     def _e_step_mc(
         self,
@@ -1107,13 +1411,14 @@ class QMCEMEstimator(MCEMEstimator):
     ]:
         """Return shared QMC draws, weights, importance normalizers and likelihoods."""
         n_persons = responses.shape[0]
+        seed = self._scramble_seed()
 
         if self.sequence == "sobol":
-            sampler = qmc.Sobol(d=n_factors, scramble=True, seed=self.seed)
+            sampler = qmc.Sobol(d=n_factors, scramble=True, seed=seed)
             exponent = int(np.ceil(np.log2(self.n_samples)))
             uniform_samples = sampler.random_base2(exponent)[: self.n_samples]
         else:
-            sampler = qmc.Halton(d=n_factors, scramble=True, seed=self.seed)
+            sampler = qmc.Halton(d=n_factors, scramble=True, seed=seed)
             uniform_samples = sampler.random(self.n_samples)
 
         from scipy.stats import norm
@@ -1303,38 +1608,58 @@ class QMCEMEstimator(MCEMEstimator):
 class StochasticEMEstimator(MCEMEstimator):
     """Stochastic EM (SEM) estimator for IRT models.
 
-    SEM draws a single sample from the posterior in the E-step instead
-    of computing expectations. This makes each iteration faster but
-    noisier, requiring more iterations to converge.
+    Each E-step imputes abilities by continuing ``n_chains`` Metropolis
+    chains per person under the current parameters, and the M-step maximizes
+    the complete-data likelihood of the imputed abilities. This makes each
+    iteration faster than an expectation over many draws, but the iterates
+    form a Markov chain that fluctuates around the maximum likelihood
+    estimate instead of converging to it. The estimates are therefore the
+    average of the iterates after a burn-in (Nielsen, 2000).
 
     Parameters
     ----------
-    max_iter : int
-        Maximum number of EM iterations.
-    tol : float
-        Convergence tolerance.
+    max_iter : int, default=1000
+        Maximum number of iterations, including the burn-in.
+    tol : float, default=0.01
+        Largest Monte Carlo standard error of the averaged free parameters at
+        which the fit converges; see Notes.
     verbose : bool
         Whether to print progress.
     seed : int or None
         Random seed.
     n_chains : int
-        Number of independent chains to average over.
+        Number of Metropolis chains, and imputed abilities, per person.
     compute_standard_errors : bool
-        Estimate approximate diagonal complete-data standard errors. Default False.
+        Estimate standard errors after fitting, as for
+        :class:`MCEMEstimator`. Default False.
     se_step_size : float
         Positive finite differentiation step for standard errors. Default 1e-5.
+    burnin : int, default=100
+        Number of initial iterations left out of the average.
 
     Notes
     -----
     SEM can be useful for very large datasets where computing full
-    expectations is too expensive. It converges to a neighborhood of
-    the MLE rather than exactly to it.
+    expectations is too expensive. Every iterate after the first ``burnin``
+    enters the average. Once at least 50 have, the fit converges when the
+    batch-means Monte Carlo standard error (Jones et al., 2006) of every
+    averaged free parameter is below ``tol``; more chains or iterations
+    reduce it. A fit that reaches ``max_iter`` first returns the average with
+    ``converged=False`` and a ``RuntimeWarning``, as does one that ends
+    during the burn-in, which returns its last iterate. The log-likelihood
+    estimates of ``convergence_history`` are noisy harmonic means of the
+    imputed draws and play no part in convergence; the reported
+    log-likelihood, threshold ordering and standard errors are those of
+    :class:`MCEMEstimator`.
 
     References
     ----------
     Celeux, G., & Diebolt, J. (1985). The SEM algorithm: a probabilistic
         teacher algorithm derived from the EM algorithm for the mixture
         problem. Computational Statistics Quarterly, 2(1), 73-82.
+
+    Nielsen, S. F. (2000). The stochastic EM algorithm: Estimation and
+        asymptotic results. Bernoulli, 6(3), 457-489.
     """
 
     _minimum_samples = 1
@@ -1343,12 +1668,13 @@ class StochasticEMEstimator(MCEMEstimator):
     def __init__(
         self,
         max_iter: int = 1000,
-        tol: float = 1e-4,
+        tol: float = 1e-2,
         verbose: bool = False,
         seed: int | None = None,
         n_chains: int = 5,
         compute_standard_errors: bool = False,
         se_step_size: float = 1e-5,
+        burnin: int = 100,
     ) -> None:
         super().__init__(
             n_samples=n_chains,
@@ -1361,6 +1687,7 @@ class StochasticEMEstimator(MCEMEstimator):
             se_step_size=se_step_size,
         )
         self.n_chains = self.n_samples
+        self.burnin = _positive_integer(burnin, "burnin", minimum=0)
 
     def _e_step_mc(
         self,
@@ -1378,6 +1705,77 @@ class StochasticEMEstimator(MCEMEstimator):
             L,
             n_factors,
         )
+
+    def _run_iterations(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        cholesky: NDArray[np.float64],
+        n_factors: int,
+    ) -> tuple[int, bool, NDArray[np.float64], NDArray[np.float64]]:
+        """Impute and maximize, then install the average of the iterates.
+
+        Returns the number of iterations, whether the Monte Carlo error of
+        the average reached ``tol``, and the last imputed draws and weights.
+        """
+        free_parameters = FreeItemParameters(model)
+        iterates: list[NDArray[np.float64]] = []
+        converged = False
+        error = np.inf
+        for iteration in range(self.max_iter):
+            theta_samples, weights, current_ll, _ = self._e_step_and_marginal_ll(
+                model, responses, prior_mean, cholesky, n_factors
+            )
+            self._convergence_history.append(current_ll)
+            self._sample_size_history.append(self.n_samples)
+            self._log_iteration(iteration, current_ll)
+
+            self._m_step_mc(model, responses, theta_samples, weights)
+            if iteration >= self.burnin:
+                iterates.append(free_parameters.get(model))
+                if len(iterates) >= _SEM_MIN_AVERAGED:
+                    errors = _batch_means_errors(np.asarray(iterates))
+                    error = float(np.max(errors, initial=0.0))
+                    converged = error < self.tol
+            if converged:
+                if self.verbose:
+                    print(f"Converged at iteration {iteration}")
+                break
+            if iteration + 1 < self.max_iter:
+                # Release the previous draw before allocating its replacement.
+                del theta_samples, weights
+
+        if not iterates:
+            warnings.warn(
+                f"Stochastic EM stopped at max_iter={self.max_iter} within the "
+                f"burn-in of {self.burnin} iterations and returns its last "
+                "iterate. Increase max_iter beyond burnin.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        elif not free_parameters.set(model, np.mean(iterates, axis=0)):
+            converged = False
+            warnings.warn(
+                "Stochastic EM could not install the average of its iterates "
+                "and returns its last iterate.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        elif not converged:
+            detail = (
+                f"the largest Monte Carlo standard error, {error:.3g}, exceeds tol"
+                if np.isfinite(error)
+                else f"fewer than {_SEM_MIN_AVERAGED} iterates were averaged"
+            )
+            warnings.warn(
+                f"Stochastic EM stopped at max_iter={self.max_iter} before "
+                f"convergence: {detail}. Increase max_iter or n_chains, or "
+                "raise tol.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return iteration + 1, converged, theta_samples, weights
 
 
 _DEFAULT_MC_ITEM_METHODS = {

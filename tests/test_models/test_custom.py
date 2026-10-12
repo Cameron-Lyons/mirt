@@ -123,7 +123,8 @@ def test_dichotomous_probability_information_and_scores(
     assert model.model_name == "Logistic"
     assert model.n_parameters == 4
     assert not model.is_polytomous
-    assert model.n_categories == 2
+    assert model.n_categories == [2, 2]
+    assert model.max_categories == 2
     np.testing.assert_allclose(model.probability(theta, 0), logistic(theta, 1.0, 0.0))
     assert model.probability(theta).shape == (3, 2)
     np.testing.assert_allclose(model.icc(theta, 0), model.probability(theta, 0))
@@ -206,6 +207,82 @@ def test_polytomous_probabilities_scores_information_and_likelihood(
         ]
     )
     np.testing.assert_allclose(model.log_likelihood(responses, theta), expected)
+
+
+def partial_credit(theta: np.ndarray, a: float, b1: float, b2: float) -> np.ndarray:
+    first = a * (theta - b1)
+    logits = np.column_stack((np.zeros_like(theta), first, first + a * (theta - b2)))
+    weights = np.exp(logits - logits.max(axis=1, keepdims=True))
+    return weights / weights.sum(axis=1, keepdims=True)
+
+
+def test_polytomous_counts_are_per_item_and_em_fits_custom_items() -> None:
+    # Regression: n_categories was a scalar, so EM's category counts raised
+    # "IndexError: index 2 is out of bounds for axis 0 with size 2".
+    spec = create_item_type(
+        "PartialCredit",
+        partial_credit,
+        par_defaults={"a": 1.0, "b1": -0.5, "b2": 0.5},
+        n_categories=3,
+    )
+    generating = mirt.GeneralizedPartialCredit(6, 3).set_parameters(
+        discrimination=np.linspace(0.8, 1.8, 6),
+        steps=np.column_stack([np.linspace(-1.5, 0.5, 6), np.linspace(-0.5, 1.5, 6)]),
+    )
+    responses = generating.simulate(np.random.default_rng(3).normal(size=1500), seed=2)
+    model = CustomItemModel(6, spec)
+
+    assert model.n_categories == [3] * 6
+    assert model.max_categories == 3
+    estimator = mirt.EMEstimator(compute_standard_errors=False)
+    custom = estimator.fit(model, responses)
+    builtin = estimator.fit(mirt.GeneralizedPartialCredit(6, 3), responses)
+
+    assert custom.log_likelihood == pytest.approx(builtin.log_likelihood, abs=1e-2)
+    np.testing.assert_allclose(
+        custom.model.parameters["a"], builtin.model.discrimination, atol=5e-3
+    )
+    steps = np.column_stack(
+        [custom.model.parameters["b1"], custom.model.parameters["b2"]]
+    )
+    np.testing.assert_allclose(steps, builtin.model.steps, atol=5e-3)
+
+
+@pytest.mark.parametrize("polytomous", [False, True])
+def test_custom_models_simulate_from_their_probabilities(
+    logistic_spec: ItemTypeSpec, ordinal_spec: ItemTypeSpec, polytomous: bool
+) -> None:
+    # Regression: CustomItemModel had no simulate() and simdata rejected it.
+    spec = ordinal_spec if polytomous else logistic_spec
+    model = CustomItemModel(3, spec)
+    if polytomous:
+        model.set_parameters(shift=[-0.5, 0.0, 1.0])
+    else:
+        model.set_parameters(a=[0.8, 1.5, 2.0], b=[-1.0, 0.0, 1.0])
+    theta = np.full(40_000, 0.3)
+
+    responses = model.simulate(theta, seed=5)
+    probabilities = model.probability(theta[:1])[0]
+    if not polytomous:
+        probabilities = np.column_stack((1.0 - probabilities, probabilities))
+    observed = np.stack(
+        [(responses == k).mean(axis=0) for k in range(probabilities.shape[1])], axis=1
+    )
+    error = np.sqrt(probabilities * (1.0 - probabilities) / theta.size)
+
+    assert responses.shape == (theta.size, 3)
+    assert np.all(np.abs(observed - probabilities) < 4.5 * error)
+    np.testing.assert_array_equal(
+        model.simulate(theta[:500], seed=9, chunk_size=7),
+        model.simulate(theta[:500], seed=9),
+    )
+    np.testing.assert_array_equal(
+        mirt.simdata(model=model, theta=theta[:500], seed=9),
+        model.simulate(theta[:500], seed=9),
+    )
+    drawn = mirt.simdata(model=model, n_persons=50, seed=1)
+    assert drawn.shape == (50, 3)
+    assert set(np.unique(drawn)) <= set(range(model.max_categories))
 
 
 @pytest.mark.parametrize("polytomous", [False, True])
