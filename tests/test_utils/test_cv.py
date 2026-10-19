@@ -466,6 +466,39 @@ class TestLogLikelihoodScorer:
         assert score == pytest.approx(result.log_likelihood, rel=1e-9)
         assert plugin > score + 50.0
 
+    def test_reuses_repeated_held_out_response_patterns(self, monkeypatch):
+        responses = mirt.simdata(model="2PL", n_persons=300, n_items=6, seed=4)
+        result = mirt.fit_mirt(responses, model="2PL", n_quadpts=21)
+        unique_rows = responses[:20]
+        repeated = np.tile(unique_rows, (20, 1))
+
+        from mirt.estimation import _patterns
+
+        original = _patterns.compress_responses
+        compression = []
+
+        def recording_compression(values):
+            patterns, frequencies = original(values)
+            compression.append((len(values), len(patterns), frequencies))
+            return patterns, frequencies
+
+        monkeypatch.setattr(
+            _patterns,
+            "compress_responses",
+            recording_compression,
+        )
+        repeated_score = LogLikelihoodScorer()(result, responses, repeated)
+
+        assert len(compression) == 1
+        n_rows, n_patterns, frequencies = compression[0]
+        assert n_rows == 400
+        assert n_patterns <= 20
+        assert frequencies is not None
+        assert np.sum(frequencies) == 400
+
+        reference_score = LogLikelihoodScorer()(result, responses, unique_rows)
+        assert repeated_score == pytest.approx(20.0 * reference_score, rel=1e-12)
+
     def test_held_out_likelihood_prefers_the_true_dimensionality(self):
         # Regression: the plug-in score gave the 2-factor model of
         # unidimensional data about 40 log-likelihood units more per fold.
