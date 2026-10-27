@@ -688,7 +688,9 @@ def _held_out_log_likelihood(
 
     scoring_responses = responses
     frequencies = None
-    if supports_pattern_compression(model):
+    # Grouping accepts signed integers and booleans. Other numeric inputs
+    # retain the model's likelihood and missing-value semantics.
+    if responses.dtype.kind in "bi" and supports_pattern_compression(model):
         scoring_responses, frequencies = compress_responses(responses)
 
     # Persons are scored in blocks that bound the likelihood matrix.

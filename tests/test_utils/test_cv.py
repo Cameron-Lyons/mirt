@@ -580,6 +580,44 @@ class TestCrossValidate:
         return (rng.random(probabilities.shape) < probabilities).astype(int)
 
     @pytest.mark.parametrize("backend", ["auto", "numpy"])
+    @pytest.mark.parametrize("fold_size", [255, 256])
+    @pytest.mark.parametrize(
+        "dtype, missing",
+        [
+            pytest.param(np.float64, False, id="float"),
+            pytest.param(np.float64, True, id="nan"),
+            pytest.param(np.uint8, False, id="uint8"),
+            pytest.param(np.uint64, False, id="uint64"),
+        ],
+    )
+    def test_numeric_dtypes_match_signed_responses(
+        self, backend, fold_size, dtype, missing
+    ):
+        responses = np.random.default_rng(488).integers(0, 2, (2 * fold_size, 6))
+        if missing:
+            responses[::7, 2] = -1
+        converted = responses.astype(dtype)
+        if missing:
+            converted[::7, 2] = np.nan
+        options = {
+            "splitter": KFold(n_splits=2, shuffle=False),
+            "n_quadpts": 7,
+            "max_iter": 2,
+        }
+
+        previous_backend = mirt.get_backend()
+        mirt.set_backend(backend)
+        try:
+            expected = cross_validate("2PL", responses, **options)
+            actual = cross_validate("2PL", converted, **options)
+        finally:
+            mirt.set_backend(previous_backend)
+
+        assert_allclose(
+            actual.scores["log_likelihood"], expected.scores["log_likelihood"]
+        )
+
+    @pytest.mark.parametrize("backend", ["auto", "numpy"])
     @pytest.mark.parametrize("explicit_context", [False, True])
     def test_parallel_matches_sequential_results(self, backend, explicit_context):
         responses = self._small_responses()
