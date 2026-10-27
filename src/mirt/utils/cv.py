@@ -649,16 +649,21 @@ def _held_out_log_likelihood(
 
     Each response pattern's likelihood is integrated over the fit's latent
     population on the fit's own quadrature grid: the grid size, quadrature
-    rule and final latent density recorded in its ``refit_recipe``. A fit
-    without a recipe integrates over its ``latent_mean`` and
-    ``latent_covariance`` (standard normal by default) on the default
-    Gauss-Hermite grid. Scoring the training responses of an EM fit
-    therefore reproduces the fit's own marginal log-likelihood.
+    rule and final latent density recorded in its ``refit_recipe``. Repeated
+    rows of built-in models reuse one likelihood evaluation. A fit without a
+    recipe integrates over its ``latent_mean`` and ``latent_covariance``
+    (standard normal by default) on the default Gauss-Hermite grid. Scoring
+    the training responses of an EM fit therefore reproduces the fit's own
+    marginal log-likelihood.
     """
     from copy import deepcopy
 
     from scipy.special import logsumexp
 
+    from mirt.estimation._patterns import (
+        compress_responses,
+        supports_pattern_compression,
+    )
     from mirt.estimation.latent_density import GaussianDensity
     from mirt.estimation.quadrature import build_quadrature, resolve_quadpts
 
@@ -681,14 +686,25 @@ def _held_out_log_likelihood(
     nodes = quadrature.nodes
     log_mass = density.log_quadrature_mass(nodes, quadrature.weights)
 
+    scoring_responses = responses
+    frequencies = None
+    # Grouping accepts signed integers and booleans. Other numeric inputs
+    # retain the model's likelihood and missing-value semantics.
+    if responses.dtype.kind in "bi" and supports_pattern_compression(model):
+        scoring_responses, frequencies = compress_responses(responses)
+
     # Persons are scored in blocks that bound the likelihood matrix.
     block_size = max(1, _MAX_SCORE_ELEMENTS // nodes.shape[0])
     total = 0.0
-    for start in range(0, responses.shape[0], block_size):
-        conditional = model.log_likelihood_batch(
-            responses[start : start + block_size], nodes
+    for start in range(0, scoring_responses.shape[0], block_size):
+        stop = start + block_size
+        conditional = model.log_likelihood_batch(scoring_responses[start:stop], nodes)
+        marginal = logsumexp(conditional + log_mass[None, :], axis=1)
+        total += float(
+            np.sum(marginal)
+            if frequencies is None
+            else frequencies[start:stop] @ marginal
         )
-        total += float(np.sum(logsumexp(conditional + log_mass[None, :], axis=1)))
     return total
 
 
