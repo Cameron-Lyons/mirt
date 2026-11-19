@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,6 +13,9 @@ from mirt._model_defaults import original_model_hook
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtValidationError
 from mirt.models.base import BaseItemModel, DichotomousItemModel, PolytomousItemModel
+
+if TYPE_CHECKING:
+    from mirt.estimation.quadrature import QuadratureRule
 
 _MAX_MC_LIKELIHOOD_ELEMENTS = 131_072
 # Scrambled Sobol points (2**12) integrating the prior where EM has no
@@ -44,6 +48,8 @@ def prior_grid(
     prior_mean: NDArray[np.float64],
     cholesky: NDArray[np.float64],
     rng: np.random.Generator,
+    *,
+    rule: "QuadratureRule" = "auto",
 ) -> PriorGrid:
     """Return EM's default quadrature grid carried onto a Gaussian prior.
 
@@ -63,6 +69,8 @@ def prior_grid(
         Lower Cholesky factor of the prior covariance.
     rng : numpy.random.Generator
         Scrambles the quasi-Monte Carlo points; unused up to six factors.
+    rule : {"auto", "rectangular", "gauss-hermite"}, default="auto"
+        Quadrature rule for product grids.
 
     Returns
     -------
@@ -84,7 +92,7 @@ def prior_grid(
         standard = ndtri(uniforms)
         weights = np.full(len(standard), 1.0 / len(standard))
     else:
-        quadrature = build_quadrature(n_points, n_factors)
+        quadrature = build_quadrature(n_points, n_factors, rule)
         standard, weights = quadrature.nodes, quadrature.weights
     nodes = standard @ cholesky.T
     nodes += prior_mean

@@ -775,6 +775,10 @@ class FitResult:
                 "latent_covariance must be positive definite",
                 parameter="latent_covariance",
             ) from exc
+        # Cholesky validates the lower triangle. Store that same symmetric
+        # matrix so scoring and simulation can consume estimates with roundoff.
+        for column in range(1, n_factors):
+            matrix[:column, column] = matrix[column, :column]
         self.latent_covariance = matrix
 
     @property

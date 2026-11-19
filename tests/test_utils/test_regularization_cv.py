@@ -16,7 +16,12 @@ from mirt.utils import (
     cv_select_lambda,
     information_criteria_path,
 )
-from mirt.utils.regularization_cv import _compute_test_ll, _score_regularized_result
+from mirt.utils.regularization_cv import _HeldOutFold
+
+
+def _compute_test_ll(result, responses, n_quadpts):
+    grid = GaussHermiteQuadrature(n_quadpts, result.loadings.shape[1])
+    return _HeldOutFold(responses, grid).log_likelihood(result)
 
 
 def _result(
@@ -121,8 +126,9 @@ class TestHeldOutLikelihood:
         responses = np.array([[1, 1], [0, 0], [1, 0], [0, 1]])
         test_ll = _compute_test_ll(result, responses, n_quadpts=5)
 
-        bic_score = _score_regularized_result(result, responses, "bic", 5)
-        ebic_score = _score_regularized_result(result, responses, "ebic", 5)
+        fold = _HeldOutFold(responses, GaussHermiteQuadrature(5, 2))
+        bic_score = fold.score(result, "bic")
+        ebic_score = fold.score(result, "ebic")
 
         expected_bic = -(-2 * test_ll + 4 * np.log(4)) / 4
         # Chen and Chen's term log C(4, 2) for 2 of 4 candidate loadings.
@@ -130,11 +136,38 @@ class TestHeldOutLikelihood:
         assert bic_score == pytest.approx(expected_bic)
         assert ebic_score == pytest.approx(expected_ebic)
 
-    def test_rejects_non_dichotomous_data(self):
-        result = _result(0.1, np.ones((2, 2)))
+    def test_rare_pattern_keeps_quadrature_tail_mass(self):
+        grid = GaussHermiteQuadrature(31, 2)
+        result = _result(0.1, np.full((8, 2), 2.0), intercepts=np.full(8, -18.0))
+        responses = np.ones((1, 8), dtype=int)
+        probabilities = 1 / (
+            1 + np.exp(-(grid.nodes @ result.loadings.T + result.intercepts))
+        )
+        probabilities = np.clip(probabilities, 1e-10, 1 - 1e-10)
+        expected = np.log(grid.weights @ probabilities.prod(axis=1))
 
-        with pytest.raises(MirtDataError, match="dichotomous"):
-            _compute_test_ll(result, np.array([[0, 2]]), n_quadpts=3)
+        assert _HeldOutFold(responses, grid).log_likelihood(result) == pytest.approx(
+            expected
+        )
+        assert _HeldOutFold(-responses, grid).log_likelihood(result) == pytest.approx(
+            0.0, abs=1e-13
+        )
+
+    def test_repeated_patterns_keep_person_counts_in_every_criterion(self):
+        responses = np.repeat([[1, -1], [0, 0], [-1, -1]], [160, 120, 20], axis=0)
+        result = _result(0.1, np.ones((2, 2)))
+        fold = _HeldOutFold(responses, GaussHermiteQuadrature(5, 2))
+        expected = sum(
+            count * _compute_test_ll(result, responses[row : row + 1], 5)
+            for count, row in [(160, 0), (120, 160), (20, 280)]
+        )
+        n = len(responses)
+        bic_score = (2 * expected - result.n_parameters * np.log(n)) / n
+
+        assert len(fold.patterns) == 3
+        assert fold.score(result, "log_likelihood") == pytest.approx(expected / n)
+        assert fold.score(result, "bic") == pytest.approx(bic_score)
+        assert fold.score(result, "ebic") == pytest.approx(bic_score)
 
 
 class TestCrossValidatedSelection:
@@ -177,6 +210,37 @@ class TestCrossValidatedSelection:
         np.testing.assert_allclose(
             parallel.best_result.intercepts, serial.best_result.intercepts
         )
+
+    def test_builds_one_grid_and_groups_test_responses_once_per_fold(
+        self, concordant_responses, monkeypatch
+    ):
+        built_grids = []
+        grouped_rows = []
+        compute_grid = GaussHermiteQuadrature._compute_quadrature
+        compress = regularization_cv.compress_responses
+
+        def record_grid(self):
+            built_grids.append(self)
+            return compute_grid(self)
+
+        def record_grouping(responses):
+            grouped_rows.append(len(responses))
+            return compress(responses)
+
+        monkeypatch.setattr(GaussHermiteQuadrature, "_compute_quadrature", record_grid)
+        monkeypatch.setattr(regularization_cv, "compress_responses", record_grouping)
+
+        cv_select_lambda(
+            concordant_responses,
+            lambda_values=[0.25, 0.1, 0.5],
+            n_folds=2,
+            n_quadpts=3,
+            max_iter=1,
+            seed=4,
+        )
+
+        assert len(built_grids) == 3  # One per fold and one for the full-data path.
+        assert grouped_rows == [12, 12]
 
     def test_selects_loading_structure_from_held_out_data(
         self, concordant_responses, monkeypatch
@@ -249,13 +313,13 @@ class TestCrossValidatedSelection:
             fit_lambdas.append(lambda_val)
             return _result(lambda_val, np.ones((2, 2)))
 
-        def fake_score(result, test_data, criterion, n_quadpts):
+        def fake_score(self, result, criterion):
             return next(score_sequences[result.lambda_val])
 
         monkeypatch.setattr(RegularizedMIRTEstimator, "fit", fake_fit)
         monkeypatch.setattr(
-            regularization_cv,
-            "_score_regularized_result",
+            _HeldOutFold,
+            "score",
             fake_score,
         )
 

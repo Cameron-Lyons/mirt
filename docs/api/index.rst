@@ -198,6 +198,31 @@ Scoring
 Cross-validation
 ----------------
 
+Use the same splits when comparing models. The default score sums the
+held-out persons' marginal log-likelihoods under each training fit.
+For a mixed-format test, supply one model family per item. Declaring the
+category counts keeps the instrument's scale explicit even when a rare
+category is absent from a fold. Each training fold still needs observations
+in at least two categories per item to estimate its parameters.
+
+.. code-block:: python
+
+   from mirt import KFold, cross_validate
+
+   folds = KFold(n_splits=5, random_state=42)
+   cv = cross_validate(
+       ["2PL", "2PL", "GRM", "GPCM"],
+       responses,
+       n_categories=[2, 2, 5, 4],
+       splitter=folds,
+   )
+   print(cv.scores["log_likelihood"])
+
+Pass ``return_models=True`` to inspect each fold's item parameters and
+standard errors. For simulated data, ``AbilityRMSEScorer(true_theta)``
+accepts one true ability per person or a person-by-factor matrix and
+reports negative RMSE across the matched entries.
+
 .. autosummary::
    :toctree: generated
    :nosignatures:
@@ -208,6 +233,9 @@ Cross-validation
    GroupKFold
    StratifiedGroupKFold
    LeaveOneOut
+   utils.LogLikelihoodScorer
+   utils.PluginLogLikelihoodScorer
+   utils.AbilityRMSEScorer
 
 Regularization selection
 ------------------------

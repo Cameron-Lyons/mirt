@@ -17,6 +17,7 @@ from scipy.optimize import brentq
 
 from mirt._core import sigmoid
 from mirt._correlation import pairwise_correlations
+from mirt._model_defaults import record_model_base as _record_model_base
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel
@@ -303,6 +304,7 @@ def _pairwise_complete_correlations(
     )
 
 
+@_record_model_base
 class TestletModel(DichotomousItemModel):
     """Two-tier testlet model for handling local item dependence.
 
@@ -1081,6 +1083,7 @@ def create_testlet_structure(
     return membership
 
 
+@_record_model_base
 class BifactorTestletModel(TestletModel):
     """Bifactor testlet model with explicit general + testlet factors.
 
@@ -1292,6 +1295,7 @@ class BifactorTestletModel(TestletModel):
         return new_model
 
 
+@_record_model_base
 class RandomTestletEffectsModel(TestletModel):
     """Random effects approach to testlet dependence.
 

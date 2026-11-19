@@ -41,7 +41,14 @@ def record_model_base(cls: type[_Model]) -> type[_Model]:
         name: vars(cls)[name]
         for name in _KERNEL_HOOKS
         + _LIKELIHOOD_HOOKS
-        + ("information", "item_information_matrix")
+        + (
+            "information",
+            "item_information_matrix",
+            "_testlet_slopes",
+            "_family_loading_mask",
+            "_prepare_theta",
+            "_marginal_components",
+        )
         if name in vars(cls)
     }
     return cls

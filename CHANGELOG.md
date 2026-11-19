@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cross-validation keeps per-item category ranges consistent across folds,
+  preserves named and nullable response columns, and stratifies tied scores
+  when quantile boundaries coincide. Ability RMSE matches people and factors
+  for vector and matrix inputs. EAP-based scorers use the Gaussian prior
+  defined by the fit's latent mean and covariance.
+- Held-out likelihood scoring uses reduced quadrature for standard-normal
+  bifactor and testlet fits. Fits without a refit recipe integrate over the
+  recorded Gaussian population. Beyond six factors they can use the same
+  4,096-point Sobol rule as Monte Carlo EM with a fixed scramble.
+- Regularization selection uses the fitted quadrature weights for rare
+  held-out responses and reuses each fold's grid and repeated patterns
+  across penalties.
 - `EMEstimator(latent_density="ehw")` no longer diverges. Before, the mass ran
   to the top node (mean +7.3) and the log-likelihood fell by 5,220 over 317
   decreasing iterations while the fit reported `converged=True`. Each cycle now

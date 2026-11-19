@@ -704,8 +704,8 @@ class TestCrossValidate:
             fitted_models += 1
             return SimpleNamespace(model=model)
 
-        def fake_fscores(model, test_responses, method):
-            scoring_calls.append((model.fold, method))
+        def fake_fscores(result, test_responses, method):
+            scoring_calls.append((result.model.fold, method))
             theta = np.mean(test_responses, axis=1, keepdims=True)
             return SimpleNamespace(theta=theta)
 

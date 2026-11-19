@@ -39,7 +39,7 @@ from numpy.typing import ArrayLike, NDArray
 from scipy.optimize import minimize
 from scipy.special import expit
 
-from mirt._model_defaults import uses_builtin_model_hooks
+from mirt._model_defaults import uses_builtin_model_hooks, uses_original_model_hook
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._graded_order import THRESHOLD_GAP, GradedOrder, graded_order
@@ -69,6 +69,7 @@ if TYPE_CHECKING:
 _PARAMETERS = ("general_loadings", "specific_loadings", "intercepts")
 # Person-by-node scratch entries for one block of response rows.
 _MAX_BLOCK_ENTRIES = 1 << 22
+_DEFAULT_BIFACTOR_QUADPTS = 21
 # Bounded fallback M-step for items with fixed coordinates or Newton failures.
 _ITEM_MAXITER = 200
 _ITEM_FTOL = 1e-12
@@ -250,31 +251,18 @@ def _row_weights(
     return frequencies[start:stop]
 
 
-def _expected_counts(
-    grid: _Grid,
-    curves: _Curves,
-    context: EMFitContext,
-) -> tuple[float, NDArray[np.float64], NDArray[np.float64]]:
-    """Run an E-step and return the log-likelihood and expected item counts.
-
-    Item ``j`` of specific factor ``s`` receives counts on the ``(Q * Q)``
-    grid of the general factor and factor ``s``.
-    """
-    n_items = curves.probability.shape[1]
-    correct_counts = np.zeros((n_items, grid.design.shape[0]))
-    observed_counts = np.zeros_like(correct_counts)
-    frequencies = context.frequencies
-    log_likelihood = 0.0
-    width = len(grid.groups) + 1
-    for block in _posterior_blocks(grid, curves, context, grid.block_size(width)):
-        weights = _row_weights(frequencies, block.start, block.stop)
-        log_likelihood += float(weights @ block.log_marginal)
-        for factor, items in enumerate(grid.groups):
-            columns = np.hstack((block.correct[:, items], block.observed[:, items]))
-            counts = (columns * weights[:, None]).T @ block.joint(factor)
-            correct_counts[items] += counts[: items.size]
-            observed_counts[items] += counts[items.size :]
-    return log_likelihood, correct_counts, observed_counts
+def _block_log_likelihood(
+    blocks: Iterable[_Block | _GradedBlock], context: EMFitContext
+) -> float:
+    total = 0.0
+    for block in blocks:
+        if context.frequencies is None:
+            total += float(block.log_marginal.sum())
+        else:
+            total += float(
+                context.frequencies[block.start : block.stop] @ block.log_marginal
+            )
+    return total
 
 
 def _bounded_item_update(
@@ -405,7 +393,7 @@ default="auto"
 
     def __init__(
         self,
-        n_quadpts: int = 21,
+        n_quadpts: int = _DEFAULT_BIFACTOR_QUADPTS,
         max_iter: int = 500,
         tol: float = 1e-4,
         verbose: bool = False,
@@ -547,7 +535,9 @@ default="auto"
             previous = current
             problem.m_step(model, grid, *statistics)
         else:
-            current, _ = problem.expected_counts(model, grid, context)
+            current = _block_log_likelihood(
+                problem.posterior_blocks(model, grid, context), context
+            )
             self._convergence_history.append(current)
             converged = self._check_convergence(previous, current)
         if self.verbose and converged:
@@ -608,13 +598,30 @@ class _DichotomousCounts:
     def coefficients(self, model: Any) -> NDArray[np.float64]:
         raise NotImplementedError
 
+    def posterior_blocks(
+        self, model: Any, grid: _Grid, context: EMFitContext
+    ) -> Iterator[_Block]:
+        curves = _Curves.evaluate(grid, self.coefficients(model))
+        return _posterior_blocks(
+            grid, curves, context, grid.block_size(len(grid.groups) + 1)
+        )
+
     def expected_counts(
         self, model: Any, grid: _Grid, context: EMFitContext
     ) -> tuple[float, tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return the log-likelihood and the expected (correct, observed) counts."""
-        curves = _Curves.evaluate(grid, self.coefficients(model))
-        current, correct, observed = _expected_counts(grid, curves, context)
-        return current, (correct, observed)
+        """Return the log-likelihood and item counts on each (general, specific) grid."""
+        correct = np.zeros((model.n_items, grid.design.shape[0]))
+        observed = np.zeros_like(correct)
+        log_likelihood = 0.0
+        for block in self.posterior_blocks(model, grid, context):
+            weights = _row_weights(context.frequencies, block.start, block.stop)
+            log_likelihood += float(weights @ block.log_marginal)
+            for factor, items in enumerate(grid.groups):
+                columns = np.hstack((block.correct[:, items], block.observed[:, items]))
+                counts = (columns * weights[:, None]).T @ block.joint(factor)
+                correct[items] += counts[: items.size]
+                observed[items] += counts[items.size :]
+        return log_likelihood, (correct, observed)
 
 
 class _BifactorProblem(_DichotomousCounts):
@@ -933,6 +940,10 @@ _TESTLET_PARAMETERS = (
 # free coordinates, which the reduced grids compute from the parameters.
 _TESTLET_HOOKS = (
     "probability",
+    "_prepare_theta",
+    "_marginal_components",
+    "_validate_dichotomous_responses",
+    "_ensure_theta_2d",
     "log_likelihood",
     "log_likelihood_batch",
     "set_parameters",
@@ -955,7 +966,7 @@ def _is_testlet_model(model: object) -> bool:
     return (
         type(model) in (TestletModel, BifactorTestletModel, RandomTestletEffectsModel)
         and tuple(getattr(model, "_parameters", ())) == _TESTLET_PARAMETERS
-        and not any(name in vars(model) for name in _TESTLET_HOOKS)
+        and all(uses_original_model_hook(model, name) for name in _TESTLET_HOOKS)
     )
 
 
@@ -1390,26 +1401,6 @@ def _graded_posterior_blocks(
         yield _GradedBlock(start, stop, indicators, log_marginal, general, conditionals)
 
 
-def _graded_expected_counts(
-    grid: _Grid,
-    curves: _GradedCurves,
-    layout: _CategoryLayout,
-    context: EMFitContext,
-) -> tuple[float, NDArray[np.float64]]:
-    """Run an E-step; return the log-likelihood and ``(n_columns, Q * Q)`` counts."""
-    counts = np.zeros((layout.n_columns, grid.design.shape[0]))
-    log_likelihood = 0.0
-    block_size = grid.block_size(len(layout.groups) + 1)
-    for block in _graded_posterior_blocks(grid, curves, layout, context, block_size):
-        weights = _row_weights(context.frequencies, block.start, block.stop)
-        log_likelihood += float(weights @ block.log_marginal)
-        for factor, columns in enumerate(layout.columns):
-            counts[columns] += (
-                block.indicators[:, columns] * weights[:, None]
-            ).T @ block.joint(factor)
-    return log_likelihood, counts
-
-
 @dataclass(frozen=True)
 class _GradedTerms:
     """Expected negative log-likelihood of graded items and its derivatives.
@@ -1820,13 +1811,28 @@ class _GradedBifactorProblem:
     ) -> _Grid:
         return _Grid.build(n_points, model, rule)
 
+    def posterior_blocks(
+        self, model: GradedBifactorModel, grid: _Grid, context: EMFitContext
+    ) -> Iterator[_GradedBlock]:
+        curves = _GradedCurves.evaluate(grid, model, self.layout)
+        return _graded_posterior_blocks(
+            grid, curves, self.layout, context, grid.block_size(len(grid.groups) + 1)
+        )
+
     def expected_counts(
         self, model: GradedBifactorModel, grid: _Grid, context: EMFitContext
     ) -> tuple[float, tuple[NDArray[np.float64]]]:
         """Return the log-likelihood and the expected category counts."""
-        curves = _GradedCurves.evaluate(grid, model, self.layout)
-        current, counts = _graded_expected_counts(grid, curves, self.layout, context)
-        return current, (counts,)
+        counts = np.zeros((self.layout.n_columns, grid.design.shape[0]))
+        log_likelihood = 0.0
+        for block in self.posterior_blocks(model, grid, context):
+            weights = _row_weights(context.frequencies, block.start, block.stop)
+            log_likelihood += float(weights @ block.log_marginal)
+            for factor, columns in enumerate(self.layout.columns):
+                counts[columns] += (
+                    block.indicators[:, columns] * weights[:, None]
+                ).T @ block.joint(factor)
+        return log_likelihood, (counts,)
 
     def _item_problems(
         self, model: GradedBifactorModel
@@ -2056,6 +2062,44 @@ class _GradedBifactorProblem:
         return _Information((information + information.T) / 2.0, score_outer, complete)
 
 
+def reduced_log_likelihood(
+    model: Any,
+    responses: NDArray[np.int_],
+    n_points: int | None,
+    rule: QuadratureRule,
+) -> float | None:
+    """Score an independent standard-normal bifactor fit on its reduced grid.
+
+    Return None for a customized model whose own likelihood must be called.
+    """
+    from mirt.models.testlet import (
+        RandomTestletEffectsModel,
+        _validate_binary_responses,
+    )
+
+    try:
+        problem = _problem_for(model)
+    except MirtModelError:
+        return None
+
+    if isinstance(problem, _GradedBifactorProblem):
+        problem.validate_responses(model, responses)
+        if responses.dtype.kind not in "bi":
+            responses = np.where(responses >= 0, responses, -1).astype(np.intp)
+    elif isinstance(model, RandomTestletEffectsModel):
+        codes, observed = _validate_binary_responses(responses, model.n_items)
+        responses = np.where(observed, codes, -1)
+    else:
+        responses = model._validate_dichotomous_responses(responses)
+    grid = problem.grid(
+        _DEFAULT_BIFACTOR_QUADPTS if n_points is None else n_points, model, rule
+    )
+    with EMFitContext(responses, compress=True) as context:
+        return _block_log_likelihood(
+            problem.posterior_blocks(model, grid, context), context
+        )
+
+
 def _is_graded_bifactor_model(model: object) -> bool:
     """Whether ``model`` is a built-in ``GradedBifactorModel`` with its hooks."""
     from mirt.models.bifactor import GradedBifactorModel
@@ -2066,6 +2110,14 @@ def _is_graded_bifactor_model(model: object) -> bool:
         return isinstance(_problem_for(model), _GradedBifactorProblem)
     except MirtModelError:
         return False
+
+
+def has_standard_normal_moments(
+    n_factors: int, mean: ArrayLike | None, cov: ArrayLike | None
+) -> bool:
+    return (mean is None or np.array_equal(mean, np.zeros(n_factors))) and (
+        cov is None or np.array_equal(cov, np.eye(n_factors))
+    )
 
 
 def reduced_testlet_estimator(
@@ -2098,14 +2150,8 @@ def reduced_testlet_estimator(
     ):
         return None
     n_factors = cast("TestletModel", model).n_factors
-    standard = (
-        prior_mean is None
-        or np.array_equal(np.asarray(prior_mean), np.zeros(n_factors))
-    ) and (
-        prior_cov is None or np.array_equal(np.asarray(prior_cov), np.eye(n_factors))
-    )
     if (
-        not standard
+        not has_standard_normal_moments(n_factors, prior_mean, prior_cov)
         or estimator._latent_density_spec not in (None, "gaussian", "normal")
         or estimator.item_priors is not None
         or estimator.constraints
@@ -2115,7 +2161,9 @@ def reduced_testlet_estimator(
     ):
         return None
     return BifactorEMEstimator(
-        n_quadpts=21 if estimator.n_quadpts is None else estimator.n_quadpts,
+        n_quadpts=_DEFAULT_BIFACTOR_QUADPTS
+        if estimator.n_quadpts is None
+        else estimator.n_quadpts,
         max_iter=estimator.max_iter,
         tol=estimator.tol,
         verbose=estimator.verbose,
@@ -2133,7 +2181,7 @@ def bfactor(
     specific_factors: Sequence[int] | NDArray[np.int_],
     *,
     model: Literal["2PL", "graded", "GRM"] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int = _DEFAULT_BIFACTOR_QUADPTS,
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
