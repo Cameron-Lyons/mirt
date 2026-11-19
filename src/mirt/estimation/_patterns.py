@@ -2,33 +2,50 @@
 
 from __future__ import annotations
 
+from typing import TypeVar
+
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._model_defaults import uses_builtin_model_hooks
 
+_Response = TypeVar("_Response", bound=np.generic)
 
-def compress_responses(
-    responses: NDArray[np.int_],
-) -> tuple[NDArray[np.int_], NDArray[np.float64] | None]:
-    """Group only when a bounded sample predicts substantial repeated work."""
+
+def _group_rows(rows: NDArray[_Response]) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
     from mirt.backends.rust.patterns import response_pattern_indices
 
+    if rows.dtype.kind in "fu":
+        # Use exact byte keys for floats and unsigned integers. Selecting
+        # representatives from the original rows preserves fractions, NaNs
+        # and unsigned values outside the signed integer range.
+        keys = np.ascontiguousarray(rows).view(np.int8).reshape(len(rows), -1)
+    elif rows.dtype.kind == "i" and rows.min(initial=-1) < -1:
+        keys = np.maximum(rows, -1)
+    else:
+        keys = rows
+    first, _, counts = response_pattern_indices(keys)
+    return first, counts
+
+
+def compress_responses(
+    responses: NDArray[_Response],
+) -> tuple[NDArray[_Response], NDArray[np.float64] | None]:
+    """Group only when a bounded sample predicts substantial repeated work."""
     n_persons = responses.shape[0]
     if n_persons < 256:
         return responses, None
     sample = responses[np.linspace(0, n_persons - 1, min(1024, n_persons), dtype=int)]
-    sample = np.where(sample < 0, -1, sample)
-    first, _, _ = response_pattern_indices(sample)
+    first, _ = _group_rows(sample)
     if first.size > sample.shape[0] // 2:
         return responses, None
-    normalized = (
-        responses if np.all(responses >= -1) else np.where(responses < 0, -1, responses)
-    )
-    first, _, counts = response_pattern_indices(normalized)
+    first, counts = _group_rows(responses)
     if first.size > n_persons // 2:
         return responses, None
-    return normalized[first], counts.astype(np.float64)
+    patterns = responses[first]
+    if patterns.dtype.kind == "i":
+        np.maximum(patterns, -1, out=patterns)
+    return patterns, counts.astype(np.float64)
 
 
 def supports_pattern_compression(model: object) -> bool:

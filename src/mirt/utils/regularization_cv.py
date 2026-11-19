@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt._core import sigmoid
+from mirt._logistic import _affine_probability
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._patterns import compress_responses
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.regularized import (
     RegularizedMIRTEstimator,
@@ -126,24 +127,25 @@ def _warm_started_path(
     """
     results: list[RegularizedMIRTResult | None] = [None] * len(lambda_values)
     previous: RegularizedMIRTResult | None = None
-    for index in np.argsort(lambda_values, kind="stable"):
-        try:
-            result = estimator.fit(
-                responses,
-                lambda_val=lambda_values[index],
-                start="default" if previous is None else previous,
-            )
-        except (
-            ValueError,
-            RuntimeError,
-            ArithmeticError,
-            FloatingPointError,
-            np.linalg.LinAlgError,
-        ):
-            if not isolate_failures:
-                raise
-            continue
-        results[index] = previous = result
+    with estimator._prepared(responses):
+        for index in np.argsort(lambda_values, kind="stable"):
+            try:
+                result = estimator.fit(
+                    responses,
+                    lambda_val=lambda_values[index],
+                    start="default" if previous is None else previous,
+                )
+            except (
+                ValueError,
+                RuntimeError,
+                ArithmeticError,
+                FloatingPointError,
+                np.linalg.LinAlgError,
+            ):
+                if not isolate_failures:
+                    raise
+                continue
+            results[index] = previous = result
     return results
 
 
@@ -170,16 +172,13 @@ def _evaluate_regularization_fold(
     fits = _warm_started_path(
         estimator, train_data, task.lambda_values, isolate_failures=True
     )
+    assert estimator._quadrature is not None
+    held_out = _HeldOutFold(test_data, estimator._quadrature)
     for result in fits:
         score = np.nan
         if result is not None:
             try:
-                score = _score_regularized_result(
-                    result,
-                    test_data,
-                    criterion=task.criterion,
-                    n_quadpts=task.n_quadpts,
-                )
+                score = held_out.score(result, task.criterion)
             except (
                 ValueError,
                 RuntimeError,
@@ -405,72 +404,66 @@ def cv_select_lambda(
     )
 
 
-def _compute_test_ll(
-    result: RegularizedMIRTResult,
-    test_data: NDArray[np.int_],
-    n_quadpts: int = 15,
-) -> float:
-    """Compute held-out marginal log-likelihood with vectorized quadrature."""
-    test_data = validate_responses(test_data, n_items=result.loadings.shape[0])
-    observed = test_data[test_data >= 0]
-    if np.any(observed > 1):
-        raise MirtDataError(
-            "regularized MIRT requires dichotomous responses",
-            n_persons=test_data.shape[0],
-            n_items=test_data.shape[1],
+class _HeldOutFold:
+    """Fixed quadrature and validated response patterns for a penalty path."""
+
+    def __init__(
+        self, responses: NDArray[np.int_], grid: GaussHermiteQuadrature
+    ) -> None:
+        self.n_persons = len(responses)
+        self.patterns, self.counts = compress_responses(responses)
+        self.nodes = grid.nodes
+        # The weights integrate over the fitter's standard normal population.
+        # Tiny tail masses can dominate the integral for rare response patterns.
+        with np.errstate(divide="ignore"):
+            self.log_weights = np.log(grid.weights)
+
+    def log_likelihood(self, result: RegularizedMIRTResult) -> float:
+        """Integrate the fitted binary likelihood in bounded node and row blocks."""
+        n_items = self.patterns.shape[1]
+        node_block = max(1, _MAX_SCORE_MATRIX_ELEMENTS // n_items)
+        marginal = np.full(len(self.patterns), -np.inf)
+        for first in range(0, len(self.nodes), node_block):
+            last = min(first + node_block, len(self.nodes))
+            probabilities = _affine_probability(
+                self.nodes[first:last], result.loadings, result.intercepts
+            )
+            np.clip(probabilities, PROB_EPSILON, 1 - PROB_EPSILON, out=probabilities)
+            log_correct = np.log(probabilities)
+            np.negative(probabilities, out=probabilities)
+            log_incorrect = np.log1p(probabilities, out=probabilities)
+            row_block = max(1, _MAX_SCORE_MATRIX_ELEMENTS // max(n_items, last - first))
+            for start in range(0, len(self.patterns), row_block):
+                stop = start + row_block
+                block = self.patterns[start:stop]
+                joint = (block == 1) @ log_correct.T
+                joint += (block == 0) @ log_incorrect.T
+                joint += self.log_weights[first:last]
+                partial = logsumexp(joint, axis=1)
+                if first == 0:
+                    marginal[start:stop] = partial
+                else:
+                    np.logaddexp(
+                        marginal[start:stop], partial, out=marginal[start:stop]
+                    )
+
+        if self.counts is None:
+            return float(marginal.sum())
+        return float(self.counts @ marginal)
+
+    def score(self, result: RegularizedMIRTResult, criterion: CVCriterion) -> float:
+        test_ll = self.log_likelihood(result)
+        if criterion == "log_likelihood":
+            return test_ll / self.n_persons
+
+        information_criterion = -2 * test_ll + result.n_parameters * np.log(
+            self.n_persons
         )
-    _validate_positive_integer(n_quadpts, "n_quadpts", minimum=1)
-
-    loadings = np.asarray(result.loadings, dtype=np.float64)
-    intercepts = np.asarray(result.intercepts, dtype=np.float64)
-    if loadings.ndim != 2 or intercepts.shape != (loadings.shape[0],):
-        raise MirtValidationError(
-            "regularized result parameters have incompatible shapes",
-            parameter="result",
-            value=(loadings.shape, intercepts.shape),
-        )
-
-    quadrature = GaussHermiteQuadrature(
-        n_points=n_quadpts,
-        n_dimensions=loadings.shape[1],
-    )
-    nodes = quadrature.nodes
-    log_weights = np.log(np.maximum(quadrature.weights, PROB_EPSILON))
-    probabilities = sigmoid(nodes @ loadings.T + intercepts[None, :])
-    probabilities = np.clip(probabilities, PROB_EPSILON, 1 - PROB_EPSILON)
-    log_probability = np.log(probabilities)
-    log_complement = np.log1p(-probabilities)
-
-    block_size = max(
-        1,
-        _MAX_SCORE_MATRIX_ELEMENTS // quadrature.n_total_points,
-    )
-    total = 0.0
-    for start in range(0, test_data.shape[0], block_size):
-        block = test_data[start : start + block_size]
-        positive = block == 1
-        negative = block == 0
-        conditional_ll = positive @ log_probability.T + negative @ log_complement.T
-        total += float(np.sum(logsumexp(conditional_ll + log_weights[None, :], axis=1)))
-    return total
-
-
-def _score_regularized_result(
-    result: RegularizedMIRTResult,
-    test_data: NDArray[np.int_],
-    criterion: CVCriterion,
-    n_quadpts: int,
-) -> float:
-    """Convert held-out likelihood or information criterion to a score."""
-    test_ll = _compute_test_ll(result, test_data, n_quadpts=n_quadpts)
-    n_persons = test_data.shape[0]
-    if criterion == "log_likelihood":
-        return test_ll / n_persons
-
-    information_criterion = -2 * test_ll + result.n_parameters * np.log(n_persons)
-    if criterion == "ebic":
-        information_criterion += ebic_penalty(result.loadings.size, result.n_nonzero)
-    return -float(information_criterion) / n_persons
+        if criterion == "ebic":
+            information_criterion += ebic_penalty(
+                result.loadings.size, result.n_nonzero
+            )
+        return -float(information_criterion) / self.n_persons
 
 
 def information_criteria_path(
@@ -578,8 +571,7 @@ def _validate_regularization_inputs(
         )
 
     validated = validate_responses(responses)
-    observed = validated[validated >= 0]
-    if np.any(observed > 1):
+    if np.max(validated) > 1:
         raise MirtDataError(
             "regularized MIRT requires dichotomous responses",
             n_persons=validated.shape[0],

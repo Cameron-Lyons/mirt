@@ -9,7 +9,9 @@ This module provides flexible cross-validation tools:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import closing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
@@ -17,13 +19,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
     from multiprocessing.context import BaseContext
 
     from mirt.results.fit_result import FitResult
     from mirt.results.score_result import ScoreResult
 
 
-ModelType = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+ModelType = Literal["1PL", "Rasch", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 AbilityMethod = Literal["EAP", "MAP", "ML", "WLE", "EAPsum"]
 # Largest person-by-node likelihood matrix held while scoring a test fold.
 _MAX_SCORE_ELEMENTS = 4_000_000
@@ -35,7 +38,9 @@ def _validate_split_responses(
     minimum_persons: int = 1,
 ) -> NDArray[Any]:
     """Return a response matrix suitable for standalone splitter use."""
-    values = np.asarray(responses)
+    from mirt.utils.data import _response_array
+
+    values = _response_array(responses)
     if values.ndim != 2 or values.shape[0] < minimum_persons or values.shape[1] == 0:
         raise ValueError(
             "responses must be a two-dimensional matrix with at least "
@@ -65,11 +70,14 @@ def _score_strata(
 
     observed = np.isfinite(responses) & (responses >= 0)
     sum_scores = np.sum(np.where(observed, responses, 0.0), axis=1)
-    bins = np.unique(np.percentile(sum_scores, np.linspace(0, 100, n_bins + 1)))
-    if bins.size < 2:
-        bins = np.array([sum_scores.min(), sum_scores.max() + 1.0])
-    strata = np.digitize(sum_scores, bins[:-1]) - 1
-    strata = np.clip(strata, 0, bins.size - 2)
+    cutoffs = np.linspace(0, 100, n_bins + 1)[1:-1]
+    edges = np.unique(np.percentile(sum_scores, cutoffs))
+    strata = np.searchsorted(edges, sum_scores, side="right")
+    # Ties can put interior quantiles at either extreme. Keep the minimum
+    # below a coincident cutoff and the maximum above one so that two common
+    # scores still form two strata.
+    if edges.size and edges[0] == sum_scores.min():
+        strata[sum_scores == edges[0]] = 0
     _, compact_strata = np.unique(strata, return_inverse=True)
     return compact_strata.astype(np.intp, copy=False)
 
@@ -87,19 +95,17 @@ def _validated_group_memberships(
         raise ValueError("groups and responses must contain the same number of rows")
     if labels.dtype.kind in "fc" and not np.all(np.isfinite(labels)):
         raise ValueError("groups must not contain missing or non-finite labels")
-    if labels.dtype.kind == "O":
-        missing_object_label = any(
-            label is None
-            or (
-                isinstance(
-                    label,
-                    (float, complex, np.floating, np.complexfloating),
-                )
+    if labels.dtype.kind in "OmM":
+        from mirt.multigroup import _missing_group_labels
+
+        if np.any(_missing_group_labels(labels)) or (
+            labels.dtype.kind == "O"
+            and any(
+                isinstance(label, (float, complex, np.floating, np.complexfloating))
                 and not np.isfinite(label)
+                for label in labels
             )
-            for label in labels
-        )
-        if missing_object_label:
+        ):
             raise ValueError("groups must not contain missing labels")
 
     try:
@@ -581,6 +587,12 @@ class LeaveOneOut:
             yield train_idx, test_idx
 
 
+_BUILTIN_SPLITS = {
+    cls: cls.split
+    for cls in (KFold, GroupKFold, StratifiedKFold, StratifiedGroupKFold, LeaveOneOut)
+}
+
+
 class Scorer(ABC):
     """Abstract base class for cross-validation scorers."""
 
@@ -641,56 +653,109 @@ class Scorer(ABC):
         ...
 
 
+def _scoring_responses(result: FitResult, responses: Any) -> NDArray[Any]:
+    """Read named and nullable response columns in the fitted model's order."""
+    from mirt.exceptions import MirtDataError
+    from mirt.utils.data import _response_array, align_response_columns
+
+    values = _response_array(
+        align_response_columns(responses, getattr(result.model, "item_names", None))
+    )
+    if values.ndim != 2:
+        raise MirtDataError(f"responses must be 2D, got {values.ndim}D")
+    return values
+
+
+def _held_out_grid(
+    result: FitResult,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return quadrature nodes and log prior masses for a fitted population."""
+    from copy import deepcopy
+
+    from mirt.estimation.quadrature import build_quadrature, resolve_quadpts
+
+    n_factors = result.model.n_factors
+    recipe = getattr(result, "refit_recipe", None)
+    mean = getattr(result, "latent_mean", None)
+    cov = getattr(result, "latent_covariance", None)
+    if recipe is None:
+        from mirt.estimation._mc_likelihood import prior_grid
+
+        # FitResult has already validated these moments, including the
+        # tolerance for symmetry of an estimated covariance.
+        center = np.zeros(n_factors) if mean is None else mean
+        factor = np.eye(n_factors) if cov is None else np.linalg.cholesky(cov)
+        grid = prior_grid(
+            center, factor, np.random.default_rng(0), rule="gauss-hermite"
+        )
+        nodes, weights = grid.nodes, grid.weights
+    else:
+        options = recipe.options
+        n_points = resolve_quadpts(options.get("n_quadpts"), n_factors)
+        quadrature = build_quadrature(
+            n_points, n_factors, options.get("quadrature", "gauss-hermite")
+        )
+        nodes, weights = quadrature.nodes, quadrature.weights
+        if recipe.latent_density is not None:
+            density = deepcopy(recipe.latent_density)
+            return nodes, density.log_quadrature_mass(nodes, weights)
+        if mean is not None or cov is not None:
+            from mirt.estimation.latent_density import GaussianDensity
+
+            density = GaussianDensity(mean=mean, cov=cov, n_dimensions=n_factors)
+            return nodes, density.log_quadrature_mass(nodes, weights)
+    with np.errstate(divide="ignore"):
+        return nodes, np.log(weights / weights.sum())
+
+
 def _held_out_log_likelihood(
     result: FitResult,
     responses: NDArray[np.int_],
 ) -> float:
-    """Return the marginal log-likelihood of ``responses`` under a fit.
-
-    Each response pattern's likelihood is integrated over the fit's latent
-    population on the fit's own quadrature grid: the grid size, quadrature
-    rule and final latent density recorded in its ``refit_recipe``. Repeated
-    rows of built-in models reuse one likelihood evaluation. A fit without a
-    recipe integrates over its ``latent_mean`` and ``latent_covariance``
-    (standard normal by default) on the default Gauss-Hermite grid. Scoring
-    the training responses of an EM fit therefore reproduces the fit's own
-    marginal log-likelihood.
-    """
-    from copy import deepcopy
-
+    """Sum marginal log-likelihoods using the training fit's integration rule."""
     from scipy.special import logsumexp
 
     from mirt.estimation._patterns import (
         compress_responses,
         supports_pattern_compression,
     )
-    from mirt.estimation.latent_density import GaussianDensity
-    from mirt.estimation.quadrature import build_quadrature, resolve_quadpts
+    from mirt.estimation.bifactor_em import (
+        has_standard_normal_moments,
+        reduced_log_likelihood,
+    )
+    from mirt.models.bifactor import BifactorModel, GradedBifactorModel
+    from mirt.models.testlet import TestletModel
 
     model = result.model
-    n_factors = model.n_factors
+    responses = _scoring_responses(result, responses)
     recipe = getattr(result, "refit_recipe", None)
-    options = {} if recipe is None else recipe.options
-    n_points = resolve_quadpts(options.get("n_quadpts"), n_factors)
-    quadrature = build_quadrature(
-        n_points, n_factors, options.get("quadrature", "gauss-hermite")
-    )
-    if recipe is not None and recipe.latent_density is not None:
-        density = deepcopy(recipe.latent_density)
-    else:
-        density = GaussianDensity(
-            mean=getattr(result, "latent_mean", None),
-            cov=getattr(result, "latent_covariance", None),
-            n_dimensions=n_factors,
+    if (
+        isinstance(model, (BifactorModel, GradedBifactorModel, TestletModel))
+        and (recipe is None or recipe.latent_density is None)
+        and has_standard_normal_moments(
+            model.n_factors,
+            getattr(result, "latent_mean", None),
+            getattr(result, "latent_covariance", None),
         )
-    nodes = quadrature.nodes
-    log_mass = density.log_quadrature_mass(nodes, quadrature.weights)
+    ):
+        from mirt.estimation.quadrature import resolve_quadpts
 
+        options = {} if recipe is None else recipe.options
+        points = (
+            None
+            if recipe is None
+            else resolve_quadpts(options.get("n_quadpts"), model.n_factors)
+        )
+        reduced = reduced_log_likelihood(
+            model, responses, points, options.get("quadrature", "gauss-hermite")
+        )
+        if reduced is not None:
+            return reduced
+
+    nodes, log_mass = _held_out_grid(result)
     scoring_responses = responses
     frequencies = None
-    # Grouping accepts signed integers and booleans. Other numeric inputs
-    # retain the model's likelihood and missing-value semantics.
-    if responses.dtype.kind in "bi" and supports_pattern_compression(model):
+    if responses.dtype.kind in "biuf" and supports_pattern_compression(model):
         scoring_responses, frequencies = compress_responses(responses)
 
     # Persons are scored in blocks that bound the likelihood matrix.
@@ -719,6 +784,14 @@ class LogLikelihoodScorer(Scorer):
     values and more flexible models are not rewarded for fitting them. Use
     :class:`PluginLogLikelihoodScorer` for the conditional likelihood at
     EAP estimates.
+
+    Built-in bifactor and testlet models with independent standard-normal
+    factors integrate each specific factor separately with the general factor.
+    Without a refit recipe they use the reduced estimator's 21-point default.
+    Other fits without a recipe use Gauss-Hermite nodes centered and scaled to
+    the recorded Gaussian population through six factors. Beyond six factors
+    this scorer uses 4,096 reproducible scrambled Sobol points from that
+    population.
     """
 
     @property
@@ -737,8 +810,36 @@ class LogLikelihoodScorer(Scorer):
         return _held_out_log_likelihood(result, test_responses)
 
 
+class _EAPFoldScorer(Scorer):
+    """Score a fold using EAP with the fit's Gaussian prior moments."""
+
+    @property
+    def ability_method(self) -> Literal["EAP"]:
+        return "EAP"
+
+    def __call__(
+        self,
+        result: FitResult,
+        train_responses: NDArray[np.int_],
+        test_responses: NDArray[np.int_],
+        test_indices: NDArray[np.intp] | None = None,
+    ) -> float:
+        """Estimate abilities with the training fit's Gaussian prior moments."""
+        from mirt.scoring import fscores
+
+        test_responses = _scoring_responses(result, test_responses)
+        ability_result = fscores(result, test_responses, method=self.ability_method)
+        return self.score_from_ability_result(
+            result,
+            train_responses,
+            test_responses,
+            ability_result,
+            test_indices,
+        )
+
+
 @dataclass
-class PluginLogLikelihoodScorer(Scorer):
+class PluginLogLikelihoodScorer(_EAPFoldScorer):
     """Scorer based on the conditional log-likelihood at EAP estimates.
 
     Sums ``log P(x_i | θ̂_i)`` over the test persons, where ``θ̂_i`` is the
@@ -752,33 +853,6 @@ class PluginLogLikelihoodScorer(Scorer):
     @property
     def name(self) -> str:
         return "plugin_log_likelihood"
-
-    @property
-    def ability_method(self) -> Literal["EAP"]:
-        return "EAP"
-
-    def __call__(
-        self,
-        result: FitResult,
-        train_responses: NDArray[np.int_],
-        test_responses: NDArray[np.int_],
-        test_indices: NDArray[np.intp] | None = None,
-    ) -> float:
-        """Compute the plug-in log-likelihood on test data."""
-        from mirt.scoring import fscores
-
-        ability_result = fscores(
-            result.model,
-            test_responses,
-            method=self.ability_method,
-        )
-        return self.score_from_ability_result(
-            result,
-            train_responses,
-            test_responses,
-            ability_result,
-            test_indices,
-        )
 
     def score_from_ability_result(
         self,
@@ -794,21 +868,24 @@ class PluginLogLikelihoodScorer(Scorer):
         if theta.ndim == 1:
             theta = theta.reshape(-1, 1)
 
-        ll = result.model.log_likelihood(test_responses, theta)
+        responses = _scoring_responses(result, test_responses)
+        ll = result.model.log_likelihood(responses, theta)
         return float(np.sum(ll))
 
 
 @dataclass
-class AbilityRMSEScorer(Scorer):
+class AbilityRMSEScorer(_EAPFoldScorer):
     """Scorer based on ability estimation RMSE.
 
-    Requires true theta values to be provided. Useful for
-    simulation studies.
+    Returns the negative root mean squared difference between EAP estimates
+    and true abilities across all test persons and factors.
 
     Parameters
     ----------
-    true_theta : NDArray
-        True ability values for all persons.
+    true_theta : NDArray of shape (n_persons,) or (n_persons, n_factors)
+        True abilities on the same factor scales as the fitted model. Fold
+        indices select the matching persons. Without indices, scoring uses
+        the first rows in test-response order.
     """
 
     true_theta: NDArray[np.float64]
@@ -816,33 +893,6 @@ class AbilityRMSEScorer(Scorer):
     @property
     def name(self) -> str:
         return "ability_rmse"
-
-    @property
-    def ability_method(self) -> Literal["EAP"]:
-        return "EAP"
-
-    def __call__(
-        self,
-        result: FitResult,
-        train_responses: NDArray[np.int_],
-        test_responses: NDArray[np.int_],
-        test_indices: NDArray[np.intp] | None = None,
-    ) -> float:
-        """Compute RMSE between estimated and true abilities."""
-        from mirt.scoring import fscores
-
-        ability_result = fscores(
-            result.model,
-            test_responses,
-            method=self.ability_method,
-        )
-        return self.score_from_ability_result(
-            result,
-            train_responses,
-            test_responses,
-            ability_result,
-            test_indices,
-        )
 
     def score_from_ability_result(
         self,
@@ -854,12 +904,22 @@ class AbilityRMSEScorer(Scorer):
     ) -> float:
         """Compute ability RMSE from an existing ability estimate."""
         _ = result, train_responses, test_responses
-        estimated = ability_result.theta.ravel()
-
-        if test_indices is not None:
-            true = self.true_theta[test_indices]
-        else:
-            true = self.true_theta[: len(estimated)]
+        estimated = ability_result.theta
+        if estimated.ndim == 1:
+            estimated = estimated[:, None]
+        true = np.asarray(self.true_theta)
+        if true.ndim == 1:
+            true = true[:, None]
+        if true.ndim != 2:
+            raise ValueError(
+                "true_theta must be a person vector or person-by-factor matrix"
+            )
+        true = true[: len(estimated)] if test_indices is None else true[test_indices]
+        if true.shape != estimated.shape:
+            raise ValueError(
+                f"true_theta for the test fold has shape {true.shape}, "
+                f"but the estimated abilities have shape {estimated.shape}"
+            )
 
         return -float(np.sqrt(np.mean((estimated - true) ** 2)))
 
@@ -914,6 +974,27 @@ class BICScorer(Scorer):
         return -result.bic
 
 
+_PARAMETER_ONLY_SCORERS = {
+    cls: (cls.__call__, cls.score_from_ability_result)
+    for cls in (
+        LogLikelihoodScorer,
+        PluginLogLikelihoodScorer,
+        AbilityRMSEScorer,
+        AICScorer,
+        BICScorer,
+    )
+}
+
+
+def _needs_standard_errors(scorer: Scorer) -> bool:
+    """Custom scoring callbacks receive a fit with the usual inference results."""
+    callbacks = _PARAMETER_ONLY_SCORERS.get(type(scorer))
+    if callbacks is None:
+        return True
+    ability_callback = getattr(scorer.score_from_ability_result, "__func__", None)
+    return (type(scorer).__call__, ability_callback) != callbacks
+
+
 def _validate_split_count(n_splits: int) -> None:
     """Validate a requested number of cross-validation folds."""
     if isinstance(n_splits, bool) or not isinstance(n_splits, (int, np.integer)):
@@ -926,31 +1007,89 @@ def _validate_split_count(n_splits: int) -> None:
 class _CVFoldTask:
     """Serializable inputs for fitting one cross-validation fold."""
 
-    fold_idx: int
     train_responses: NDArray[np.int_]
-    model_type: ModelType
-    n_categories: int | None
+    model_type: ModelType | Sequence[ModelType]
+    n_categories: int | Sequence[int] | None
+    item_names: list[str] | None
     n_factors: int
     n_quadpts: int
     max_iter: int
     tol: float
+    compute_standard_errors: bool
 
 
-def _fit_cv_fold(task: _CVFoldTask) -> tuple[int, FitResult]:
+def _fit_cv_fold(task: _CVFoldTask) -> FitResult:
     """Fit one fold in a process-safe module-level worker."""
     from mirt import fit_mirt
 
-    result = fit_mirt(
+    return fit_mirt(
         task.train_responses,
         model=task.model_type,
         n_categories=task.n_categories,
+        item_names=task.item_names,
         n_factors=task.n_factors,
         n_quadpts=task.n_quadpts,
         max_iter=task.max_iter,
         tol=task.tol,
         verbose=False,
+        compute_standard_errors=task.compute_standard_errors,
     )
-    return task.fold_idx, result
+
+
+def _fit_cv_folds(
+    tasks: Iterator[tuple[_CVFoldTask, NDArray[np.intp]]],
+    workers: int,
+    mp_context: BaseContext | None,
+) -> Generator[tuple[_CVFoldTask, NDArray[np.intp], FitResult], None, None]:
+    """Fit folds in split order while keeping training matrices bounded."""
+    if workers == 1:
+        for task, test_idx in tasks:
+            yield task, test_idx, _fit_cv_fold(task)
+        return
+
+    from mirt.utils._parallel import _process_pool
+
+    with _process_pool(workers, mp_context) as executor:
+        pending: deque[tuple[_CVFoldTask, NDArray[np.intp], Future[FitResult]]] = (
+            deque()
+        )
+        for task, test_idx in tasks:
+            pending.append((task, test_idx, executor.submit(_fit_cv_fold, task)))
+            if len(pending) >= 2 * workers:
+                first, indices, future = pending.popleft()
+                yield first, indices, future.result()
+        while pending:
+            first, indices, future = pending.popleft()
+            yield first, indices, future.result()
+
+
+def _cv_category_counts(
+    model_type: ModelType | Sequence[ModelType], responses: NDArray[np.int_]
+) -> list[int] | None:
+    """Infer a fixed category support for the polytomous items in every fold."""
+    from mirt.models._factory import (
+        POLYTOMOUS_FAMILIES,
+        resolve_category_counts,
+        validate_item_types,
+    )
+    from mirt.utils.data import validate_responses
+
+    n_items = responses.shape[1]
+    families = validate_item_types(model_type, n_items)
+    if isinstance(families, str):
+        if families not in POLYTOMOUS_FAMILIES:
+            return None
+        items: slice | list[int] = slice(None)
+    else:
+        items = [
+            i for i, family in enumerate(families) if family in POLYTOMOUS_FAMILIES
+        ]
+        if not items:
+            return None
+    values = validate_responses(responses[:, items])
+    counts = np.full(n_items, 2, dtype=np.intp)
+    counts[items] = resolve_category_counts(values.shape[1], None, values)
+    return counts.tolist()
 
 
 def _evaluate_scorers(
@@ -972,7 +1111,7 @@ def _evaluate_scorers(
         else:
             if method not in ability_results:
                 ability_results[method] = fscores(
-                    result.model,
+                    result,
                     test_responses,
                     method=method,
                 )
@@ -1006,8 +1145,9 @@ def _validated_splits(
             test_values.dtype, np.integer
         ):
             raise ValueError(f"fold {fold_idx} indices must be integers")
-        train_idx = train_values.astype(np.intp, copy=False)
-        test_idx = test_values.astype(np.intp, copy=False)
+        # A custom splitter may refill the same index buffers for its next fold.
+        train_idx = train_values.astype(np.intp, copy=True)
+        test_idx = test_values.astype(np.intp, copy=True)
         if (
             np.any(train_idx < 0)
             or np.any(train_idx >= n_persons)
@@ -1090,13 +1230,13 @@ class CVResult:
 
 
 def cross_validate(
-    model_type: ModelType,
+    model_type: ModelType | Sequence[ModelType],
     responses: NDArray[np.int_],
     splitter: Splitter | None = None,
     scorers: list[Scorer] | None = None,
-    n_categories: int | None = None,
+    n_categories: int | Sequence[int] | None = None,
     n_factors: int = 1,
-    n_quadpts: int = 21,
+    n_quadpts: int | Literal["auto"] | None = "auto",
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
@@ -1108,23 +1248,29 @@ def cross_validate(
 
     Parameters
     ----------
-    model_type : str
-        Type of IRT model to fit ('1PL', '2PL', '3PL', '4PL',
-        'GRM', 'GPCM', 'PCM', 'NRM').
-    responses : NDArray
-        Response matrix (n_persons, n_items).
+    model_type : str or sequence of str
+        IRT family to fit ('1PL', 'Rasch', '2PL', '3PL', '4PL', 'GRM',
+        'GPCM', 'PCM', 'NRM'), or one family per item for a mixed-format test.
+    responses : NDArray or DataFrame
+        Response matrix (n_persons, n_items). Named DataFrame columns supply
+        item names as in :func:`mirt.fit_mirt`.
     splitter : Splitter, optional
         Data splitting strategy. Default is KFold(n_splits=5).
     scorers : list[Scorer], optional
         Scoring functions. Default is ``[LogLikelihoodScorer()]``, the
         held-out marginal log-likelihood of each test fold under the model
         and latent population fitted to its training folds.
-    n_categories : int, optional
-        Number of categories for polytomous models.
+    n_categories : int or sequence of int, optional
+        Category count shared by polytomous items, or one count per item.
+        By default the largest observed code for each polytomous item
+        determines its category range across all folds. Supply counts to
+        define the scale in advance, including categories absent from the data.
     n_factors : int, default=1
         Number of latent factors.
-    n_quadpts : int, default=21
-        Quadrature points for EM.
+    n_quadpts : int, "auto" or None, default="auto"
+        EM quadrature points per dimension. "auto" uses 21 for one to three
+        factors and the dimension-dependent :func:`mirt.fit_mirt` defaults
+        for larger models. None uses those fit defaults for every dimension.
     max_iter : int, default=500
         Maximum EM iterations.
     tol : float, default=1e-4
@@ -1132,7 +1278,9 @@ def cross_validate(
     verbose : bool, default=False
         Print progress.
     return_models : bool, default=False
-        Whether to return fitted models for each fold.
+        Whether to return fitted models for each fold. Fits returned here
+        or supplied to custom scorers include item-parameter standard errors.
+        Score-only evaluation with built-in scorers skips their computation.
     n_jobs : int, default=1
         Number of process workers for fold fitting. Use -1 for all CPUs.
         Process startup has overhead, so ``n_jobs=1`` is preferable for
@@ -1162,15 +1310,18 @@ def cross_validate(
     ... )
     >>> print(cv_result.summary())
     """
-    from mirt.utils._parallel import _process_pool, resolve_n_jobs
+    from mirt.estimation.quadrature import resolve_quadpts
+    from mirt.models._factory import validate_n_factors
+    from mirt.utils._parallel import resolve_n_jobs
+    from mirt.utils.data import response_column_names
 
-    responses = np.asarray(responses)
-    if responses.ndim != 2 or responses.shape[0] < 2 or responses.shape[1] == 0:
-        raise ValueError(
-            "responses must be a two-dimensional matrix with at least "
-            "2 persons and 1 item"
-        )
+    item_names = response_column_names(responses)
+    responses = _validate_split_responses(responses, minimum_persons=2)
     n_jobs = resolve_n_jobs(n_jobs)
+    n_factors = validate_n_factors(n_factors)
+    if isinstance(n_quadpts, str) and n_quadpts == "auto":
+        n_quadpts = 21 if n_factors <= 3 else None
+    n_quadpts = resolve_quadpts(n_quadpts, n_factors)
 
     if splitter is None:
         splitter = KFold(n_splits=5)
@@ -1188,66 +1339,51 @@ def cross_validate(
     scores: dict[str, list[float]] = {name: [] for name in scorer_names}
     fold_results: list[FitResult] = []
 
-    splits = _validated_splits(splitter, responses)
-    n_folds = len(splits)
-    tasks = (
-        _CVFoldTask(
-            fold_idx=fold_idx,
-            train_responses=responses[train_idx],
-            model_type=model_type,
-            n_categories=n_categories,
-            n_factors=n_factors,
-            n_quadpts=n_quadpts,
-            max_iter=max_iter,
-            tol=tol,
+    # Built-in splits are complementary by construction. Consume them on demand,
+    # especially leave-one-out, where storing every training index is quadratic.
+    builtin_split = _BUILTIN_SPLITS.get(type(splitter))
+    if (
+        builtin_split is not None
+        and getattr(splitter.split, "__func__", None) is builtin_split
+    ):
+        splits = splitter.split(responses)
+        n_folds = (
+            responses.shape[0] if type(splitter) is LeaveOneOut else splitter.n_splits
         )
-        for fold_idx, (train_idx, _) in enumerate(splits)
+    else:
+        custom_splits = _validated_splits(splitter, responses)
+        splits = iter(custom_splits)
+        n_folds = len(custom_splits)
+
+    if n_categories is None:
+        n_categories = _cv_category_counts(model_type, responses)
+    compute_standard_errors = return_models or any(map(_needs_standard_errors, scorers))
+    tasks = (
+        (
+            _CVFoldTask(
+                train_responses=responses[train_idx],
+                model_type=model_type,
+                n_categories=n_categories,
+                item_names=item_names,
+                n_factors=n_factors,
+                n_quadpts=n_quadpts,
+                max_iter=max_iter,
+                tol=tol,
+                compute_standard_errors=compute_standard_errors,
+            ),
+            test_idx,
+        )
+        for train_idx, test_idx in splits
     )
 
-    if n_jobs > 1 and n_folds > 1:
-        with _process_pool(min(n_jobs, n_folds), mp_context) as executor:
-            results_list = list(executor.map(_fit_cv_fold, tasks))
-
-        results_list.sort(key=lambda x: x[0])
-
-        for fold_idx, result in results_list:
+    with closing(_fit_cv_folds(tasks, min(n_jobs, n_folds), mp_context)) as fitted:
+        for fold_idx, (task, test_idx, result) in enumerate(fitted):
             if verbose:
                 print(f"Fold {fold_idx + 1}/{n_folds} completed")
-
-            train_idx, test_idx = splits[fold_idx]
-            train_data = responses[train_idx]
-            test_data = responses[test_idx]
-
             if return_models:
                 fold_results.append(result)
-
             for name, score in _evaluate_scorers(
-                scorers,
-                result,
-                train_data,
-                test_data,
-                test_idx,
-            ).items():
-                scores[name].append(score)
-    else:
-        for task, (train_idx, test_idx) in zip(tasks, splits, strict=True):
-            if verbose:
-                print(f"Fold {task.fold_idx + 1}/{n_folds}")
-
-            train_data = responses[train_idx]
-            test_data = responses[test_idx]
-
-            _, result = _fit_cv_fold(task)
-
-            if return_models:
-                fold_results.append(result)
-
-            for name, score in _evaluate_scorers(
-                scorers,
-                result,
-                train_data,
-                test_data,
-                test_idx,
+                scorers, result, task.train_responses, responses[test_idx], test_idx
             ).items():
                 scores[name].append(score)
 
