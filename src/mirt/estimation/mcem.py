@@ -1434,9 +1434,10 @@ class QMCEMEstimator(MCEMEstimator):
             (n_persons, self.n_samples, n_factors),
         )
 
-        if hasattr(model, "log_likelihood_batch"):
+        batch_likelihood = getattr(model, "log_likelihood_batch", None)
+        if callable(batch_likelihood):
             log_likes = self._validated_log_likelihoods(
-                model.log_likelihood_batch(responses, theta_base),
+                batch_likelihood(responses, theta_base),
                 (n_persons, self.n_samples),
             )
         else:
@@ -1459,17 +1460,14 @@ class QMCEMEstimator(MCEMEstimator):
         expected = (n_persons, self.n_samples, model.n_factors)
         if samples.shape != expected:
             raise ValueError(f"theta_samples must have shape {expected}")
-        if (
-            n_persons == 0
-            or samples.strides[0] != 0
-            or not hasattr(model, "log_likelihood_batch")
-        ):
+        batch_likelihood = getattr(model, "log_likelihood_batch", None)
+        if n_persons == 0 or samples.strides[0] != 0 or not callable(batch_likelihood):
             return super()._sample_log_likelihoods(model, responses, theta_samples)
         grid = np.asarray(samples[0], dtype=np.float64)
         if not np.all(np.isfinite(grid)):
             raise ValueError("theta_samples must contain only finite values")
         values = self._validated_log_likelihoods(
-            model.log_likelihood_batch(responses, grid), (n_persons, self.n_samples)
+            batch_likelihood(responses, grid), (n_persons, self.n_samples)
         )
         # The MC sampler owns its output and may update accepted cells in place.
         return np.array(values, dtype=np.float64, copy=True)

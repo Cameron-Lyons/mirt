@@ -464,6 +464,7 @@ class GVEMEstimator(BaseEstimator):
 
     def _convert_from_slope_intercept(self, model: BaseItemModel) -> None:
         """Convert parameters from slope-intercept back to discrimination-difficulty form."""
+        assert self._slopes is not None and self._intercepts is not None
         if model.n_factors == 1:
             a = self._slopes.ravel()
             d = self._intercepts
@@ -594,6 +595,7 @@ class GVEMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
     ) -> None:
         """CPU M-step."""
+        assert self._slopes is not None and self._intercepts is not None
         fixed_loadings = model.model_name == "1PL"
         stats = variational_item_statistics(
             responses,

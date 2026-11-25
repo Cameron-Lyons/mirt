@@ -533,7 +533,8 @@ default="auto"
                 converged = True
                 break
             previous = current
-            problem.m_step(model, grid, *statistics)
+            # Each problem consumes the statistics tuple returned by its own E-step.
+            problem.m_step(model, grid, *statistics)  # ty: ignore[missing-argument, too-many-positional-arguments]
         else:
             current = _block_log_likelihood(
                 problem.posterior_blocks(model, grid, context), context

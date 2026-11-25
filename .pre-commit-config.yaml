@@ -22,9 +22,9 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      - id: mypy
-        name: mypy
-        entry: uv run mypy src/mirt --ignore-missing-imports
+      - id: ty
+        name: ty
+        entry: uv run --extra dev --extra plot ty check
         language: system
         types: [python]
         pass_filenames: false

@@ -705,6 +705,7 @@ class SparseBayesianEstimator(BaseEstimator):
         """Convert intercepts back to difficulty parameters."""
         if loadings is None:
             loadings = self._loadings
+        assert loadings is not None and self._intercepts is not None
         a_sum = np.sum(loadings, axis=1)
         return np.divide(
             -self._intercepts,
@@ -742,6 +743,7 @@ class SparseBayesianEstimator(BaseEstimator):
         responses: NDArray[np.int_],
     ) -> None:
         """M-step with spike-slab LASSO penalty."""
+        assert self._loadings is not None and self._intercepts is not None
         stats = variational_item_statistics(
             responses,
             self._mu,

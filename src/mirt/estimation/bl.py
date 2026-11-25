@@ -360,8 +360,9 @@ class BLEstimator(BaseEstimator):
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
 
-        if hasattr(model, "log_likelihood_batch"):
-            log_likelihoods = model.log_likelihood_batch(responses, quad_points)
+        batch_likelihood = getattr(model, "log_likelihood_batch", None)
+        if callable(batch_likelihood):
+            log_likelihoods = batch_likelihood(responses, quad_points)
         else:
             n_persons = responses.shape[0]
             n_quad = len(quad_weights)

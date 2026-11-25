@@ -336,7 +336,7 @@ def _supported_point(prior: Prior, lower: float, upper: float) -> float | None:
     """Return a point of the box with positive prior density, or None."""
     candidates = [0.5 * (lower + upper), *np.linspace(lower, upper, 65)[1:-1]]
     try:
-        candidates.insert(0, float(prior.mean()))
+        candidates.insert(0, float(prior.mean))
     except (NotImplementedError, TypeError, ValueError):
         pass
     for point in candidates:

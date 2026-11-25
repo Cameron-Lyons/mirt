@@ -132,10 +132,10 @@ def _validate_options(
         raise ValueError("n_permutations requires method='crossing'")
     rng = np.random.default_rng(random_state) if n_permutations else None
     return _SIBTESTOptions(
-        cast(SIBTESTMethod, method),
+        method,
         bool(correction),
         minimum,
-        cast(SIBTESTConvention, convention),
+        convention,
         int(n_permutations),
         rng,
     )

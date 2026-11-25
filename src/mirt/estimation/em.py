@@ -1656,8 +1656,9 @@ default="auto"
         ):
             return self._compute_log_likelihoods_gpu(model, responses, quad_points)
 
-        if hasattr(model, "log_likelihood_batch"):
-            return model.log_likelihood_batch(responses, quad_points)
+        batch_likelihood = getattr(model, "log_likelihood_batch", None)
+        if callable(batch_likelihood):
+            return batch_likelihood(responses, quad_points)
 
         return self._compute_log_likelihoods_python(model, responses, quad_points)
 
@@ -1740,8 +1741,9 @@ default="auto"
                 n_categories=model.n_categories,
             )
 
-        if hasattr(model, "log_likelihood_batch"):
-            return model.log_likelihood_batch(responses, quad_points)
+        batch_likelihood = getattr(model, "log_likelihood_batch", None)
+        if callable(batch_likelihood):
+            return batch_likelihood(responses, quad_points)
 
         return self._compute_log_likelihoods_python(model, responses, quad_points)
 

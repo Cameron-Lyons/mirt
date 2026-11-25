@@ -78,9 +78,9 @@ jobs:
       - uses: ./.github/actions/setup-python
         with:
           python-version: "3.14"
-          extras: dev
-      - name: Run mypy
-        run: uv run --no-sync mypy src/mirt --ignore-missing-imports
+          extras: "dev plot"
+      - name: Run ty
+        run: uv run --no-sync ty check
 
   build-wheel:
     needs: [workflow-lint, lint, typecheck]

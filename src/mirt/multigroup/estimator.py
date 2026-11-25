@@ -1104,10 +1104,9 @@ class MultigroupEMEstimator:
             group_responses = responses[g]
             n_persons = group_responses.shape[0]
 
-            if hasattr(group_model, "log_likelihood_batch"):
-                log_likelihoods = group_model.log_likelihood_batch(
-                    group_responses, quad_points
-                )
+            batch_likelihood = getattr(group_model, "log_likelihood_batch", None)
+            if callable(batch_likelihood):
+                log_likelihoods = batch_likelihood(group_responses, quad_points)
             else:
                 log_likelihoods = np.zeros((n_persons, n_quad))
                 for q in range(n_quad):

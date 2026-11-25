@@ -925,7 +925,7 @@ uv run maturin develop --release
 
 uv run pytest
 
-uv run mypy src/mirt
+uv run --extra dev --extra plot ty check
 
 uv run ruff format src tests
 uv run ruff check src tests

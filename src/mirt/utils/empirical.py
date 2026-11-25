@@ -254,7 +254,7 @@ def _expected_all_item_scores(
         probabilities.ndim != 3
         or probabilities.shape[0] != n_persons
         or probabilities.shape[1] != model.n_items
-        or probabilities.shape[2] < 2
+        or probabilities.shape[-1] < 2
     ):
         raise ValueError(
             "model probability output must have shape (n_persons, n_items) "
@@ -265,16 +265,16 @@ def _expected_all_item_scores(
     if not np.allclose(probabilities.sum(axis=2), 1.0, atol=1e-6, rtol=1e-6):
         raise ValueError("polytomous category probabilities must sum to 1")
 
-    categories = np.arange(probabilities.shape[2], dtype=np.float64)
+    categories = np.arange(probabilities.shape[-1], dtype=np.float64)
     expected_scores = probabilities @ categories
 
     counts = _model_category_counts(model)
     if counts is not None:
-        if np.any(counts > probabilities.shape[2]):
+        if np.any(counts > probabilities.shape[-1]):
             raise ValueError("model category counts are malformed")
         max_scores = counts - 1
     else:
-        max_scores = np.full(model.n_items, probabilities.shape[2] - 1, dtype=np.intp)
+        max_scores = np.full(model.n_items, probabilities.shape[-1] - 1, dtype=np.intp)
     return expected_scores, max_scores
 
 

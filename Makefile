@@ -3,7 +3,7 @@
 lint:
 	uv run --no-sync ruff check src tests benchmarks .github/scripts
 	uv run --no-sync ruff format --check src tests benchmarks .github/scripts
-	uv run --no-sync mypy src/mirt --ignore-missing-imports
+	uv run --no-sync ty check
 
 fmt:
 	uv run --no-sync ruff format src tests benchmarks .github/scripts

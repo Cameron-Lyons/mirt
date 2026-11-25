@@ -53,7 +53,7 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.1",
-    "mypy>=1.0",
+    "ty==0.0.110",
     "pandas>=1.5",
     "polars>=0.20",
     "maturin>=1.4",
@@ -97,50 +97,58 @@ line-length = 88
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP", "B904", "B905"]
+select = ["E", "F", "I", "W", "UP", "B904", "B905", "ANN0", "ANN2"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/mirt/__init__.py" = ["F401"]
+"!src/mirt/**" = ["ANN"]
 
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = false
-warn_unused_ignores = true
-check_untyped_defs = true
-disallow_incomplete_defs = true
-disable_error_code = [
-    "import-not-found",
-    "import-untyped",
-    "arg-type",
-    "return-value",
-    "assignment",
-    "union-attr",
-    "attr-defined",
-    "override",
-    "operator",
-    "index",
-    "dict-item",
-    "list-item",
-]
+# Require complete signatures once a package function has any annotations.
+[tool.ruff.lint.flake8-annotations]
+ignore-fully-untyped = true
+mypy-init-return = true
 
-[[tool.mypy.overrides]]
-module = [
-    "mirt.exceptions",
-    "mirt.results.*",
-    "mirt._backend_config",
-    "mirt._backend_state",
-    "mirt.backends.rust._helpers",
+[tool.ty.src]
+include = ["src/mirt"]
+
+[tool.ty.environment]
+python-version = "3.11"
+
+# Numerical modules use gradual typing. The backend contracts and public
+# result types are checked with the full set of default rules.
+[[tool.ty.overrides]]
+include = ["src/mirt/**"]
+exclude = [
+    "src/mirt/exceptions.py",
+    "src/mirt/results/**",
+    "src/mirt/_backend_config.py",
+    "src/mirt/_backend_state.py",
+    "src/mirt/backends/rust/_helpers.py",
 ]
-disable_error_code = [
-    "import-not-found",
-    "import-untyped",
-    "assignment",
-    "union-attr",
-    "attr-defined",
-    "override",
-    "operator",
-    "index",
-    "dict-item",
-    "list-item",
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+invalid-explicit-return = "ignore"
+invalid-assignment = "ignore"
+missing-attribute = "ignore"
+missing-union-attribute = "ignore"
+not-subscriptable = "ignore"
+
+[[tool.ty.overrides]]
+include = ["src/mirt/estimation/**", "src/mirt/models/**", "src/mirt/utils/**"]
+[tool.ty.overrides.rules]
+unsupported-operator = "ignore"
+
+[[tool.ty.overrides]]
+include = ["src/mirt/estimation/**", "src/mirt/models/**"]
+[tool.ty.overrides.rules]
+incompatible-method-override = "ignore"
+
+[[tool.ty.overrides]]
+include = [
+    "src/mirt/models/explanatory.py",
+    "src/mirt/models/mixed_format.py",
+    "src/mirt/models/testlet.py",
 ]
+[tool.ty.overrides.rules]
+incompatible-property-override = "ignore"

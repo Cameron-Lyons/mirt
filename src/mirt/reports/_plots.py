@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -34,7 +34,7 @@ def _get_pyplot() -> Any:
 
 
 @contextmanager
-def _figure(figsize: tuple[float, float]) -> Iterator[tuple[Any, Any]]:
+def _figure(figsize: tuple[float, float]) -> Generator[tuple[Any, Any], None, None]:
     """Create a figure and guarantee that its resources are released."""
     plt = _get_pyplot()
     fig, ax = plt.subplots(figsize=figsize)

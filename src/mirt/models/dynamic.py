@@ -856,6 +856,7 @@ class BKTModel:
             if skill_assignments.ndim == 1
             else skill_assignments
         )
+        assert self.p_init is not None
         retained_priors = np.broadcast_to(
             self.p_init,
             (n_persons, self.n_skills),
@@ -1016,6 +1017,7 @@ class BKTModel:
         n_steps: int,
     ) -> BKTBatchForecastResult:
         """Forecast validated next-opportunity priors without Python loops."""
+        assert self.p_learn is not None and self.p_forget is not None
         transition_rate = self.p_learn + self.p_forget
         equilibrium = np.divide(
             self.p_learn,
@@ -1159,6 +1161,7 @@ class BKTModel:
         reached = prior_mastery >= target_mastery
         opportunities[reached] = 0.0
 
+        assert self.p_learn is not None and self.p_forget is not None
         transition_rate = self.p_learn + self.p_forget
         persistence = 1.0 - transition_rate
         next_mastery = prior_mastery * persistence + self.p_learn
@@ -1816,6 +1819,7 @@ class BKTModel:
         # Emission tables are indexed by (skill, response + 1).
         response_columns = np.ascontiguousarray(responses.T) + 1
         no_response = np.ones(self.n_skills)
+        assert self.p_guess is not None and self.p_slip is not None
         unlearned_emissions = np.column_stack(
             [no_response, 1.0 - self.p_guess, self.p_guess]
         )[trial_skills, response_columns]
@@ -2224,6 +2228,7 @@ class BKTModel:
     ) -> NDArray[np.float64]:
         """Extract each skill's last posterior from validated inference output."""
         n_persons, n_trials = learned_probabilities.shape
+        assert self.p_init is not None
         mastery = np.broadcast_to(self.p_init, (n_persons, self.n_skills)).copy()
 
         if skill_assignments.ndim == 1:
@@ -2293,6 +2298,7 @@ class BKTModel:
             if skill_assignments.ndim == 1
             else skill_assignments
         )
+        assert self.p_init is not None
         next_priors = np.broadcast_to(
             self.p_init,
             (n_persons, self.n_skills),

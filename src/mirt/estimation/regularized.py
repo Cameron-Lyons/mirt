@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from math import lgamma
@@ -374,7 +374,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
         return validated
 
     @contextmanager
-    def _prepared(self, responses: NDArray[np.int_]) -> Iterator[None]:
+    def _prepared(self, responses: NDArray[np.int_]) -> Generator[None, None, None]:
         """Share one response preparation and quadrature grid within a call."""
         previous_context = self._fit_context
         if previous_context is not None and previous_context.responses is responses:

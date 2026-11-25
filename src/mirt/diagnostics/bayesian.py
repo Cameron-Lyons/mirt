@@ -10,7 +10,7 @@ This module provides:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -44,7 +44,7 @@ def _copy_state_value(value: Any) -> Any:
 def _preserve_model_state(
     model: BaseItemModel,
     parameter_names: set[str],
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     """Restore model parameters and mirrored private attributes on exit."""
     original_parameters = {
         name: value.copy() for name, value in model._parameters.items()

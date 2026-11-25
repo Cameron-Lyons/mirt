@@ -571,13 +571,14 @@ def _anchor_parameter_values(
             )
         anchor_counts = getattr(anchor_parameters, "n_categories", None)
         model_counts = getattr(model, "n_categories", None)
-        if (anchor_counts is None) != (model_counts is None) or (
-            model_counts is not None
-            and not np.array_equal(
+        if model_counts is None or anchor_counts is None:
+            matching_counts = anchor_counts is model_counts
+        else:
+            matching_counts = np.array_equal(
                 np.broadcast_to(anchor_counts, len(anchor_items)),
                 np.broadcast_to(model_counts, model.n_items)[anchor_items],
             )
-        ):
+        if not matching_counts:
             raise MirtValidationError(
                 "anchor items must have the same category counts in both models",
                 parameter="anchor_parameters",
