@@ -93,7 +93,7 @@ def test_information_gain_matches_binary_mutual_information(
     )
     assert_array_equal(priors, original)
     with pytest.raises(FrozenInstanceError):
-        setattr(result, "criterion", "lowest_mastery")
+        result.criterion = "lowest_mastery"
 
 
 def test_information_gain_is_zero_without_mastery_uncertainty_or_separation() -> None:

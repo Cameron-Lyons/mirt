@@ -49,6 +49,7 @@ def variational_e_step(
 
     def update(data, block_xi):
         valid = data >= 0
+        block_mu = block_sigma = None
         for _ in range(n_inner_iter):
             lam = lambda_function(block_xi)
             weights = np.where(valid, 2.0 * lam, 0.0)
@@ -65,6 +66,8 @@ def variational_e_step(
             )
             candidate_xi = np.sqrt(np.maximum(eta_variance + eta_mean**2, xi_floor))
             block_xi = np.where(valid, candidate_xi, block_xi)
+        if block_mu is None or block_sigma is None:
+            raise ValueError("n_inner_iter must be positive")
         return block_mu, block_sigma, block_xi
 
     # Include response-wide buffers, covariance matrices, and possible einsum

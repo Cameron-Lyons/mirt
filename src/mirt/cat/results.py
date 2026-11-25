@@ -96,9 +96,11 @@ def _array_history(
     limit: int,
 ) -> list[NDArray[np.float64]]:
     """Normalize a history of arrays with a fixed per-step shape."""
-    if isinstance(values, np.ndarray):
-        candidates = list(values)
-    elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+    if (
+        isinstance(values, np.ndarray)
+        or isinstance(values, Sequence)
+        and not isinstance(values, (str, bytes))
+    ):
         candidates = list(values)
     else:
         raise MirtValidationError(

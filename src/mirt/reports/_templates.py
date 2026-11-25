@@ -222,10 +222,7 @@ def format_value(value: float, fmt: str = ".4f", quality: str | None = None) -> 
         Formatted HTML span.
     """
     _validate_quality(quality)
-    if not math.isfinite(value):
-        formatted = "NA"
-    else:
-        formatted = f"{value:{fmt}}"
+    formatted = "NA" if not math.isfinite(value) else f"{value:{fmt}}"
     escaped_value = escape_text(formatted)
     if quality:
         return _SafeHTML(f'<span class="stat-value {quality}">{escaped_value}</span>')

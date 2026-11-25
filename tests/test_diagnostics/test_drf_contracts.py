@@ -625,8 +625,8 @@ def test_compute_drf_links_away_pure_impact(monkeypatch: pytest.MonkeyPatch) -> 
     result = compute_drf(data, groups, theta_range=(-3.0, 3.0), n_points=31)
 
     A, B = result["linking_constants"]
-    assert A == pytest.approx(1.2, rel=1e-4)
-    assert B == pytest.approx(-1.0, abs=1e-4)
+    assert pytest.approx(1.2, rel=1e-4) == A
+    assert pytest.approx(-1.0, abs=1e-4) == B
     assert result["anchor_items"] == list(range(6))
     assert result["DRF"] < 1e-3
     theta = result["theta_grid"]

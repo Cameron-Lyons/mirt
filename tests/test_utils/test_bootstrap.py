@@ -269,8 +269,8 @@ class TestBootstrapSE:
             seed=42,
         )
 
-        assert "discrimination" in se or "discrimination_se" in se.keys()
-        assert "difficulty" in se or "difficulty_se" in se.keys()
+        assert "discrimination" in se or "discrimination_se" in se
+        assert "difficulty" in se or "difficulty_se" in se
 
     def test_bootstrap_se_positive(self, fitted_2pl_model, dichotomous_responses):
         """Test that bootstrap SEs are positive."""
@@ -278,7 +278,7 @@ class TestBootstrapSE:
 
         se = bootstrap_se(fitted_2pl_model, responses, n_bootstrap=3, seed=42)
 
-        for key, values in se.items():
+        for values in se.values():
             if isinstance(values, np.ndarray):
                 assert np.all(values >= 0)
 
@@ -516,7 +516,7 @@ class TestBootstrapCI:
         )
 
         assert "discrimination" in ci or "difficulty" in ci
-        for key, value in ci.items():
+        for value in ci.values():
             if isinstance(value, tuple):
                 assert len(value) == 2
 

@@ -119,7 +119,7 @@ def _diagonal_item_standard_errors(
             if mask is not None and not mask[index]:
                 continue
 
-            def at_offset(offset: float) -> float:
+            def at_offset(offset: float, index: tuple[int, ...] = index) -> float:
                 candidate = current.copy()
                 candidate[index] += offset
                 return log_likelihood(candidate)
@@ -542,10 +542,7 @@ def _compute_item_se_curvature(
     quad_points = quadrature.nodes
 
     values = model.parameters[param_name]
-    if values.ndim == 1:
-        current = float(values[item_idx])
-    else:
-        current = values[item_idx].copy()
+    current = float(values[item_idx]) if values.ndim == 1 else values[item_idx].copy()
 
     def set_parameter(param_val):
         candidate = values.copy()

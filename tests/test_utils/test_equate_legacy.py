@@ -34,8 +34,8 @@ def test_exact_anchors_recover_legacy_constants(method):
         result = equate(old, new, list(range(10)), list(range(10)), method=method)
 
     # Legacy convention: theta_new = A * theta_old + B.
-    assert result.A == pytest.approx(1.0 / 1.3, abs=1e-7)
-    assert result.B == pytest.approx(-0.4 / 1.3, abs=1e-7)
+    assert pytest.approx(1.0 / 1.3, abs=1e-7) == result.A
+    assert pytest.approx(-0.4 / 1.3, abs=1e-7) == result.B
     assert result.rmse == pytest.approx(0.0, abs=1e-6)
     assert result.method == method
     assert result.anchor_items == list(range(10))
@@ -63,9 +63,9 @@ def test_matches_link_up_to_the_documented_inversion(method):
         result = equate(old, new, anchors, anchors, method=method)
 
     linked = link(old, new, anchors, anchors, method=method)
-    assert result.A == pytest.approx(1.0 / linked.constants.A, rel=1e-12)
-    assert result.B == pytest.approx(
-        -linked.constants.B / linked.constants.A, rel=1e-12
+    assert pytest.approx(1.0 / linked.constants.A, rel=1e-12) == result.A
+    assert (
+        pytest.approx(-linked.constants.B / linked.constants.A, rel=1e-12) == result.B
     )
     assert result.rmse == pytest.approx(linked.fit_statistics.weighted_rmse)
 
@@ -84,9 +84,11 @@ def test_stocking_lord_and_haebara_are_distinct_estimators():
 def test_rejects_unknown_method():
     old, new = _forms()
 
-    with pytest.warns(DeprecationWarning):
-        with pytest.raises(ValueError, match="Unknown equating method"):
-            equate(old, new, [0, 1], [0, 1], method="tcc")
+    with (
+        pytest.warns(DeprecationWarning),
+        pytest.raises(ValueError, match="Unknown equating method"),
+    ):
+        equate(old, new, [0, 1], [0, 1], method="tcc")
 
 
 @pytest.mark.parametrize("A", [0.0, -1.0, np.nan])

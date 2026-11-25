@@ -410,9 +410,7 @@ class ManyFacetRaschModel:
                 selected = self._facet_parameters[facet.name][indices]
             elif item_idx is None and indices.ndim == 1:
                 selected = self._facet_parameters[facet.name][indices, None]
-            elif item_idx is None:
-                selected = self._facet_parameters[facet.name][indices]
-            elif indices.ndim == 1:
+            elif item_idx is None or indices.ndim == 1:
                 selected = self._facet_parameters[facet.name][indices]
             else:
                 selected = self._facet_parameters[facet.name][indices[:, item_idx]]
@@ -488,11 +486,11 @@ class ManyFacetRaschModel:
                     _MFRM_MAX_PROBABILITY_VALUES // probability_values_per_person,
                 ),
             )
-        elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
-            chunk_size, (int, np.integer)
+        elif (
+            isinstance(chunk_size, (bool, np.bool_))
+            or not isinstance(chunk_size, (int, np.integer))
+            or chunk_size <= 0
         ):
-            raise ValueError("chunk_size must be a positive integer")
-        elif chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer")
         return theta_values, prepared_facets, int(chunk_size)
 

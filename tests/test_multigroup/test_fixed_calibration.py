@@ -333,7 +333,7 @@ def test_ordered_density_handles_conflicting_means_by_constrained_likelihood():
     for index in [0, 2]:
         counts = posterior[index].sum(axis=0)
 
-        def fixed_mean_loss(log_variance):
+        def fixed_mean_loss(log_variance, counts=counts):
             log_mass = log_base - nodes**2 / (2 * np.exp(log_variance))
             return -float(counts @ (log_mass - logsumexp(log_mass)))
 

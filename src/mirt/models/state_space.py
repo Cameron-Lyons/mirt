@@ -1431,18 +1431,22 @@ class StateSpaceIRT:
             if probabilities
             else None
         )
-        node_scores = None
+        scoring_data = None
         if responses is not None:
             flat_responses = responses.reshape(-1, self.n_items)
-            correct = (flat_responses == 1).astype(np.float64)
-            incorrect = (flat_responses == 0).astype(np.float64)
-            node_scores = np.empty((weights.size, flat_means.size), dtype=np.float64)
+            scoring_data = (
+                flat_responses,
+                (flat_responses == 1).astype(np.float64),
+                (flat_responses == 0).astype(np.float64),
+                np.empty((weights.size, flat_means.size), dtype=np.float64),
+            )
 
         for index, (node, weight) in enumerate(zip(nodes, weights, strict=True)):
             conditional = self._observation_probability(flat_means + flat_scales * node)
             if marginal is not None:
                 marginal += weight * conditional
-            if node_scores is not None:
+            if scoring_data is not None:
+                _, correct, incorrect, node_scores = scoring_data
                 # Clipped probabilities keep both logs finite under the 0/1 masks.
                 node_scores[index] = (
                     np.log(weight)
@@ -1459,8 +1463,9 @@ class StateSpaceIRT:
                 1.0,
             )
         )
-        if node_scores is None:
+        if scoring_data is None:
             return integrated, None
+        flat_responses, _, _, node_scores = scoring_data
         scores = np.logaddexp.reduce(node_scores, axis=0)
         scores[~np.any(flat_responses >= 0, axis=1)] = 0.0
         return integrated, scores.reshape(state_means.shape)

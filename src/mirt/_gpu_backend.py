@@ -38,9 +38,10 @@ def is_gpu_available() -> bool:
     bool
         True if PyTorch is installed and CUDA is available.
     """
-    if _torch is None and _torch_import_error is None:
-        if not is_torch_available() or _torch_build_supports_gpu() is False:
-            return False
+    if (_torch is None and _torch_import_error is None) and (
+        not is_torch_available() or _torch_build_supports_gpu() is False
+    ):
+        return False
     try:
         _load_torch()
     except ImportError:

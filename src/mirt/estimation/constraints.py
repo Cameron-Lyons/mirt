@@ -251,14 +251,9 @@ class BoundConstraint(ParameterConstraint):
             else:
                 check_values = values[self.item_indices]
 
-        if self.lower is not None:
-            if np.any(check_values < self.lower - tol):
-                return False
-        if self.upper is not None:
-            if np.any(check_values > self.upper + tol):
-                return False
-
-        return True
+        if self.lower is not None and np.any(check_values < self.lower - tol):
+            return False
+        return self.upper is None or not np.any(check_values > self.upper + tol)
 
     def penalty(self, model: BaseItemModel) -> float:
         params = model.parameters

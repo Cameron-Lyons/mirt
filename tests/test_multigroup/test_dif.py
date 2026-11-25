@@ -489,4 +489,4 @@ def test_items_without_free_coordinates_warn() -> None:
 def test_scheme_names_come_from_the_literal() -> None:
     from typing import get_args
 
-    assert dif_module.DIF_SCHEMES == get_args(dif_module.DIFScheme)
+    assert get_args(dif_module.DIFScheme) == dif_module.DIF_SCHEMES

@@ -283,7 +283,7 @@ default="auto"
             self._m_step_weighted(model, responses, posterior_weights, weights)
             del posterior_weights
 
-        if not converged:
+        else:
             posterior_weights, log_marginal = self._e_step_weighted(
                 model, responses, prior_mean, prior_cov, weights
             )
@@ -310,7 +310,7 @@ default="auto"
         return FitResult(
             model=model,
             log_likelihood=current_ll,
-            n_iterations=iteration + 1,
+            n_iterations=len(self._convergence_history),
             converged=converged,
             standard_errors=standard_errors,
             aic=aic,

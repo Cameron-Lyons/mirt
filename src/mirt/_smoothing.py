@@ -73,7 +73,8 @@ def smooth_response_curves(
         )
         block_curves = responses.T @ weights
         mass = weights.sum(axis=0) if valid_values is None else valid_values.T @ weights
-        if calculate_se:
+        second_moments = None
+        if standard_errors is not None:
             assert squared_responses is not None
             second_moment = (
                 block_curves.copy()
@@ -86,6 +87,7 @@ def smooth_response_curves(
                 if valid_values is None
                 else valid_values.T @ weights
             )
+            second_moments = second_moment, squared_mass
         del weights
 
         np.divide(block_curves, mass, out=block_curves, where=mass > 0.0)
@@ -93,7 +95,8 @@ def smooth_response_curves(
             block_curves[mass <= 0.0] = np.nan
         curves[:, start:stop] = block_curves
 
-        if standard_errors is not None:
+        if second_moments is not None and standard_errors is not None:
+            second_moment, squared_mass = second_moments
             np.divide(second_moment, mass, out=second_moment, where=mass > 0.0)
             second_moment -= np.square(block_curves)
             np.maximum(second_moment, 0.0, out=second_moment)
@@ -149,6 +152,7 @@ def _stable_gaussian_weights(
         log_weights /= bandwidth
         np.square(log_weights, out=log_weights)
         log_weights *= -0.5
+    log_sample_weight = None
     if sample_weight is None:
         column_maximum = np.max(log_weights, axis=0)
     else:
@@ -164,10 +168,10 @@ def _stable_gaussian_weights(
     # Remove the common distance before adding person weights; a large common
     # distance can otherwise round away even substantial weight differences.
     np.subtract(log_weights, column_maximum, out=log_weights, where=ordinary)
-    if sample_weight is not None:
+    if log_sample_weight is not None:
         log_weights += log_sample_weight[:, None]
     if not np.all(ordinary):
-        if sample_weight is None:
+        if log_sample_weight is None:
             log_sample_weight = np.zeros(samples.size, dtype=np.float64)
         log_weights[:, ~ordinary] = _extreme_gaussian_log_weights(
             samples, grid[~ordinary], bandwidth, log_sample_weight

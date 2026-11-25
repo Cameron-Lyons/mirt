@@ -128,11 +128,12 @@ def mc_standard_errors(
         if not any(np.any(masks[name][item]) for name in originals):
             continue
 
-        def restore():
+        def restore(originals=originals, item=item):
             for name, value in originals.items():
                 model.set_item_parameter(item, name, value)
 
         kernel = None
+        current = None
         default_model = (
             estimator._uses_default_item_methods()
             and estimator._uses_default_information_model(model)
@@ -191,13 +192,20 @@ def mc_standard_errors(
                         bounds,
                     )
         if kernel is not None:
+            assert current is not None
             coordinate = 0
-            for name, original in originals.items():
+            for name in originals:
                 item_mask = np.asarray(masks[name][item]).reshape(-1)
                 item_result = result[name][item : item + 1].reshape(-1)
                 for index in np.flatnonzero(item_mask):
 
-                    def gradient_at_offset(offset):
+                    def gradient_at_offset(
+                        offset,
+                        current=current,
+                        coordinate=coordinate,
+                        item=item,
+                        kernel=kernel,
+                    ):
                         candidate = current.copy()
                         candidate[coordinate] += offset
                         try:
@@ -293,7 +301,7 @@ def _numerical_item_errors(
         if not np.any(masks[name][item]):
             continue
 
-        def likelihood(value):
+        def likelihood(value, name=name):
             try:
                 model.set_item_parameter(item, name, value)
                 return estimator._item_expected_log_likelihood(

@@ -779,6 +779,7 @@ def lagrange(
     if result is not None:
         model = result.model
     response_matrix = _response_matrix(model, responses)
+    theta_array = None
     if result is None:
         if theta is None:
             raise ValueError("theta is required unless model is a fit result")
@@ -820,6 +821,7 @@ def lagrange(
 
     marginal_vcov = None
     if result is None:
+        assert theta_array is not None
         score_subset = _conditional_scores(
             model,
             response_matrix,

@@ -1114,7 +1114,9 @@ def _numerical_difficulties(
         item_index = int(indices[position])
         target = float(targets[position])
 
-        def objective(theta_value: float) -> float:
+        def objective(
+            theta_value: float, item_index: int = item_index, target: float = target
+        ) -> float:
             probability = _difficulty_probability_curve(
                 model, np.array([theta_value]), item_index
             )[0]

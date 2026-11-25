@@ -230,7 +230,7 @@ class TestAnalyzeResiduals:
         result = analyze_residuals(model, dichotomous_responses["responses"])
 
         assert len(result.item_residuals) == dichotomous_responses["n_items"]
-        for j, stats in result.item_residuals.items():
+        for stats in result.item_residuals.values():
             assert "mean" in stats
             assert "sd" in stats
             assert "max_abs_z" in stats
@@ -241,7 +241,7 @@ class TestAnalyzeResiduals:
         result = analyze_residuals(model, dichotomous_responses["responses"])
 
         assert len(result.pattern_residuals) > 0
-        for pattern, stats in result.pattern_residuals.items():
+        for stats in result.pattern_residuals.values():
             assert "mean_z" in stats
             assert "n" in stats
 

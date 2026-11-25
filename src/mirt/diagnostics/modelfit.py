@@ -877,6 +877,8 @@ def _prepare_fit_moments(
     theta_values = (
         _prepare_theta(model, theta, responses.shape[0]) if theta is not None else None
     )
+    expected_moments = None
+    max_score = 0
     if theta is None:
         expected_moments, max_score = _integrate_model_moments(
             model, n_quadpts, latent=latent
@@ -913,6 +915,7 @@ def _prepare_fit_moments(
     observed_moments = observed.finish(pair_counts)
     if expected is not None:
         expected_moments = expected.finish(pair_counts)
+    assert expected_moments is not None
     return _FitMoments(
         observed_uni=observed_moments.univariate,
         observed_bi=observed_moments.bivariate,
@@ -1092,6 +1095,7 @@ def _integration_blocks(
         nodes, weights = _latent_grid(model, n_quadpts, latent)
     else:
         nodes = _prepare_theta(model, theta, len(responses))
+        weights = None
     rows = None if layout is None or layout.categories is None else layout.design_rows()
     n_moments = model.n_items * (model.n_items + 1) // 2 if rows is None else len(rows)
     chunk_rows = min(
@@ -1109,7 +1113,9 @@ def _integration_blocks(
                 if rows is not None:
                     present = present[:, rows]
         block_weights = (
-            weights[start:stop] if theta is None else np.ones(len(nodes[start:stop]))
+            weights[start:stop]
+            if weights is not None
+            else np.ones(len(nodes[start:stop]))
         )
         yield nodes[start:stop], block_weights, present
 
@@ -1297,21 +1303,23 @@ def _model_moment_jacobian(
                         worker.set_parameters(**restore)
                 perturbed.append(value)
             upper, lower = perturbed
-            if upper is None or lower is None:
+            if upper is not None and lower is not None:
+                derivative = (upper - lower) / (2 * step)
+            else:
                 if item is None:
                     center_value = original
                 elif categorical:
                     center_value = _conditional_item_probabilities(model, nodes, item)
                 else:
                     center_value = means[:, item]
-            if upper is not None and lower is not None:
-                derivative = (upper - lower) / (2 * step)
-            elif upper is not None:
-                derivative = (upper - center_value) / step
-            elif lower is not None:
-                derivative = (center_value - lower) / step
-            else:
-                raise ValueError(f"cannot differentiate model moment parameter {name}")
+                if upper is not None:
+                    derivative = (upper - center_value) / step
+                elif lower is not None:
+                    derivative = (center_value - lower) / step
+                else:
+                    raise ValueError(
+                        f"cannot differentiate model moment parameter {name}"
+                    )
             if item is None:
                 if present is not None:
                     derivative *= present

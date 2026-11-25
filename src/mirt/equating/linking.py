@@ -1369,9 +1369,11 @@ def _closed_form_bootstrap_samples(
             1,
             min(n_bootstrap, _BOOTSTRAP_CHUNK_ELEMENTS // max(1, n_items)),
         )
-    elif isinstance(chunk_size, bool) or not isinstance(chunk_size, (int, np.integer)):
-        raise ValueError("chunk_size must be a positive integer")
-    elif chunk_size <= 0:
+    elif (
+        isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, (int, np.integer))
+        or chunk_size <= 0
+    ):
         raise ValueError("chunk_size must be a positive integer")
 
     A_samples = np.empty(n_bootstrap, dtype=np.float64)

@@ -1046,7 +1046,7 @@ class TestChainStandardErrors:
         pairwise = [(1.3, 0.4), (0.8, -0.2), (1.1, 0.5)]
         for reference_index in range(4):
 
-            def cumulative(values):
+            def cumulative(values, reference_index=reference_index):
                 constants = values.reshape(-1, 2)
                 A, B = accumulate_constants(
                     list(1.0 / constants[:, 0]),

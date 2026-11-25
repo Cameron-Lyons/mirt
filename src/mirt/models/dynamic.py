@@ -4646,11 +4646,12 @@ class GrowthMixtureModel:
             )
             return grams, covariance.solve(observations) @ design
 
-        if not complete_data:
-            precision_grams, precision_observations = gls_terms(covariance)
+        precision_terms = None if complete_data else gls_terms(covariance)
 
         converged = False
-        for iteration in range(max_iter):
+        n_iterations = 0
+        for _ in range(max_iter):
+            n_iterations += 1
             trajectories = self._validated_class_trajectories(times)
             log_likelihoods = self._class_log_likelihood_from_covariance(
                 observations,
@@ -4662,17 +4663,23 @@ class GrowthMixtureModel:
             prev_proportions = self.class_proportions.copy()
             prev_intercepts = self.class_intercepts.copy()
             prev_slopes = self.class_slopes.copy()
-            if self.growth_type == "quadratic":
-                prev_quadratics = self.class_quadratics.copy()
-            elif self.growth_type == "piecewise":
-                prev_post_slopes = self.class_post_slopes.copy()
+            prev_quadratics = (
+                self.class_quadratics.copy()
+                if self.growth_type == "quadratic"
+                else None
+            )
+            prev_post_slopes = (
+                self.class_post_slopes.copy()
+                if self.growth_type == "piecewise"
+                else None
+            )
 
             self.class_proportions = np.mean(posteriors, axis=0)
 
             class_mass = np.sum(posteriors, axis=0)
             active = class_mass >= PROB_EPSILON
             safe_mass = np.where(active, class_mass, 1.0)
-            if complete_data:
+            if precision_terms is None:
                 weighted_means = (posteriors.T @ observations) / safe_mass[:, None]
                 coefficients = np.linalg.lstsq(
                     design,
@@ -4680,6 +4687,7 @@ class GrowthMixtureModel:
                     rcond=None,
                 )[0].T
             else:
+                precision_grams, precision_observations = precision_terms
                 normal_matrices = np.tensordot(
                     posteriors, precision_grams, axes=([0], [0])
                 )
@@ -4716,12 +4724,12 @@ class GrowthMixtureModel:
             int_change = np.max(np.abs(self.class_intercepts - prev_intercepts))
             slope_change = np.max(np.abs(self.class_slopes - prev_slopes))
             parameter_change = max(prop_change, int_change, slope_change)
-            if self.growth_type == "quadratic":
+            if prev_quadratics is not None:
                 quadratic_change = np.max(
                     np.abs(self.class_quadratics - prev_quadratics)
                 )
                 parameter_change = max(parameter_change, quadratic_change)
-            elif self.growth_type == "piecewise":
+            elif prev_post_slopes is not None:
                 post_slope_change = np.max(
                     np.abs(self.class_post_slopes - prev_post_slopes)
                 )
@@ -4742,8 +4750,8 @@ class GrowthMixtureModel:
                     variances,
                     observation_mask,
                 )
-                if not complete_data:
-                    precision_grams, precision_observations = gls_terms(covariance)
+                if precision_terms is not None:
+                    precision_terms = gls_terms(covariance)
                 parameter_change = max(
                     parameter_change,
                     float(np.max(np.abs(np.subtract(variances, previous_variances)))),
@@ -4771,7 +4779,7 @@ class GrowthMixtureModel:
             "classifications": classifications,
             "posteriors": final_posteriors,
             "log_likelihood": log_likelihood,
-            "n_iterations": iteration + 1,
+            "n_iterations": n_iterations,
             "converged": converged,
         }
 

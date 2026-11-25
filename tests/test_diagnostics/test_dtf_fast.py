@@ -698,8 +698,8 @@ class TestLinkedDTF:
         assert abs(unlinked["DTF"]) > 0.5
         assert linked["DTF"] == pytest.approx(0.0, abs=1e-3)
         A, B = linked["linking_constants"]
-        assert A == pytest.approx(1.2, rel=1e-4)
-        assert B == pytest.approx(-1.0, abs=1e-4)
+        assert pytest.approx(1.2, rel=1e-4) == A
+        assert pytest.approx(-1.0, abs=1e-4) == B
         assert linked["anchor_items"] == [0, 1, 2, 3]
         np.testing.assert_allclose(
             linked["expected_score_focal"], linked["expected_score_ref"], atol=1e-3

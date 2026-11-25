@@ -178,11 +178,11 @@ def _simulate_responses(
     n_persons = theta_values.shape[0]
     if chunk_size is None:
         chunk_size = max(1, min(n_persons, default_rows))
-    elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
-        chunk_size, (int, np.integer)
+    elif (
+        isinstance(chunk_size, (bool, np.bool_))
+        or not isinstance(chunk_size, (int, np.integer))
+        or chunk_size <= 0
     ):
-        raise ValueError("chunk_size must be a positive integer")
-    elif chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
     return draw_item_responses(
         model,
@@ -248,13 +248,12 @@ class BaseItemModel(ABC):
             )
         # Store a plain int even when given 2.0, True or np.int64(2).
         n_factors = int(n_factors)
-        if not self.supports_multidimensional:
-            if n_factors != 1:
-                raise MirtModelError(
-                    f"{self.model_name} only supports unidimensional models",
-                    model_type=self.model_name,
-                    n_factors=n_factors,
-                )
+        if not self.supports_multidimensional and n_factors != 1:
+            raise MirtModelError(
+                f"{self.model_name} only supports unidimensional models",
+                model_type=self.model_name,
+                n_factors=n_factors,
+            )
 
         self.n_items = n_items
         self.n_factors = n_factors

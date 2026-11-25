@@ -44,8 +44,8 @@ class TestDRF:
             groups=two_group_responses["groups"],
         )
 
-        assert "information_ref" in result or "information_reference" in result.keys()
-        assert "information_focal" in result or "info_focal" in result.keys()
+        assert "information_ref" in result or "information_reference" in result
+        assert "information_focal" in result or "info_focal" in result
 
     def test_drf_by_theta(self, two_group_responses):
         """Test DRF at different theta values."""
@@ -114,8 +114,8 @@ class TestReliabilityInvariance:
         """Test reliability invariance computation."""
         result = reliability_result
 
-        assert "reliability_ref" in result or "reliability_reference" in result.keys()
-        assert "reliability_foc" in result or "reliability_focal" in result.keys()
+        assert "reliability_ref" in result or "reliability_reference" in result
+        assert "reliability_foc" in result or "reliability_focal" in result
 
     def test_reliability_values(self, reliability_result):
         """Test that reliability values are in valid range."""

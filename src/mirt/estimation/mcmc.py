@@ -451,9 +451,8 @@ def _marginal_log_likelihood(
     n_persons = responses.shape[0]
     precision = np.linalg.inv(cov)
     log_det = float(2.0 * np.sum(np.log(np.diag(factor))))
-    share = 1.0
+    proposal = None
     if posterior is not None:
-        share = _DEFENSIVE_SHARE
         centers = np.asarray(posterior[0], dtype=np.float64)
         spread = _POSTERIOR_INFLATION * np.asarray(posterior[1], dtype=np.float64)
         spread = spread + 1e-6 * np.eye(n_factors)
@@ -462,6 +461,7 @@ def _marginal_log_likelihood(
         person_log_det = 2.0 * np.sum(
             np.log(np.diagonal(person_factors, axis1=1, axis2=2)), axis=1
         )
+        proposal = centers, person_factors, person_precision, person_log_det
     total = np.full(n_persons, -np.inf)
     drawn = 0
     while drawn < _IMPORTANCE_DRAWS:
@@ -470,7 +470,9 @@ def _marginal_log_likelihood(
         points = mean + noise @ factor.T
         log_prior = _gaussian_log_density(points, mean, precision, log_det)
         log_proposal = log_prior
-        if posterior is not None:
+        if proposal is not None:
+            centers, person_factors, person_precision, person_log_det = proposal
+            share = _DEFENSIVE_SHARE
             approximate = centers[:, None, :] + np.einsum(
                 "nij,nsj->nsi", person_factors, noise
             )

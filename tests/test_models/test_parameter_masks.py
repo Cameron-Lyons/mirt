@@ -214,7 +214,7 @@ def test_partial_binary_coordinates_fit_and_se_match_independent_curvature(
     correct = responses.T @ posterior
     for item in range(1, 4):
 
-        def objective(location):
+        def objective(location, item=item):
             p = c[item] + (1 - c[item]) * expit(a[item] * (points - location))
             return np.sum(
                 correct[item] * np.log(p) + (observed - correct[item]) * np.log1p(-p)

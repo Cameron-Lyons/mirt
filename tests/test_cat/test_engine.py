@@ -272,7 +272,7 @@ class TestCATEngineStoppingRules:
         max_items = 3
         cat = CATEngine(model, max_items=max_items, seed=42)
 
-        for i in range(max_items + 5):
+        for _ in range(max_items + 5):
             state = cat.get_current_state()
             if state.is_complete:
                 break

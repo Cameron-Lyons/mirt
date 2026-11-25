@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -558,10 +559,8 @@ def _latent_scale_updates(
     rows = masks[slope_name].reshape(-1, n_factors)
     factors = []
     if np.all(rows.any(axis=1) == rows.all(axis=1)):
-        try:
+        with contextlib.suppress(np.linalg.LinAlgError):
             factors.append(np.linalg.cholesky(covariance))
-        except np.linalg.LinAlgError:
-            pass
     if n_factors > 1 or not factors:
         factors.append(np.diag(np.sqrt(np.diag(covariance))))
     # The slopes of each item (or category) on the factors, as rows.
@@ -1167,6 +1166,7 @@ default="auto"
                 expanded = None
             return posterior, objective
 
+        iteration = -1
         for iteration in range(self.max_iter):
             rust_result = None
             if use_rust_3pl:
@@ -1177,13 +1177,7 @@ default="auto"
             if rust_result is None:
                 posterior_weights, current_ll = evaluate()
             else:
-                (
-                    new_discrimination,
-                    new_difficulty,
-                    new_guessing,
-                    posterior_weights,
-                    current_ll,
-                ) = rust_result
+                posterior_weights, current_ll = rust_result[3:]
 
             self._convergence_history.append(current_ll)
 
@@ -1202,6 +1196,7 @@ default="auto"
             if rust_result is None:
                 self._m_step(model, responses, weighted_posterior)
             else:
+                new_discrimination, new_difficulty, new_guessing = rust_result[:3]
                 model.set_parameters(
                     discrimination=new_discrimination,
                     difficulty=new_difficulty,
@@ -1755,6 +1750,7 @@ default="auto"
     ) -> None:
         import os
         from concurrent.futures import ThreadPoolExecutor
+        from itertools import chain
 
         quad_points = self._quadrature.nodes
         fit_context = self._fit_context
@@ -1814,40 +1810,43 @@ default="auto"
 
         item_counts: dict[int, dict[str, NDArray[np.float64]]]
         items: Iterable[int] = range(model.n_items)
+        tied_items = () if tied is None else tied.items
+        needs_shared_counts = bool(_free_shared_parameters(model))
+        shared_counts = None
         if model.is_polytomous:
             category_counts = context.category_counts(
                 model.n_categories, posterior_weights
             )
             if self._uses_newton_polytomous_m_step(model):
                 items = self._newton_polytomous_m_step(
-                    model, category_counts, skip=() if tied is None else tied.items
+                    model, category_counts, skip=tied_items
                 )
             item_counts = {
-                item_idx: {"r_kc": category_counts[item_idx]} for item_idx in items
+                item_idx: {"r_kc": category_counts[item_idx]}
+                for item_idx in chain(items, tied_items)
             }
+            if needs_shared_counts:
+                shared_counts = category_counts
         else:
             correct, observed = context.expected_counts(posterior_weights)
             if self._uses_newton_logistic_m_step(model):
                 items = self._newton_logistic_m_step(
-                    model, correct, observed, skip=() if tied is None else tied.items
+                    model, correct, observed, skip=tied_items
                 )
             elif self._uses_newton_guessing_m_step(model):
                 items = self._newton_guessing_m_step(
-                    model, correct, observed, skip=() if tied is None else tied.items
+                    model, correct, observed, skip=tied_items
                 )
             item_counts = {
                 item_idx: {"r_k": correct[item_idx], "n_k_valid": observed[item_idx]}
-                for item_idx in items
+                for item_idx in chain(items, tied_items)
             }
+            if needs_shared_counts:
+                from mirt.estimation._shared_step import binary_category_counts
+
+                shared_counts = binary_category_counts(correct, observed)
         # Items linked by equality constraints are optimized jointly below.
-        tied_counts: dict[int, dict[str, NDArray[np.float64]]] = {}
-        for item in () if tied is None else tied.items:
-            item_counts.pop(item, None)
-            tied_counts[item] = (
-                {"r_kc": category_counts[item]}
-                if model.is_polytomous
-                else {"r_k": correct[item], "n_k_valid": observed[item]}
-            )
+        tied_counts = {item: item_counts.pop(item) for item in tied_items}
 
         n_jobs = self.n_jobs
         if n_jobs == -1:
@@ -1893,15 +1892,8 @@ default="auto"
                 model, responses, posterior_weights, quad_points, tied_counts
             )
 
-        if _free_shared_parameters(model):
-            from mirt.estimation._shared_step import binary_category_counts
-
-            self._m_step_shared(
-                model,
-                category_counts
-                if model.is_polytomous
-                else binary_category_counts(correct, observed),
-            )
+        if shared_counts is not None:
+            self._m_step_shared(model, shared_counts)
 
     def _m_step_common_slope(
         self,
@@ -2637,7 +2629,9 @@ default="auto"
             prepared = prepare_polytomous_objective(
                 target, item_idx, quad_points, r_kc, self.prob_epsilon
             )
-            if prepared is None:
+            if prepared is not None:
+                objective = prepared
+            else:
 
                 def polytomous_objective(params: NDArray[np.float64]) -> float:
                     self._set_item_params(model, item_idx, params)
@@ -2684,7 +2678,9 @@ default="auto"
                     self.prob_epsilon,
                     layout_bounds,
                 )
-            if prepared is None:
+            if prepared is not None:
+                objective = prepared
+            else:
 
                 def dichotomous_objective(params: NDArray[np.float64]) -> float:
                     self._set_item_params(model, item_idx, params)
@@ -2700,10 +2696,8 @@ default="auto"
                 objective = dichotomous_objective
 
         analytic = prepared is not None
-        if prepared is not None:
-            objective = (
-                prepared if layout is None else _fix_coordinates(prepared, *layout)
-            )
+        if prepared is not None and layout is not None:
+            objective = _fix_coordinates(prepared, *layout)
         if self._prior_penalty is not None:
             objective, bounds = self._prior_penalty.penalize(
                 model, item_idx, objective, bounds, analytic=analytic

@@ -258,6 +258,7 @@ class GVEMEstimator(BaseEstimator):
         prev_elbo = -np.inf
         converged = False
 
+        iteration = -1
         for iteration in range(self.max_iter):
             self._e_step(model, responses, prior_mean, prior_cov)
 

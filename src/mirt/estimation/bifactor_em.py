@@ -525,6 +525,7 @@ default="auto"
         self._convergence_history = []
         previous = -np.inf
         converged = False
+        iteration = -1
         for iteration in range(self.max_iter):
             current, statistics = problem.expected_counts(model, grid, context)
             self._convergence_history.append(current)

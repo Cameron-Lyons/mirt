@@ -513,8 +513,8 @@ class TestCommonScaleDIF:
         )
 
         A, B = result["linking_constants"]
-        assert A == pytest.approx(1.2, rel=1e-5)
-        assert B == pytest.approx(-1.0, abs=1e-5)
+        assert pytest.approx(1.2, rel=1e-5) == A
+        assert pytest.approx(-1.0, abs=1e-5) == B
         # a: 0 / (0.1**2 + (0.12 / 1.2)**2); b: 0.6**2 / (0.15**2 + (1.2 * 0.125)**2)
         assert result["statistic"][0] == pytest.approx(8.0, rel=1e-4)
         assert result["df"][0] == 2

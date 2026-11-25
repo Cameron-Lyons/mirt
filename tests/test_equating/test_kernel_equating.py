@@ -104,7 +104,7 @@ def test_equated_scores_invert_independent_continuized_cdfs(forms, bandwidth):
     result = kernel_equating(old, new, bandwidth=bandwidth)
 
     expected = [
-        brentq(lambda y, p=cdf_old(x): cdf_new(y) - p, -40, 70, xtol=1e-14)
+        brentq(lambda y, p: cdf_new(y) - p, -40, 70, args=(cdf_old(x),), xtol=1e-14)
         for x in range(len(old))
     ]
     np.testing.assert_allclose(result.new_scores, expected, atol=1e-9)

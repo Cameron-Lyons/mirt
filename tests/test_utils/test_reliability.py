@@ -451,9 +451,11 @@ def test_reliability_validates_item_information_before_reducing(
         lambda theta: np.tile(values, (len(theta), 1)),
     )
 
-    with np.errstate(over="raise", invalid="raise", divide="raise"):
-        with pytest.raises(ValueError, match=message):
-            sem(logistic_model, [-1.0, 0.0, 1.0])
+    with (
+        np.errstate(over="raise", invalid="raise", divide="raise"),
+        pytest.raises(ValueError, match=message),
+    ):
+        sem(logistic_model, [-1.0, 0.0, 1.0])
 
 
 def test_posterior_score_result_uses_r_empirical_rxx_formula(

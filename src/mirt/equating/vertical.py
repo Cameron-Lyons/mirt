@@ -426,7 +426,7 @@ def vertical_scale_summary(result: VerticalScaleResult) -> str:
     )
 
     labels = list(result.grade_means.keys())
-    for i, (label, growth) in enumerate(zip(labels, result.growth_curve, strict=True)):
+    for label, growth in zip(labels, result.growth_curve, strict=True):
         lines.append(f"  {label}: {growth:.3f}")
 
     if result.monotonicity_violations:

@@ -98,6 +98,7 @@ def _affine_logits(
             return value if single_item or paired else value[:, None]
 
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        bifactor_points = None
         if specific_columns is None:
             if paired:
                 logits = np.einsum("ij,ij->i", theta, slopes)
@@ -109,6 +110,7 @@ def _affine_logits(
                 specific = theta[np.arange(len(theta)), specific_columns]
             else:
                 specific = theta[:, specific_columns]
+            bifactor_points = general, specific
             logits = general * slopes[..., 0]
             logits += specific * slopes[..., 1]
         logits += intercepts
@@ -119,10 +121,10 @@ def _affine_logits(
         if not direct_bound:
             theta_scale = (
                 np.abs(theta).max(initial=0.0)
-                if specific_columns is None
+                if bifactor_points is None
                 else np.maximum(
-                    np.abs(general).max(initial=0.0),
-                    np.abs(specific).max(initial=0.0),
+                    np.abs(bifactor_points[0]).max(initial=0.0),
+                    np.abs(bifactor_points[1]).max(initial=0.0),
                 )
             )
             max_bound = theta_scale * np.abs(slopes).max(
@@ -130,7 +132,7 @@ def _affine_logits(
             ) * n_coefficients + np.abs(intercepts).max(initial=0.0)
             if max_bound <= 1000.0:
                 return logits
-        if specific_columns is None:
+        if bifactor_points is None:
             if direct_bound:
                 bound = np.dot(np.abs(theta), np.abs(slopes).T)
                 if paired:
@@ -141,6 +143,7 @@ def _affine_logits(
                     row_scale = row_scale[:, None]
                 bound = row_scale * np.sum(np.abs(slopes), axis=-1)
         else:
+            general, specific = bifactor_points
             bound = np.abs(general) * np.abs(slopes[..., 0])
             bound += np.abs(specific) * np.abs(slopes[..., 1])
         bound += np.abs(intercepts)
@@ -315,14 +318,17 @@ def _item_information(
     """Preserve signed cross-factor information without squaring large slopes."""
     # Adaptive item selection repeatedly requests one small matrix. Scalar
     # arithmetic avoids array masks when neither tails nor slopes need recovery.
-    if logits.size == 1 and abs(float(logits[0])) < 700.0:
-        if all(
+    if (
+        logits.size == 1
+        and abs(float(logits[0])) < 700.0
+        and all(
             value == 0.0 or 1e-150 <= abs(value) <= 1e150 for value in slope.tolist()
-        ):
-            tail = exp(-abs(float(logits[0])))
-            scalar_variance = tail / (1.0 + tail) ** 2
-            with np.errstate(under="ignore"):
-                return (scalar_variance * np.outer(slope, slope))[None, :, :]
+        )
+    ):
+        tail = exp(-abs(float(logits[0])))
+        scalar_variance = tail / (1.0 + tail) ** 2
+        with np.errstate(under="ignore"):
+            return (scalar_variance * np.outer(slope, slope))[None, :, :]
     variance = _sigmoid_derivative(logits)
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
         coefficients = np.outer(slope, slope)

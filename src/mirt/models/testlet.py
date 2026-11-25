@@ -735,12 +735,11 @@ class TestletModel(DichotomousItemModel):
         if theta_values.shape[1] == 1:
             return self._marginal_components(theta_values[:, 0], item_idx)[0]
 
-        if item_idx is not None:
-            item = self._validate_item_index(item_idx)
+        item = self._validate_item_index(item_idx) if item_idx is not None else None
         a = self._parameters["discrimination"]
         slopes = self._testlet_slopes()
         b = self._parameters["difficulty"]
-        if item_idx is not None:
+        if item is not None:
             position = self._testlet_positions[item]
             linear = a[item] * theta_values[:, 0] - b[item]
             if position >= 0:

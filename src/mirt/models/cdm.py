@@ -505,11 +505,10 @@ class _NoisyGateCDM(BaseCDM):
                     f"{name} must contain finite probabilities in [0, 1]",
                     parameter=name,
                 )
-        if slip.shape == self.slip.shape and guess.shape == self.guess.shape:
-            if np.any(slip + guess >= 1.0):
-                raise MirtValidationError(
-                    "slip + guess must be less than 1 for every item"
-                )
+        if (slip.shape == self.slip.shape and guess.shape == self.guess.shape) and (
+            np.any(slip + guess >= 1.0)
+        ):
+            raise MirtValidationError("slip + guess must be less than 1 for every item")
         return super().set_parameters(**params)
 
     def _ideal_responses(self, alpha: NDArray[np.int_]) -> NDArray[np.bool_]:

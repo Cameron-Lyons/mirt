@@ -131,8 +131,8 @@ class TestLinkGRM:
             model_new, model_old, anchors, anchors, method="stocking_lord"
         )
 
-        assert result.constants.A == pytest.approx(A_true, abs=1e-10)
-        assert result.constants.B == pytest.approx(B_true, abs=1e-10)
+        assert pytest.approx(A_true, abs=1e-10) == result.constants.A
+        assert pytest.approx(B_true, abs=1e-10) == result.constants.B
 
     @pytest.mark.parametrize(
         "method", ["mean_sigma", "mean_mean", "stocking_lord", "haebara"]
@@ -151,8 +151,8 @@ class TestLinkGRM:
             compute_diagnostics=False,
         )
 
-        assert result.constants.A == pytest.approx(A_true, abs=1e-10)
-        assert result.constants.B == pytest.approx(B_true, abs=1e-10)
+        assert pytest.approx(A_true, abs=1e-10) == result.constants.A
+        assert pytest.approx(B_true, abs=1e-10) == result.constants.B
         assert result.constants.A > 0.0
         if method in {"stocking_lord", "haebara"}:
             assert result.convergence_info == {
@@ -224,8 +224,8 @@ class TestLinkGPCM:
             compute_diagnostics=False,
         )
 
-        assert result.constants.A == pytest.approx(A_true, abs=1e-10)
-        assert result.constants.B == pytest.approx(B_true, abs=1e-10)
+        assert pytest.approx(A_true, abs=1e-10) == result.constants.A
+        assert pytest.approx(B_true, abs=1e-10) == result.constants.B
         assert result.constants.A > 0.0
 
     def test_link_gpcm_returns_anchor_diagnostics(self, gpcm_model_pair):
@@ -249,8 +249,8 @@ class TestLinkNRM:
 
         result = link_nrm(model_new, model_old, anchors, anchors, method=method)
 
-        assert result.constants.A == pytest.approx(A_true, abs=1e-10)
-        assert result.constants.B == pytest.approx(B_true, abs=1e-10)
+        assert pytest.approx(A_true, abs=1e-10) == result.constants.A
+        assert pytest.approx(B_true, abs=1e-10) == result.constants.B
         assert result.constants.A > 0.0
         assert result.fit_statistics is not None
         assert result.fit_statistics.tcc_rmse == pytest.approx(0.0, abs=1e-12)
@@ -424,8 +424,8 @@ class TestLinkerDispatch:
                     method=method,
                 )
                 # The fixtures move the new form forward by (A_true, B_true).
-                assert result.constants.A == pytest.approx(1.0 / A_true, abs=1e-6)
-                assert result.constants.B == pytest.approx(-B_true / A_true, abs=1e-6)
+                assert pytest.approx(1.0 / A_true, abs=1e-6) == result.constants.A
+                assert pytest.approx(-B_true / A_true, abs=1e-6) == result.constants.B
                 assert result.anchor_diagnostics.item_indices == [0, 1, 2, 3, 4]
 
 
@@ -550,8 +550,8 @@ class TestPolytomousEdgeCases:
 
         result = link_gpcm(model_new, model_old, list(range(4)), list(range(4)))
 
-        assert result.constants.A == pytest.approx(A, abs=1e-10)
-        assert result.constants.B == pytest.approx(B, abs=1e-10)
+        assert pytest.approx(A, abs=1e-10) == result.constants.A
+        assert pytest.approx(B, abs=1e-10) == result.constants.B
         assert [
             len(values) for values in _extract_steps(model_old, list(range(4)))
         ] == [

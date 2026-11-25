@@ -379,12 +379,13 @@ class MixedEffectsIRT:
                     expected=">= 3",
                 )
 
-        if self._item_covariates is not None:
-            if self._item_covariates.shape[0] != n_items:
-                raise ValueError(
-                    f"Item covariates shape {self._item_covariates.shape[0]} "
-                    f"does not match n_items {n_items}"
-                )
+        if (self._item_covariates is not None) and (
+            self._item_covariates.shape[0] != n_items
+        ):
+            raise ValueError(
+                f"Item covariates shape {self._item_covariates.shape[0]} "
+                f"does not match n_items {n_items}"
+            )
 
         if verbose:
             print("Stage 1: Fitting base IRT model...")

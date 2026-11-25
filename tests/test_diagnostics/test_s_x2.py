@@ -780,9 +780,10 @@ def _reference_pooled_statistic(observed, expected, n_parameters, minimum):
         row = int(sparse_rows[0])
         if row == 0:
             neighbor = 1
-        elif row == len(expected) - 1:
-            neighbor = row - 1
-        elif observed[row - 1].sum() <= observed[row + 1].sum():
+        elif (
+            row == len(expected) - 1
+            or observed[row - 1].sum() <= observed[row + 1].sum()
+        ):
             neighbor = row - 1
         else:
             neighbor = row + 1
@@ -801,9 +802,10 @@ def _reference_pooled_statistic(observed, expected, n_parameters, minimum):
             category = int(np.argmin(row_expected))
             if category == 0:
                 neighbor = 1
-            elif category == len(row_expected) - 1:
-                neighbor = category - 1
-            elif row_expected[category - 1] <= row_expected[category + 1]:
+            elif (
+                category == len(row_expected) - 1
+                or row_expected[category - 1] <= row_expected[category + 1]
+            ):
                 neighbor = category - 1
             else:
                 neighbor = category + 1

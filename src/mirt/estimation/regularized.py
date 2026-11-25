@@ -521,6 +521,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
         prev_ll = -np.inf
         converged = False
 
+        iteration = -1
         for iteration in range(self.max_iter):
             posterior_weights, log_marginal = self._e_step(
                 responses, loadings, intercepts, latent_density

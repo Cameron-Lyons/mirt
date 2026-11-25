@@ -126,8 +126,8 @@ def test_equivalent_calibrations_have_identical_score_tables(model_type, backend
 def test_estimated_linking_constants_flow_into_true_score_equating(backend):
     old, new, known = _equivalent_forms(TwoParameterLogistic)
     estimated = link(old, new, [0, 1, 2, 3], [0, 1, 2, 3], method="mean_mean")
-    assert estimated.constants.A == pytest.approx(known.constants.A)
-    assert estimated.constants.B == pytest.approx(known.constants.B)
+    assert pytest.approx(known.constants.A) == estimated.constants.A
+    assert pytest.approx(known.constants.B) == estimated.constants.B
     result = true_score_equating(old, new, linking_result=estimated)
     reference = true_score_equating(old, old)
     np.testing.assert_allclose(result.new_scores, reference.new_scores, atol=1e-12)

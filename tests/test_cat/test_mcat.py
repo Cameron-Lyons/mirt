@@ -378,7 +378,7 @@ class TestMCATStoppingRules:
 
         projected_se = np.sqrt(0.04 + 0.09 - 2.0 * 0.03)
 
-        assert 0.5 >= 1.6448536269514722 * projected_se
+        assert 1.6448536269514722 * projected_se <= 0.5
         assert rule.should_stop(state)
         assert rule.classification == "above"
         assert "above" in rule.get_reason()
