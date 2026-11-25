@@ -216,7 +216,7 @@ def _bounded_reference_em(
         r_k, n_k = correct.T @ posterior, observed.T @ posterior
         for j in range(n_items):
 
-            def negative(x: np.ndarray, j: int = j) -> float:
+            def negative(x: np.ndarray, j: int = j, r_k=r_k, n_k=n_k) -> float:
                 z = x[0] * (points - x[1])
                 return -float(
                     np.sum(r_k[j] * log_expit(z) + (n_k[j] - r_k[j]) * log_expit(-z))

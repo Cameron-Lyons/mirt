@@ -500,6 +500,13 @@ def test_unknown_or_unsupported_prior_parameters_are_rejected(responses_2pl):
         nowhere.fit(ThreeParameterLogistic(4), data)
 
 
+def test_optimizer_finds_prior_support_between_grid_points():
+    prior = UniformPrior(0.201, 0.202)
+    penalty = ItemPriorPenalty({"guessing": prior})
+    lower, upper = penalty.bounds("guessing", (0.0, 1.0))
+    assert prior.lower <= lower < prior.mean < upper <= prior.upper
+
+
 def test_optimizer_boxes_are_intersected_with_the_prior_support():
     data = mirt.simdata("3PL", n_persons=300, n_items=4, seed=1)
     narrow = EMEstimator(

@@ -461,7 +461,7 @@ def _integrated_mixed_probabilities(
     chunk_size: int | None,
 ) -> NDArray[np.float64]:
     """Average response probabilities over Gaussian ability uncertainty."""
-    probability = getattr(model, "probability")
+    probability = model.probability
     if theta.shape[0] == 0:
         return np.asarray(probability(theta, item_idx=item_idx), dtype=np.float64)
 

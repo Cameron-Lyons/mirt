@@ -161,7 +161,7 @@ def test_sampling_recovers_probabilities_and_never_draws_zero_mass_points():
     draws = result.sample(20_000, seed=12)
     for person, weights in enumerate(result.weights):
         for point, weight in zip(result.points, weights, strict=True):
-            frequency = np.all(draws[person].T == point, axis=1).mean()
+            frequency = np.all(point == draws[person].T, axis=1).mean()
             if weight == 0.0:
                 assert frequency == 0.0
             else:

@@ -47,7 +47,7 @@ def normalize_log_posterior(
         if np.isfinite(peak):
             prior = log_prior_mass - peak
     block_size = max(1, _MAX_NORMALIZATION_ELEMENTS // n_points)
-    scratch: NDArray[np.float64] | None = None
+    workspace = None
     for start in range(0, n_rows, block_size):
         stop = min(start + block_size, n_rows)
         block = log_joint[start:stop]
@@ -66,9 +66,12 @@ def normalize_log_posterior(
                 log_marginal[start:stop] = shift + _normalize_rows(block)
                 continue
             block += prior[None, :]
-            if scratch is None:
-                scratch = np.empty((min(block_size, n_rows), n_points))
-                ones = np.ones(n_points)
+            if workspace is None:
+                workspace = (
+                    np.empty((min(block_size, n_rows), n_points)),
+                    np.ones(n_points),
+                )
+            scratch, ones = workspace
             work = scratch[: stop - start]
             np.exp(block, out=work)
             # A matrix-vector product sums the nonnegative rows fastest.

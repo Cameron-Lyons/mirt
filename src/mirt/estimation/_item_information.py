@@ -128,7 +128,7 @@ def item_standard_errors(
         second = derivative * (1 - 2 * cumulative)
         clipped = np.clip(p, epsilon, 1 - epsilon)
 
-        def curvature(dp, d2p):
+        def curvature(dp, d2p, effective=effective, clipped=clipped):
             return np.sum(effective * (d2p / clipped - (dp / clipped) ** 2))
 
         def category_difference(values):

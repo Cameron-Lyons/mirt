@@ -1008,6 +1008,7 @@ class LongitudinalGibbsSampler:
         if model.growth_model == "quadratic":
             X[:, 2] = time_values**2
 
+        assert model.growth_cov is not None
         precision_prior = np.linalg.inv(model.growth_cov)
         precision_lik = X.T @ X / model.residual_variance
         precision_post = precision_prior + precision_lik
@@ -1149,6 +1150,7 @@ class LongitudinalGibbsSampler:
         sample_mean = np.mean(growth_factors, axis=0)
         prior_mean, prior_precision = self._growth_mean_prior(n_growth)
 
+        assert model.growth_cov is not None
         cov_inv = np.linalg.inv(model.growth_cov)
         post_precision = prior_precision + n_persons * cov_inv
 
@@ -1241,6 +1243,7 @@ class LongitudinalGibbsSampler:
 
         # Location: an exact draw of the shift d.
         intercepts = growth_factors[:, 0]
+        assert model.growth_mean is not None and model.discrimination is not None
         slope_means = model.growth_mean[1:]
         loading = model.growth_cov[0, 1:]
         weighted_loading = slope_prior_precision @ loading

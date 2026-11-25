@@ -506,8 +506,8 @@ class TestCrossedRandomEffectsModel:
 
         assert np.all(np.isfinite(low))
         assert np.all(np.isfinite(high))
-        assert np.all((0.0 <= low) & (low <= 1.0))
-        assert np.all((0.0 <= high) & (high <= 1.0))
+        assert np.all((low >= 0.0) & (low <= 1.0))
+        assert np.all((high >= 0.0) & (high <= 1.0))
 
     def test_disabled_rater_effects_return_base_probabilities(self):
         assignments = np.array([[0, 1], [1, 0]])

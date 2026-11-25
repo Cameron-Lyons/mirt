@@ -56,7 +56,7 @@ def test_opportunities_match_closed_form_transition(model: BKTModel) -> None:
     assert_array_equal(priors, original_priors)
     assert_array_equal(targets, original_targets)
     with pytest.raises(FrozenInstanceError):
-        setattr(result, "opportunities", np.empty(0))
+        result.opportunities = np.empty(0)
 
 
 def test_default_target_is_broadcast(model: BKTModel) -> None:

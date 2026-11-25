@@ -132,10 +132,10 @@ def _validate_options(
         raise ValueError("n_permutations requires method='crossing'")
     rng = np.random.default_rng(random_state) if n_permutations else None
     return _SIBTESTOptions(
-        cast(SIBTESTMethod, method),
+        method,
         bool(correction),
         minimum,
-        cast(SIBTESTConvention, convention),
+        convention,
         int(n_permutations),
         rng,
     )
@@ -1421,11 +1421,18 @@ def _two_group_items(
         matching_totals = np.sum(response_data, axis=1)
     anchor_membership = np.zeros(n_items, dtype=np.bool_)
     anchor_membership[anchors] = True
+    correction_variances = None
     if correction:
         ref_item_variances = _item_variances(ref_data)
         focal_item_variances = _item_variances(focal_data)
         ref_anchor_variance = float(np.sum(ref_item_variances[anchors]))
         focal_anchor_variance = float(np.sum(focal_item_variances[anchors]))
+        correction_variances = (
+            ref_item_variances,
+            focal_item_variances,
+            ref_anchor_variance,
+            focal_anchor_variance,
+        )
 
     betas = np.full(n_items, np.nan)
     standard_errors = np.full(n_items, np.nan)
@@ -1449,7 +1456,13 @@ def _two_group_items(
         ref_suspect = ref_data[:, item_index]
         focal_suspect = focal_data[:, item_index]
         matching_variances = None
-        if correction:
+        if correction_variances is not None:
+            (
+                ref_item_variances,
+                focal_item_variances,
+                ref_anchor_variance,
+                focal_anchor_variance,
+            ) = correction_variances
             matching_variances = (
                 ref_anchor_variance - ref_item_variances[item_index]
                 if anchor_membership[item_index]
@@ -1542,9 +1555,12 @@ def _multigroup_items(
     matching_totals = np.sum(response_data[:, anchors], axis=1)
     anchor_membership = np.zeros(n_items, dtype=np.bool_)
     anchor_membership[anchors] = True
+    correction_variances = None
     if options.correction:
         item_variances = [_item_variances(response_data[mask]) for mask in masks]
-        anchor_variances = [float(np.sum(item[anchors])) for item in item_variances]
+        correction_variances = [
+            (float(np.sum(item[anchors])), item) for item in item_variances
+        ]
 
     per_contrast = {
         name: np.full((n_items, n_contrasts), np.nan)
@@ -1572,9 +1588,9 @@ def _multigroup_items(
             n_matching_items=int(anchors.size - is_anchor),
             matching_variances=[
                 total - item[item_index] if is_anchor else total
-                for total, item in zip(anchor_variances, item_variances, strict=True)
+                for total, item in correction_variances
             ]
-            if options.correction
+            if correction_variances is not None
             else None,
         )
         per_contrast["beta"][item_index] = result.beta

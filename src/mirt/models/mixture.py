@@ -418,11 +418,11 @@ class MixtureIRT(BaseItemModel):
                     _MIXTURE_MAX_SIMULATION_VALUES // working_values_per_person,
                 ),
             )
-        elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
-            chunk_size, (int, np.integer)
+        elif (
+            isinstance(chunk_size, (bool, np.bool_))
+            or not isinstance(chunk_size, (int, np.integer))
+            or chunk_size <= 0
         ):
-            raise ValueError("chunk_size must be a positive integer")
-        elif chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer")
 
         rng = np.random.default_rng(seed)
@@ -1144,6 +1144,7 @@ def _item_expected_objective(
             )
         )
         derivative_z = expected_total * logistic - expected_correct
+        gradient_guessing = None
     else:
         guessing = float(values[2])
         probability = guessing + (1.0 - guessing) * logistic
@@ -1161,19 +1162,19 @@ def _item_expected_objective(
         derivative_z = (
             derivative_probability * (1.0 - guessing) * logistic * (1.0 - logistic)
         )
+        gradient_guessing = float(np.sum(derivative_probability * (1.0 - logistic)))
 
     gradient_difficulty = float(np.sum(-discrimination * derivative_z))
     if base_model == "1PL":
         return objective, np.array([gradient_difficulty], dtype=np.float64)
 
     gradient_log_discrimination = float(np.sum(z * derivative_z))
-    if base_model == "2PL":
+    if gradient_guessing is None:
         return objective, np.array(
             [gradient_log_discrimination, gradient_difficulty],
             dtype=np.float64,
         )
 
-    gradient_guessing = float(np.sum(derivative_probability * (1.0 - logistic)))
     return objective, np.array(
         [
             gradient_log_discrimination,

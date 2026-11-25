@@ -21,7 +21,7 @@ Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
 uv run --no-sync ruff format src tests benchmarks .github/scripts
 uv run --no-sync ruff check src tests benchmarks .github/scripts
 
-uv run --no-sync mypy src/mirt --ignore-missing-imports
+uv run --no-sync ty check
 
 uv run --no-sync pytest
 

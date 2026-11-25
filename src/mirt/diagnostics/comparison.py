@@ -387,10 +387,7 @@ def vuong_test(
     p_value = 2.0 * special.ndtr(-abs(z))
 
     if p_value < validated_alpha:
-        if z > 0:
-            preferred = model1.model_name
-        else:
-            preferred = model2.model_name
+        preferred = model1.model_name if z > 0 else model2.model_name
     else:
         preferred = "neither"
 

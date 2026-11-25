@@ -58,11 +58,13 @@ class _BifactorStructure(BaseItemModel):
                 f"must match n_items ({n_items})"
             )
 
-        if not np.issubdtype(factor_values.dtype, np.integer):
-            if not np.issubdtype(factor_values.dtype, np.floating) or not np.all(
+        if (not np.issubdtype(factor_values.dtype, np.integer)) and (
+            not np.issubdtype(factor_values.dtype, np.floating)
+            or not np.all(
                 np.isfinite(factor_values) & (factor_values == np.floor(factor_values))
-            ):
-                raise ValueError("specific_factors must contain integer labels")
+            )
+        ):
+            raise ValueError("specific_factors must contain integer labels")
 
         factor_values = factor_values.astype(np.int_, copy=False)
         if np.any(factor_values < 0):

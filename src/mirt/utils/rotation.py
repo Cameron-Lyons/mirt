@@ -373,10 +373,8 @@ def rotate_loadings(
 
     if normalize is None:
         normalize = normalized_method == "promax"
-    if normalize:
-        normalized, row_scales, scaled_norms = _kaiser_normalize(loadings)
-    else:
-        normalized = loadings
+    normalization = _kaiser_normalize(loadings) if normalize else None
+    normalized = normalization[0] if normalization is not None else loadings
 
     starts = _starting_rotations(n_factors, int(random_starts), seed)
     factor_corr: NDArray[np.float64] | None
@@ -401,7 +399,8 @@ def rotate_loadings(
             rotated = normalized @ T
             factor_corr = None
 
-        if normalize:
+        if normalization is not None:
+            _, row_scales, scaled_norms = normalization
             with np.errstate(over="ignore", invalid="ignore"):
                 rotated = (rotated * scaled_norms) * row_scales
             if not np.all(np.isfinite(rotated)):

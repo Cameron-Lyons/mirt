@@ -76,8 +76,8 @@ def test_true_scores_accept_constants_estimated_by_public_link_api():
 
     actual = true_score_equating(old, new, linking_result=linking)
 
-    assert linking.constants.A == pytest.approx(1.4)
-    assert linking.constants.B == pytest.approx(-0.7)
+    assert pytest.approx(1.4) == linking.constants.A
+    assert pytest.approx(-0.7) == linking.constants.B
     # Interior scores have unique expected-score inverses on this grid.
     np.testing.assert_allclose(actual.new_scores[1:-1], [1.0, 2.0, 3.0], atol=1e-12)
 

@@ -293,7 +293,7 @@ def draw_item_responses(
                 value=probabilities.shape,
                 expected=f"({stop - start}, {n_items}, n_categories)",
             )
-        width = probabilities.shape[2]
+        width = probabilities.shape[-1]
         if width not in category_counts:
             category_counts[width] = _response_category_counts(model, width)
         draws = sample_categorical_tensor(

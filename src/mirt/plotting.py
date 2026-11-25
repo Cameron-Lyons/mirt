@@ -9,6 +9,7 @@ Callers may also supply an existing axes-compatible object.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Literal
 
 from mirt.constants import PROB_EPSILON
@@ -285,10 +286,9 @@ def _factor_item_information(
     matrix_function = getattr(model, "item_information_matrix", None)
     matrices = None
     if callable(matrix_function):
-        try:
+        # Mixed-format components may lack exact matrices.
+        with suppress(MirtModelError, NotImplementedError):
             matrices = np.asarray(matrix_function(theta, item_idx), dtype=np.float64)
-        except (MirtModelError, NotImplementedError):
-            pass  # e.g. mixed-format components without exact matrices
     if matrices is None:
         values = _numerical_factor_information(model, theta, item_idx, factor)
     elif matrices.shape == (n_points, n_factors, n_factors):
@@ -508,9 +508,10 @@ def _result_columns(
         }
         index = getattr(results, "index", None)
         labels = None if index is None else list(index)
-        if labels is not None and getattr(index, "name", None) is None:
-            if labels == list(range(len(labels))):
-                labels = None
+        if (labels is not None and getattr(index, "name", None) is None) and (
+            labels == list(range(len(labels)))
+        ):
+            labels = None
     names = None if labels is None else [str(label) for label in labels]
     return values, names
 

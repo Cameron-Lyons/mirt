@@ -617,7 +617,7 @@ def _expected_score_evaluator(
         None if np.array_equal(item_indices, np.arange(model.n_items)) else item_indices
     )
     if model.is_polytomous:
-        counts = np.asarray(getattr(model, "n_categories"), dtype=np.intp)
+        counts = np.asarray(model.n_categories, dtype=np.intp)
         counts = counts[item_indices]
         width = int(np.max(counts))
         observed = np.arange(width) < counts[:, None]
@@ -1087,7 +1087,7 @@ def _polytomous_probabilities(
     selected items are returned alongside.
     """
     raw_probabilities = np.asarray(model.probability(theta[:, None]), dtype=np.float64)
-    category_counts = np.asarray(getattr(model, "n_categories"), dtype=np.intp)
+    category_counts = np.asarray(model.n_categories, dtype=np.intp)
     if (
         raw_probabilities.ndim != 3
         or raw_probabilities.shape[:2] != (len(theta), model.n_items)
@@ -1124,7 +1124,7 @@ def _maximum_score(model: "BaseItemModel", item_indices: NDArray[np.intp]) -> in
     """Return the largest attainable sum score for selected items."""
     if not model.is_polytomous:
         return len(item_indices)
-    category_counts = np.asarray(getattr(model, "n_categories"), dtype=np.intp)
+    category_counts = np.asarray(model.n_categories, dtype=np.intp)
     return int(np.sum(category_counts[item_indices] - 1))
 
 

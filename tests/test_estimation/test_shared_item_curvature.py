@@ -46,7 +46,14 @@ def _personwise_reference(
             item, coordinate = index[0], index[1:]
             valid = responses[:, item] >= 0
 
-            def loss(offset):
+            def loss(
+                offset,
+                values=values,
+                item=item,
+                coordinate=coordinate,
+                name=name,
+                valid=valid,
+            ):
                 local = deepcopy(model)
                 current = (
                     values[item].copy() if values.ndim > 1 else float(values[item])
@@ -68,7 +75,7 @@ def _personwise_reference(
 
             center = loss(0.0)
 
-            def se(step):
+            def se(step, center=center):
                 numerator = (
                     loss(step) - 2 * center + loss(-step)
                     if method != "forward"

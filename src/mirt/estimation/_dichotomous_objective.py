@@ -182,6 +182,7 @@ def prepare_logistic_objective(
         else:
             z = _multidimensional_logits(points, a, b)
 
+        guessing_terms = None
         if has_guessing:
             c = params[n_slopes + 1]
             d = params[-1] if has_upper else 1.0
@@ -194,6 +195,7 @@ def prepare_logistic_objective(
             positive = z >= 0.0
             failure = np.where(positive, tail, 1.0 - tail)
             p = np.where(positive, d - (d - c) * tail, c + (d - c) * tail)
+            guessing_terms = c, d, tail, positive, failure
         elif ordinary:
             # Saturated nodes below need the logits.
             p = np.negative(z)
@@ -209,7 +211,8 @@ def prepare_logistic_objective(
         # which the optimizer cannot step against, so those nodes keep the
         # clip.
         exact = np.flatnonzero(~active)
-        if has_guessing:
+        unclipped = None
+        if guessing_terms is not None:
             exact = exact[:0] if has_upper else exact[p[exact] >= 1.0 - epsilon]
             unclipped = p[exact]
         np.clip(p, epsilon, 1.0 - epsilon, out=p)
@@ -223,7 +226,9 @@ def prepare_logistic_objective(
             score = residual
             score[~active] = 0.0
         if exact.size:
-            if has_guessing:
+            if guessing_terms is not None:
+                c, _, _, _, failure = guessing_terms
+                assert unclipped is not None
                 values, scores, usable = guessing_tails(
                     unclipped,
                     (1.0 - c) * failure[exact],
@@ -238,16 +243,18 @@ def prepare_logistic_objective(
                     z[rows], observed[rows], correct[rows]
                 )
         loss = -float(np.sum(terms))
-        common = score * (d - c) * tail * (1.0 - tail) if has_guessing else score
+        common = score
         gradient = np.empty_like(params)
-        if n_slopes:
-            gradient[:n_slopes] = (points - b).T @ common
-        gradient[n_slopes] = -slope_sum * common.sum()
-        if has_guessing:
+        if guessing_terms is not None:
+            c, d, tail, positive, failure = guessing_terms
+            common = score * (d - c) * tail * (1.0 - tail)
             gradient[n_slopes + 1] = failure @ score
             if has_upper:
                 success = np.where(positive, 1.0 - tail, tail)
                 gradient[-1] = success @ score
+        if n_slopes:
+            gradient[:n_slopes] = (points - b).T @ common
+        gradient[n_slopes] = -slope_sum * common.sum()
         return loss, gradient
 
     return objective

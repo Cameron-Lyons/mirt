@@ -1278,7 +1278,7 @@ def test_default_posterior_grid_reproduces_narrow_posteriors():
     # With 200 draws a ratio has Monte Carlo SD of about 0.1. The former
     # 21-node default gave a 10-90% range of 0.15-2.31 here.
     p10, p50, p90 = np.percentile(ratio, [10, 50, 90])
-    assert 0.7 < p10 and p90 < 1.35 and abs(p50 - 1.0) < 0.06
+    assert p10 > 0.7 and p90 < 1.35 and abs(p50 - 1.0) < 0.06
     np.testing.assert_array_equal(
         draws,
         generate_plausible_values(

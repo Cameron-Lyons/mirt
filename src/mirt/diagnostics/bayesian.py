@@ -10,7 +10,7 @@ This module provides:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -44,7 +44,7 @@ def _copy_state_value(value: Any) -> Any:
 def _preserve_model_state(
     model: BaseItemModel,
     parameter_names: set[str],
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     """Restore model parameters and mirrored private attributes on exit."""
     original_parameters = {
         name: value.copy() for name, value in model._parameters.items()
@@ -110,9 +110,7 @@ def _sampled_parameter_chains(
         theta_values = np.asarray(theta_chain, dtype=np.float64)
         if not np.all(np.isfinite(theta_values)):
             raise ValueError("chain 'theta' must contain only finite values")
-        if theta_values.ndim == 3:
-            sample_counts.append(theta_values.shape[0])
-        elif (
+        if theta_values.ndim == 3 or (
             theta_values.ndim == 2
             and model.n_factors == 1
             and theta_values.shape[1] == n_persons
@@ -1379,8 +1377,15 @@ def compute_pointwise_log_lik(
         n_persons=n_persons,
     )
 
-    batched_2pl = _supports_batched_pointwise_2pl(model)
-    if batched_2pl:
+    def allocate_log_lik() -> NDArray[np.float64]:
+        if by == "person":
+            return np.zeros((n_samples, n_persons), dtype=np.float64)
+        elif by == "observation":
+            return np.zeros((n_samples, n_persons * n_items), dtype=np.float64)
+        else:
+            return np.zeros((n_samples, int(np.sum(responses >= 0))), dtype=np.float64)
+
+    if _supports_batched_pointwise_2pl(model):
         from mirt.backends.rust.diagnostics import compute_pointwise_loglik_2pl
 
         discrimination, difficulty, theta = _batched_2pl_pointwise_inputs(
@@ -1399,23 +1404,7 @@ def compute_pointwise_log_lik(
                 aggregation=by,
             )
 
-    if by == "person":
-        log_lik = np.zeros((n_samples, n_persons), dtype=np.float64)
-    elif by == "observation":
-        log_lik = np.zeros((n_samples, n_persons * n_items), dtype=np.float64)
-    else:
-        log_lik = np.zeros((n_samples, int(np.sum(responses >= 0))), dtype=np.float64)
-
-    builtin_curves = uses_builtin_model_hooks(model)
-    if batch_size is None:
-        category_width = max(model.n_categories) if model.is_polytomous else 1
-        batch_size = (
-            max(1, _LOG_LIKELIHOOD_CHUNK_ELEMENTS // max(1, n_items * category_width))
-            if builtin_curves
-            else max(1, n_persons)
-        )
-
-    if batched_2pl:
+        log_lik = allocate_log_lik()
         offset = 0
         for start in range(0, n_persons, batch_size):
             stop = min(start + batch_size, n_persons)
@@ -1429,6 +1418,16 @@ def compute_pointwise_log_lik(
             log_lik[:, offset : offset + block.shape[1]] = block
             offset += block.shape[1]
         return log_lik
+
+    log_lik = allocate_log_lik()
+    builtin_curves = uses_builtin_model_hooks(model)
+    if batch_size is None:
+        category_width = max(model.n_categories) if model.is_polytomous else 1
+        batch_size = (
+            max(1, _LOG_LIKELIHOOD_CHUNK_ELEMENTS // max(1, n_items * category_width))
+            if builtin_curves
+            else max(1, n_persons)
+        )
 
     parameter_names = set(parameter_chains)
     with _preserve_model_state(model, parameter_names):

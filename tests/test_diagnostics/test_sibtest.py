@@ -24,7 +24,7 @@ class TestSIBTEST:
         )
 
         assert "beta" in result
-        assert "beta_se" in result or "SE" in result or "se" in result.keys()
+        assert "beta_se" in result or "SE" in result or "se" in result
         assert "p_value" in result
 
     def test_sibtest_crossing(self, two_group_responses):

@@ -296,7 +296,9 @@ class IRTreeEMEstimator(BaseEstimator):
         converged = False
         estimate_distribution = self.estimate_correlations and model.correlated_traits
         posterior_weights: NDArray[np.float64] | None = None
+        log_marginal = None
 
+        iteration = -1
         for iteration in range(self.max_iter):
             posterior_weights, log_marginal = self._e_step(
                 model,
@@ -347,7 +349,7 @@ class IRTreeEMEstimator(BaseEstimator):
                 trait_cov,
                 return_log=True,
             )
-        assert posterior_weights is not None
+        assert posterior_weights is not None and log_marginal is not None
         current_ll = float(np.sum(log_marginal))
         if not converged:
             self._convergence_history.append(current_ll)

@@ -683,15 +683,17 @@ def _perturbed_form(side: _DeltaSide, coordinate: int, value: float) -> _AnchorF
 
     ``coordinate`` indexes the concatenated component values.
     """
+    form = side.form
     for part, component in enumerate(side.components):
         if coordinate < component.values.size:
+            if component.values[coordinate] == value:
+                return form
+            if isinstance(form, _PolytomousForm):
+                return form.replaced(part, coordinate, value)
             break
         coordinate -= component.values.size
-    form = side.form
-    if component.values[coordinate] == value:
-        return form
-    if isinstance(form, _PolytomousForm):
-        return form.replaced(part, coordinate, value)
+    else:
+        raise IndexError("component coordinate out of range")
     values = component.values.copy()
     values[coordinate] = value
     if not form.is_native:

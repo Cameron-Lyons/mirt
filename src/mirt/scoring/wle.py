@@ -339,10 +339,7 @@ class WLEScorer:
 
             info = self._test_information(model, theta_arr, valid_mask)[0]
 
-            if info > PROB_EPSILON:
-                wl = ll + 0.5 * np.log(info)
-            else:
-                wl = ll
+            wl = ll + 0.5 * np.log(info) if info > PROB_EPSILON else ll
 
             return -wl
 
@@ -383,10 +380,7 @@ class WLEScorer:
         theta_arr = np.array([[theta_hat]])
         info = self._test_information(model, theta_arr, valid_mask)[0]
 
-        if info > PROB_EPSILON:
-            se = 1.0 / np.sqrt(info)
-        else:
-            se = np.inf
+        se = 1.0 / np.sqrt(info) if info > PROB_EPSILON else np.inf
 
         return theta_hat, se
 

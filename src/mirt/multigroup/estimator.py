@@ -704,11 +704,9 @@ class MultigroupEMEstimator:
         prev_ll = -np.inf
         n_iterations = 0
         converged = False
-        state_is_current = False
 
         for iteration in range(self.max_iter):
             posterior_weights, group_lls = self._e_step(model, responses)
-            state_is_current = True
 
             current_ll = float(sum(group_lls))
             self._log_iteration(current_ll)
@@ -724,13 +722,12 @@ class MultigroupEMEstimator:
             n_iterations = iteration + 1
 
             self._em_update(model, responses, posterior_weights, invariance, mean_order)
-            state_is_current = False
             if self._grow_grid(base_points):
                 # The likelihood is now integrated more accurately, so the
                 # next change does not measure convergence.
                 prev_ll = -np.inf
 
-        if not state_is_current:
+        else:
             posterior_weights, group_lls = self._e_step(model, responses)
             final_ll = float(sum(group_lls))
             self._convergence_history.append(final_ll)
@@ -1104,10 +1101,9 @@ class MultigroupEMEstimator:
             group_responses = responses[g]
             n_persons = group_responses.shape[0]
 
-            if hasattr(group_model, "log_likelihood_batch"):
-                log_likelihoods = group_model.log_likelihood_batch(
-                    group_responses, quad_points
-                )
+            batch_likelihood = getattr(group_model, "log_likelihood_batch", None)
+            if callable(batch_likelihood):
+                log_likelihoods = batch_likelihood(group_responses, quad_points)
             else:
                 log_likelihoods = np.zeros((n_persons, n_quad))
                 for q in range(n_quad):
@@ -1689,12 +1685,13 @@ class MultigroupEMEstimator:
             if name in shared:
                 for coordinate in np.flatnonzero(np.logical_or.reduce(name_masks)):
                     coupled = True
-                    for g, mask in enumerate(name_masks):
-                        if mask[coordinate]:
-                            positions[g].append(offset + coordinate)
-                            variables[g].append(len(start))
-                            value = rows[g][offset + coordinate]
-                    start.append(value)
+                    active_groups = [
+                        g for g, mask in enumerate(name_masks) if mask[coordinate]
+                    ]
+                    for g in active_groups:
+                        positions[g].append(offset + coordinate)
+                        variables[g].append(len(start))
+                    start.append(rows[active_groups[-1]][offset + coordinate])
                     box.append(bound)
                 continue
             for g, mask in enumerate(name_masks):
@@ -2011,7 +2008,7 @@ class MultigroupEMEstimator:
             solves.append((problem, used, local, terms, order))
 
         solutions = []
-        for problem, used, local, terms, order in solves:
+        for _, used, _, terms, order in solves:
             solution = self._minimize_item_terms(
                 terms, initial[used], [box[index] for index in used], order
             )
@@ -2186,9 +2183,8 @@ class MultigroupEMEstimator:
             )
             if not np.all(np.isfinite(result.x)):
                 return
-            if ordered_thresholds:
-                if np.min(matrix @ result.x + constants) < -1e-9:
-                    return
+            if (ordered_thresholds) and (np.min(matrix @ result.x + constants) < -1e-9):
+                return
             final_loss = evaluate(result.x)
             if not np.isfinite(final_loss) or final_loss > initial_loss + 1e-10 * max(
                 1.0, abs(initial_loss)

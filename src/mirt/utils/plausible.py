@@ -310,6 +310,7 @@ def _generate_pv_posterior(
                 model, responses[start:stop], means, nodes
             )
         else:
+            means = None
             log_likes = np.asarray(
                 model.log_likelihood_batch(responses[start:stop], nodes),
                 dtype=np.float64,
@@ -335,7 +336,7 @@ def _generate_pv_posterior(
         cumulative[:, -1] = 1.0
         indices = _inverse_cdf_rows(cumulative, uniforms[start:stop])
         draws = nodes[indices]
-        if person_specific:
+        if means is not None:
             draws += means[:, None, :]
         pvs[start:stop] = np.moveaxis(draws, 1, 2)
 

@@ -385,6 +385,7 @@ class EAPScorer:
                 n_items=model.n_items,
                 n_quad=quad_points.shape[0],
             )
+            grouping = None
             if n_patterns < n_persons:
                 # Group respondent indices once. Expansion is also batched so a
                 # common pattern cannot allocate another full posterior matrix.
@@ -392,6 +393,7 @@ class EAPScorer:
                 offsets = np.concatenate(
                     ([0], np.cumsum(np.bincount(inverse, minlength=n_patterns)))
                 )
+                grouping = grouped_rows, offsets
             for start in range(0, n_patterns, batch_size):
                 stop = min(start + batch_size, n_patterns)
                 batch_weights, batch_log_marginal = self._posterior_batch(
@@ -400,10 +402,11 @@ class EAPScorer:
                     quad_points,
                     log_weights,
                 )
-                if n_patterns == n_persons:
+                if grouping is None:
                     posterior_weights[start:stop] = batch_weights
                     log_marginal[start:stop] = batch_log_marginal
                 else:
+                    grouped_rows, offsets = grouping
                     for row_start in range(offsets[start], offsets[stop], batch_size):
                         rows = grouped_rows[
                             row_start : min(row_start + batch_size, offsets[stop])

@@ -202,7 +202,7 @@ class AbilityPosteriorResult:
         return entropy
 
     @staticmethod
-    def _validate_probability(value: float, *, parameter: str) -> float:
+    def _validate_probability(value: object, *, parameter: str) -> float:
         """Validate a scalar probability strictly between zero and one."""
         if isinstance(value, bool) or not isinstance(value, Real):
             resolved = np.nan

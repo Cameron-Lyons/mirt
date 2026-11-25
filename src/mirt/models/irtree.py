@@ -885,11 +885,11 @@ class IRTreeModel:
                     _IRTREE_MAX_PROBABILITY_VALUES // probability_values_per_person,
                 ),
             )
-        elif isinstance(chunk_size, bool) or not isinstance(
-            chunk_size, (int, np.integer)
+        elif (
+            isinstance(chunk_size, bool)
+            or not isinstance(chunk_size, (int, np.integer))
+            or chunk_size <= 0
         ):
-            raise ValueError("chunk_size must be a positive integer")
-        elif chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer")
 
         rng = np.random.default_rng(seed)

@@ -216,7 +216,7 @@ def test_native_polytomous_mstep_matches_scipy_objective(factory):
             ]
         )
 
-        def loss(fitted):
+        def loss(fitted, counts=counts, j=j):
             return -np.sum(
                 counts
                 * np.log(np.clip(fitted.probability(points, j), 1e-10, 1 - 1e-10))

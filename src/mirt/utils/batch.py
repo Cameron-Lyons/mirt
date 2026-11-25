@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -90,7 +90,7 @@ def _validate_models(models: Sequence[ModelType]) -> list[ModelType]:
             value=duplicate,
         )
 
-    return [cast(ModelType, model) for model in validated]
+    return validated
 
 
 def _validate_integer_grid(

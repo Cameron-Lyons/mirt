@@ -100,10 +100,11 @@ def _category_codes(responses: NDArray[Any]) -> NDArray[np.int32]:
     values = np.asarray(responses)
     if values.dtype == np.int32:
         return np.ascontiguousarray(values)
-    if values.dtype.kind in "iu" and values.size:
-        # Codes that fit in int32 keep their sign, hence their missingness.
-        if _INT32_MIN <= values.min() and values.max() <= _INT32_MAX:
-            return np.ascontiguousarray(values, dtype=np.int32)
+    # Codes that fit in int32 keep their sign, hence their missingness.
+    if (values.dtype.kind in "iu" and values.size) and (
+        values.min() >= _INT32_MIN and values.max() <= _INT32_MAX
+    ):
+        return np.ascontiguousarray(values, dtype=np.int32)
     observed = values >= 0
     if values.dtype.kind == "f" and np.any(observed & (values != np.trunc(values))):
         raise ValueError("observed response codes must be integers")

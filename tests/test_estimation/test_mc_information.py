@@ -651,4 +651,4 @@ def test_unidimensional_fits_report_observed_information(method, kind):
         # The Monte Carlo estimates differ slightly from EM's.
         free = model.free_parameter_masks[name]
         ratio = errors[free] / reference.standard_errors[name][free]
-        assert np.all((0.8 < ratio) & (ratio < 1.25))
+        assert np.all((ratio > 0.8) & (ratio < 1.25))

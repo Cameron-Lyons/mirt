@@ -105,7 +105,7 @@ class MultigroupModel:
             self._group_models.append(base_model.copy())
 
         self._parameter_links: dict[str, ParameterLink] = {}
-        for param_name in base_model.parameters.keys():
+        for param_name in base_model.parameters:
             self._parameter_links[param_name] = ParameterLink(param_name=param_name)
 
         self._base_model_class = base_model.__class__

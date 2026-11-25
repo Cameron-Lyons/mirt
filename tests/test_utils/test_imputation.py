@@ -468,7 +468,8 @@ class TestImputeResponses:
         mass = quad(posterior_kernel, -12.0, 12.0)[0]
         expected = [
             quad(
-                lambda point: posterior_kernel(point) * predictive(point, items),
+                lambda point, items=items: posterior_kernel(point)
+                * predictive(point, items),
                 -12.0,
                 12.0,
             )[0]

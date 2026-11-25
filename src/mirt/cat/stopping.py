@@ -62,7 +62,8 @@ class StoppingRule(ABC):
         pass
 
     def reset(self) -> None:
-        """Reset state before the rule is reused for another session."""
+        """Reset state before the rule is reused for another session (stateless by default)."""
+        return None
 
 
 @_register_native_defaults

@@ -79,8 +79,8 @@ def test_linking_recovers_the_reference_scale(model_type: type) -> None:
 
     linked, A, B = link_focal_to_reference(reference, focal, range(5))
 
-    assert A == pytest.approx(SCALE, rel=1e-4)
-    assert B == pytest.approx(SHIFT, abs=1e-4)
+    assert pytest.approx(SCALE, rel=1e-4) == A
+    assert pytest.approx(SHIFT, abs=1e-4) == B
     for name, values in reference.parameters.items():
         assert_allclose(linked.parameters[name], values, atol=1e-4)
     assert_allclose(focal.parameters["discrimination"], DISCRIMINATION * SCALE)
@@ -92,7 +92,7 @@ def test_one_parameter_linking_shifts_locations_only() -> None:
     linked, A, B = link_focal_to_reference(reference, focal, [0, 1, 2, 3, 4])
 
     assert A == 1.0
-    assert B == pytest.approx(SHIFT)
+    assert pytest.approx(SHIFT) == B
     assert_allclose(linked.parameters["difficulty"], LOCATION)
     assert_allclose(linked.parameters["discrimination"], 1.0)
 
@@ -120,8 +120,8 @@ def test_fit_linked_group_models_links_over_requested_anchors(
     all_items = fit_linked_group_models(data, data)
 
     assert anchored.anchor_items == [1, 2, 3, 4]
-    assert anchored.A == pytest.approx(SCALE, rel=1e-4)
-    assert anchored.B == pytest.approx(SHIFT, abs=1e-4)
+    assert pytest.approx(SCALE, rel=1e-4) == anchored.A
+    assert pytest.approx(SHIFT, abs=1e-4) == anchored.B
     assert anchored.focal_on_reference.parameters["difficulty"][0] == pytest.approx(
         LOCATION[0] + SCALE * 1.0, abs=1e-3
     )

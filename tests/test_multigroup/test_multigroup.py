@@ -222,7 +222,7 @@ class TestMultigroupAnalysis:
         assert "scalar" in results
         assert "strict" in results
 
-        for inv, result in results.items():
+        for result in results.values():
             assert result.model.is_fitted
 
     def test_3pl_model(self, rng):

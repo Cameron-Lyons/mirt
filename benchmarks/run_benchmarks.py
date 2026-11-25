@@ -14,6 +14,7 @@ import tracemalloc
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -318,10 +319,15 @@ def bench_binary_likelihood(
         shared = np.zeros((1, model.n_factors))
         grid = rng.normal(size=(121, model.n_factors))
         for stage, run in (
-            ("matched", lambda: model.log_likelihood(responses, theta)),
-            ("shared", lambda: model.log_likelihood(responses, shared)),
-            ("grid_21", lambda: model.log_likelihood_batch(responses, grid[:21])),
-            ("grid_121", lambda: model.log_likelihood_batch(responses, grid)),
+            ("matched", partial(model.log_likelihood, responses, theta)),
+            ("shared", partial(model.log_likelihood, responses, shared)),
+            (
+                "grid_21",
+                lambda model=model, grid=grid: model.log_likelihood_batch(
+                    responses, grid[:21]
+                ),
+            ),
+            ("grid_121", partial(model.log_likelihood_batch, responses, grid)),
         ):
             results.append(
                 BenchResult(
@@ -398,8 +404,7 @@ def bench_gpu_likelihood(
                 args += (params["guessing"],)
             kwargs = {}
 
-        def likelihood():
-            return kernel(*args, **kwargs)
+        likelihood = partial(kernel, *args, **kwargs)
 
         results.append(
             BenchResult(
@@ -420,11 +425,8 @@ def bench_weighted_em(
     rng = np.random.default_rng(42)
     weights = rng.uniform(0.25, 2.0, n_persons)
     results = []
-    for name, model in (
-        ("2pl", mirt.TwoParameterLogistic(n_items)),
-        ("mirt", mirt.TwoParameterLogistic(n_items, n_factors=2)),
-        ("grm", mirt.GradedResponseModel(n_items, n_categories=5)),
-    ):
+
+    def measure_model(name, model):
         responses = mirt.simdata(
             model=model.model_name,
             n_items=n_items,
@@ -450,7 +452,7 @@ def bench_weighted_em(
             )
         )
         if name == "mirt":
-            continue
+            return
 
         def fit():
             return WeightedEMEstimator(n_quadpts=21, max_iter=5, tol=1e-12).fit(
@@ -464,6 +466,13 @@ def bench_weighted_em(
                 peak_traced_bytes=_peak_traced_bytes(fit),
             )
         )
+
+    for name, model in (
+        ("2pl", mirt.TwoParameterLogistic(n_items)),
+        ("mirt", mirt.TwoParameterLogistic(n_items, n_factors=2)),
+        ("grm", mirt.GradedResponseModel(n_items, n_categories=5)),
+    ):
+        measure_model(name, model)
     return results
 
 
@@ -478,12 +487,8 @@ def bench_weighted_mstep(
     survey_weights = rng.uniform(0.25, 2.0, n_persons)
     survey_weights[::11] = 0.0
     results = []
-    for name, model in (
-        ("2pl", mirt.TwoParameterLogistic(n_items)),
-        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
-        ("grm", mirt.GradedResponseModel(n_items, n_categories=5)),
-        ("nrm", mirt.NominalResponseModel(n_items, n_categories=5)),
-    ):
+
+    def measure_model(name, model):
         categories = model.n_categories if model.is_polytomous else [2] * n_items
         responses = np.column_stack([rng.integers(0, k, n_persons) for k in categories])
         responses[rng.random(responses.shape) < 0.1] = -1
@@ -512,6 +517,14 @@ def bench_weighted_mstep(
                     peak_traced_bytes=_peak_traced_bytes(run),
                 )
             )
+
+    for name, model in (
+        ("2pl", mirt.TwoParameterLogistic(n_items)),
+        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
+        ("grm", mirt.GradedResponseModel(n_items, n_categories=5)),
+        ("nrm", mirt.NominalResponseModel(n_items, n_categories=5)),
+    ):
+        measure_model(name, model)
     return results
 
 
@@ -528,15 +541,8 @@ def bench_polytomous_fit(
     survey_weights = rng.uniform(0.25, 2.0, n_persons)
     survey_weights[::11] = 0.0
     results = []
-    for label, factory, factors in (
-        ("grm_1d", mirt.GradedResponseModel, 1),
-        ("grm_2d", mirt.GradedResponseModel, 2),
-        ("gpcm_1d", mirt.GeneralizedPartialCredit, 1),
-        ("gpcm_2d", mirt.GeneralizedPartialCredit, 2),
-        ("pcm_1d", mirt.PartialCreditModel, 1),
-        ("nrm_1d", mirt.NominalResponseModel, 1),
-        ("nrm_2d", mirt.NominalResponseModel, 2),
-    ):
+
+    def measure_model(label, factory, factors):
         model = factory(n_items, n_categories=categories, n_factors=factors)
         responses = np.column_stack([rng.integers(0, k, n_persons) for k in categories])
         responses[rng.random(responses.shape) < 0.1] = -1
@@ -576,6 +582,17 @@ def bench_polytomous_fit(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for label, factory, factors in (
+        ("grm_1d", mirt.GradedResponseModel, 1),
+        ("grm_2d", mirt.GradedResponseModel, 2),
+        ("gpcm_1d", mirt.GeneralizedPartialCredit, 1),
+        ("gpcm_2d", mirt.GeneralizedPartialCredit, 2),
+        ("pcm_1d", mirt.PartialCreditModel, 1),
+        ("nrm_1d", mirt.NominalResponseModel, 1),
+        ("nrm_2d", mirt.NominalResponseModel, 2),
+    ):
+        measure_model(label, factory, factors)
     return results
 
 
@@ -589,19 +606,8 @@ def bench_item_curvature(
     rng = np.random.default_rng(86)
     categories = [2 + item % 4 for item in range(n_items)]
     results = []
-    for label, model in (
-        ("2pl_1d", mirt.TwoParameterLogistic(n_items)),
-        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
-        ("gpcm_1d", mirt.GeneralizedPartialCredit(n_items, n_categories=categories)),
-        (
-            "grm_2d",
-            mirt.GradedResponseModel(n_items, n_categories=categories, n_factors=2),
-        ),
-        (
-            "nrm_2d",
-            mirt.NominalResponseModel(n_items, n_categories=categories, n_factors=2),
-        ),
-    ):
+
+    def measure_model(label, model):
         counts = model.n_categories if model.is_polytomous else [2] * n_items
         responses = np.column_stack([rng.integers(0, k, n_persons) for k in counts])
         responses[rng.random(responses.shape) < 0.1] = -1
@@ -617,17 +623,16 @@ def bench_item_curvature(
             ("richardson", 1),
             ("central", 2),
         ):
-
-            def run():
-                return compute_se(
-                    model,
-                    responses,
-                    quadrature,
-                    posterior,
-                    method=method,
-                    step_size=1e-4,
-                    n_jobs=jobs,
-                )
+            run = partial(
+                compute_se,
+                model,
+                responses,
+                quadrature,
+                posterior,
+                method=method,
+                step_size=0.0001,
+                n_jobs=jobs,
+            )
 
             results.append(
                 BenchResult(
@@ -636,6 +641,21 @@ def bench_item_curvature(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for label, model in (
+        ("2pl_1d", mirt.TwoParameterLogistic(n_items)),
+        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
+        ("gpcm_1d", mirt.GeneralizedPartialCredit(n_items, n_categories=categories)),
+        (
+            "grm_2d",
+            mirt.GradedResponseModel(n_items, n_categories=categories, n_factors=2),
+        ),
+        (
+            "nrm_2d",
+            mirt.NominalResponseModel(n_items, n_categories=categories, n_factors=2),
+        ),
+    ):
+        measure_model(label, model)
     return results
 
 
@@ -648,6 +668,37 @@ def bench_bl_fit(
     rng = np.random.default_rng(87)
     categories = [2 + item % 3 for item in range(n_items)]
     results = []
+
+    def measure_model(label, model):
+        counts = model.n_categories if model.is_polytomous else [2] * n_items
+        responses = np.column_stack([rng.integers(0, k, n_persons) for k in counts])
+        responses[rng.random(responses.shape) < 0.1] = -1
+
+        def skip_curvature(fitted, data, params, structure):
+            return {
+                name: np.zeros_like(values)
+                for name, values in fitted.parameters.items()
+            }
+
+        for stage in ("optimize", "fit"):
+
+            def run(stage=stage):
+                estimator = BLEstimator(
+                    n_quadpts=21 if model.n_factors == 1 else 5,
+                    max_iter=5,
+                )
+                if stage == "optimize":
+                    estimator._compute_standard_errors = skip_curvature
+                return estimator.fit(model.copy(), responses)
+
+            results.append(
+                BenchResult(
+                    f"bl_{label}_{stage}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
+                )
+            )
+
     for label, model in (
         ("2pl_1d", mirt.TwoParameterLogistic(n_items)),
         ("3pl_1d", mirt.ThreeParameterLogistic(n_items)),
@@ -664,34 +715,7 @@ def bench_bl_fit(
             mirt.BifactorModel(n_items, specific_factors=np.arange(n_items) % 2),
         ),
     ):
-        counts = model.n_categories if model.is_polytomous else [2] * n_items
-        responses = np.column_stack([rng.integers(0, k, n_persons) for k in counts])
-        responses[rng.random(responses.shape) < 0.1] = -1
-
-        def skip_curvature(fitted, data, params, structure):
-            return {
-                name: np.zeros_like(values)
-                for name, values in fitted.parameters.items()
-            }
-
-        for stage in ("optimize", "fit"):
-
-            def run():
-                estimator = BLEstimator(
-                    n_quadpts=21 if model.n_factors == 1 else 5,
-                    max_iter=5,
-                )
-                if stage == "optimize":
-                    estimator._compute_standard_errors = skip_curvature
-                return estimator.fit(model.copy(), responses)
-
-            results.append(
-                BenchResult(
-                    f"bl_{label}_{stage}",
-                    _time(run, repeats=repeats, warmups=warmups),
-                    _peak_traced_bytes(run),
-                )
-            )
+        measure_model(label, model)
     return results
 
 
@@ -705,7 +729,8 @@ def bench_irtree_fit(
 
     rng = np.random.default_rng(88)
     results = []
-    for spec in ("bockenholt", "extreme_midpoint", "direction_intensity"):
+
+    def measure_tree(spec):
         model = IRTreeModel(n_items, tree_spec=spec)
         responses = rng.integers(0, 5, (n_persons, n_items))
         responses[rng.random(responses.shape) < 0.1] = -1
@@ -750,6 +775,9 @@ def bench_irtree_fit(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for spec in ("bockenholt", "extreme_midpoint", "direction_intensity"):
+        measure_tree(spec)
     return results
 
 
@@ -790,7 +818,8 @@ def bench_mcem_fit(
         ("nrm_2d", mirt.NominalResponseModel(n_items, n_categories=4, n_factors=2)),
         ("mirt_3d", MultidimensionalModel(n_items, 3)),
     )
-    for name, model in models:
+
+    def measure_model(name, model):
         categories = 4 if model.is_polytomous else 2
         responses = rng.integers(0, categories, (n_persons, n_items))
         responses[rng.random(responses.shape) < 0.1] = -1
@@ -840,6 +869,9 @@ def bench_mcem_fit(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for name, model in models:
+        measure_model(name, model)
     return results
 
 
@@ -857,7 +889,8 @@ def bench_mcem_sampling(
         ("mirt_6d_correlated", mirt.MultidimensionalModel(n_items, n_factors=6)),
     )
     results = []
-    for label, template in models:
+
+    def measure_model(label, template):
         categories = 4 if template.is_polytomous else 2
         responses = rng.integers(0, categories, (n_persons, n_items))
         responses[rng.random(responses.shape) < 0.1] = -1
@@ -885,7 +918,7 @@ def bench_mcem_sampling(
             uncertainty_weights = np.full((n_persons, n_samples), 1.0 / n_samples)
             uncertainty_weights.setflags(write=False)
 
-            def estimator(compute_standard_errors=False):
+            def estimator(compute_standard_errors=False, method=method):
                 if method == "posterior":
                     return MCEMEstimator(
                         n_samples=64,
@@ -908,17 +941,18 @@ def bench_mcem_sampling(
                     template, responses, prior, cholesky, template.n_factors
                 )
 
-            def prior_kernel():
-                return MCEMEstimator._gaussian_log_kernel(
-                    kernel_samples, prior, cholesky
-                )
+            prior_kernel = partial(
+                MCEMEstimator._gaussian_log_kernel, kernel_samples, prior, cholesky
+            )
 
             def fit():
                 return estimator().fit(
                     template.copy(), responses, prior_mean=prior, prior_cov=covariance
                 )
 
-            def uncertainty():
+            def uncertainty(
+                kernel_samples=kernel_samples, uncertainty_weights=uncertainty_weights
+            ):
                 return estimator(True)._compute_standard_errors_mc(
                     template.copy(), responses, kernel_samples, uncertainty_weights
                 )
@@ -936,6 +970,9 @@ def bench_mcem_sampling(
                         _peak_traced_bytes(run),
                     )
                 )
+
+    for label, template in models:
+        measure_model(label, template)
     return results
 
 
@@ -947,7 +984,8 @@ def bench_gvem_uncertainty(
 
     rng = np.random.default_rng(82)
     results = []
-    for n_factors in (1, 3):
+
+    def measure_dimensions(n_factors):
         model = mirt.TwoParameterLogistic(n_items, n_factors=n_factors)
         responses = mirt.simdata(
             n_persons=n_persons, n_items=n_items, n_factors=n_factors, seed=42
@@ -977,6 +1015,9 @@ def bench_gvem_uncertainty(
                     peak_traced_bytes=_peak_traced_bytes(run),
                 )
             )
+
+    for n_factors in (1, 3):
+        measure_dimensions(n_factors)
     return results
 
 
@@ -1005,7 +1046,8 @@ def bench_variational_objective(
 
     rng = np.random.default_rng(92)
     results = []
-    for n_factors in (1, 3, 6):
+
+    def measure_dimensions(n_factors):
         responses, loadings, intercepts, mu, sigma, xi = _variational_state(
             rng, n_persons, n_items, n_factors
         )
@@ -1035,6 +1077,9 @@ def bench_variational_objective(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for n_factors in (1, 3, 6):
+        measure_dimensions(n_factors)
     return results
 
 
@@ -1048,7 +1093,8 @@ def bench_variational_mstep(
 
     rng = np.random.default_rng(93)
     results = []
-    for n_factors, fixed in ((1, False), (3, False), (6, False), (1, True)):
+
+    def measure_model(n_factors, fixed):
         responses, loadings, intercepts, mu, sigma, xi = _variational_state(
             rng, n_persons, n_items, n_factors
         )
@@ -1082,6 +1128,9 @@ def bench_variational_mstep(
                     f"variational_mstep_{name}_{label}", times, _peak_traced_bytes(run)
                 )
             )
+
+    for n_factors, fixed in ((1, False), (3, False), (6, False), (1, True)):
+        measure_model(n_factors, fixed)
     return results
 
 
@@ -1130,7 +1179,8 @@ def _bench_qmcem(
         ("nrm_2d", mirt.NominalResponseModel(n_items, n_categories=4, n_factors=2)),
     )
     results = []
-    for label, template in models:
+
+    def measure_model(label, template):
         n_categories = 4 if template.is_polytomous else 2
         responses = rng.integers(0, n_categories, (n_persons, n_items))
         responses[rng.random(responses.shape) < 0.1] = -1
@@ -1148,7 +1198,7 @@ def _bench_qmcem(
 
         for stage in stages:
 
-            def run() -> None:
+            def run(stage=stage) -> None:
                 if stage == "mstep":
                     estimator._m_step_mc(template.copy(), responses, samples, weights)
                 elif stage == "refresh":
@@ -1173,6 +1223,9 @@ def _bench_qmcem(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for label, template in models:
+        measure_model(label, template)
     return results
 
 
@@ -1199,11 +1252,11 @@ def bench_regularized(
             estimator._quadrature = GaussHermiteQuadrature(n_points, n_factors)
             density = GaussianDensity(n_dimensions=n_factors)
 
-            def e_step() -> object:
-                return estimator._e_step(responses, loadings, intercepts, density)
+            e_step = partial(
+                estimator._e_step, responses, loadings, intercepts, density
+            )
 
-            def fit() -> object:
-                return estimator.fit(responses)
+            fit = partial(estimator.fit, responses)
 
             label = f"{n_factors}d_{'missing' if missing else 'complete'}"
             for name, run in (("e_step", e_step), ("fit", fit)):
@@ -1248,7 +1301,9 @@ def bench_kernels(
             BenchResult(
                 f"likelihood_{model.model_name.lower()}",
                 _time(
-                    lambda: model.log_likelihood_batch(data, points[:, None]),
+                    lambda model=model, data=data: model.log_likelihood_batch(
+                        data, points[:, None]
+                    ),
                     repeats=repeats,
                     warmups=warmups,
                 ),
@@ -1270,7 +1325,8 @@ def bench_optimization(
             BenchResult(
                 f"em_fit_{kind.lower()}",
                 _time(
-                    lambda: mirt.fit_mirt(
+                    partial(
+                        mirt.fit_mirt,
                         data,
                         model=kind,
                         n_categories=5,
@@ -1296,7 +1352,7 @@ def bench_optimization(
             BenchResult(
                 f"{method.lower()}_scoring",
                 _time(
-                    lambda: mirt.fscores(model, data, method=method),
+                    partial(mirt.fscores, model, data, method=method),
                     repeats=repeats,
                     warmups=warmups,
                 ),
@@ -1335,7 +1391,7 @@ def bench_optimization(
             BenchResult(
                 f"grm_{method.lower()}_scoring",
                 _time(
-                    lambda: mirt.fscores(grm, grm_data, method=method),
+                    partial(mirt.fscores, grm, grm_data, method=method),
                     repeats=repeats,
                     warmups=warmups,
                 ),
@@ -1388,7 +1444,7 @@ def bench_variational(
                 update = estimator._e_step
             estimator._intercepts = intercepts
 
-            def run():
+            def run(estimator=estimator, update=update, mean=mean, precision=precision):
                 # Each measurement starts with the same local bound values.
                 # Initial means/covariances are not used by the closed-form update.
                 estimator._xi = xi
@@ -1412,7 +1468,8 @@ def bench_latent_density(
 
     rng = np.random.default_rng(68)
     results = []
-    for n_dimensions in (1, 3, 8):
+
+    def measure_dimensions(n_dimensions):
         points = rng.normal(size=(n_persons, n_dimensions))
         weights = rng.uniform(size=n_persons)
         density = GaussianDensity(
@@ -1440,6 +1497,9 @@ def bench_latent_density(
                 _peak_traced_bytes(evaluate),
             )
         )
+
+    for n_dimensions in (1, 3, 8):
+        measure_dimensions(n_dimensions)
     return results
 
 
@@ -1464,9 +1524,7 @@ def bench_kernel_smoothing(
             n_items=n_items, theta_grid=np.linspace(-4.0, 4.0, n_points)
         )
         for label, data in (("complete", responses), ("missing", missing_responses)):
-
-            def run() -> None:
-                model.calibrate(data, theta, sample_weight=weights)
+            run = partial(model.calibrate, data, theta, sample_weight=weights)
 
             times = _time(run, repeats=repeats, warmups=warmups)
             results.append(
@@ -1485,9 +1543,9 @@ def bench_kernel_smoothing(
         missing_data[rng.random(data.shape) < 0.1] = -1
         missing_data[0] = data[0]
         for label, item_responses in (("complete", data), ("missing", missing_data)):
-
-            def smooth() -> None:
-                itemGAM(model, item_responses, theta, n_grid=101, bandwidth=0.5)
+            smooth = partial(
+                itemGAM, model, item_responses, theta, n_grid=101, bandwidth=0.5
+            )
 
             times = _time(smooth, repeats=repeats, warmups=warmups)
             results.append(
@@ -1519,9 +1577,7 @@ def bench_empirical(
         missing[rng.random(responses.shape) < 0.1] = -1
         for n_bins in (10, 100):
             for label, data in (("complete", responses), ("missing", missing)):
-
-                def run() -> None:
-                    empirical_rmsea(model, data, theta, n_bins=n_bins)
+                run = partial(empirical_rmsea, model, data, theta, n_bins=n_bins)
 
                 times = _time(run, repeats=repeats, warmups=warmups)
                 results.append(
@@ -1550,9 +1606,7 @@ def bench_classical(
     results = []
     for corrected, correlation in ((True, "corrected"), (False, "uncorrected")):
         for label, data in (("complete", responses), ("missing", missing)):
-
-            def run() -> None:
-                traditional(data, use_corrected_correlation=corrected)
+            run = partial(traditional, data, use_corrected_correlation=corrected)
 
             times = _time(run, repeats=repeats, warmups=warmups)
             results.append(
@@ -1586,9 +1640,7 @@ def bench_reliability(
     results = []
     for label, model in models:
         for name, statistic in (("sem", sem), ("empirical", information_rxx)):
-
-            def run() -> None:
-                statistic(model, theta)
+            run = partial(statistic, model, theta)
 
             times = _time(run, repeats=repeats, warmups=warmups)
             results.append(
@@ -1613,10 +1665,10 @@ def bench_curves(
         ("grm", mirt.GradedResponseModel(n_items, n_categories=4)),
     ):
         for name, run in (
-            ("test_information", lambda: testinfo(model, theta)),
-            ("item_information", lambda: iteminfo(model, theta)),
-            ("selected_information", lambda: iteminfo(model, theta, selected)),
-            ("expected_score", lambda: expected_score(model, theta)),
+            ("test_information", partial(testinfo, model, theta)),
+            ("item_information", partial(iteminfo, model, theta)),
+            ("selected_information", partial(iteminfo, model, theta, selected)),
+            ("expected_score", partial(expected_score, model, theta)),
         ):
             times = _time(run, repeats=repeats, warmups=warmups)
             results.append(
@@ -1727,9 +1779,7 @@ def bench_logistic_information(
         model.set_parameters(**parameters)
         theta = rng.normal(size=(n_persons, model.n_factors))
         for selection, item_idx in (("full", None), ("single", n_items - 1)):
-
-            def run() -> None:
-                model.information(theta, item_idx)
+            run = partial(model.information, theta, item_idx)
 
             times = _time(run, repeats=repeats, warmups=warmups)
             results.append(
@@ -1776,9 +1826,12 @@ def bench_logistic_probability(
         theta = rng.normal(size=(n_persons, model.n_factors))
         indices = rng.integers(n_items, size=n_persons)
         for selection, run in (
-            ("full", lambda: model.probability(theta)),
-            ("single", lambda: model.probability(theta, n_items - 1)),
-            ("pairs", lambda: model.probability_pairs(theta, indices)),
+            ("full", partial(model.probability, theta)),
+            (
+                "single",
+                lambda model=model, theta=theta: model.probability(theta, n_items - 1),
+            ),
+            ("pairs", partial(model.probability_pairs, theta, indices)),
         ):
             times = _time(run, repeats=repeats, warmups=warmups)
             results.append(
@@ -1819,7 +1872,7 @@ def bench_logistic_fit(
         ).astype(int)
         responses[rng.random(responses.shape) < 0.1] = -1
 
-        def run() -> None:
+        def run(template=template, responses=responses) -> None:
             EMEstimator(
                 n_quadpts=15 if template.n_factors == 1 else 7,
                 max_iter=8,
@@ -1872,7 +1925,7 @@ def bench_multidimensional_fit(
         ).astype(int)
         responses[rng.random(responses.shape) < 0.1] = -1
 
-        def run() -> None:
+        def run(template=template, responses=responses) -> None:
             EMEstimator(
                 n_quadpts=7,
                 max_iter=8,
@@ -1918,7 +1971,8 @@ def bench_multidimensional_probability(
         ),
     )
     results = []
-    for label, model in models:
+
+    def measure_model(label, model):
         theta = rng.normal(size=(n_persons, model.n_factors))
         indices = rng.integers(n_items, size=n_persons)
         for selection, run in (
@@ -1935,6 +1989,9 @@ def bench_multidimensional_probability(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for label, model in models:
+        measure_model(label, model)
     return results
 
 
@@ -1965,7 +2022,8 @@ def bench_multidimensional_information(
         ),
     )
     results = []
-    for label, model in models:
+
+    def measure_model(label, model):
         theta = rng.normal(size=(n_persons, model.n_factors))
         covariance = np.eye(model.n_factors)
         available_items = set(range(n_items))
@@ -1990,6 +2048,9 @@ def bench_multidimensional_information(
                     _peak_traced_bytes(run),
                 )
             )
+
+    for label, model in models:
+        measure_model(label, model)
     return results
 
 
@@ -2114,7 +2175,7 @@ def bench_patterns(
         BenchResult(
             name,
             _time(
-                lambda: mirt.collapse_patterns(responses),
+                partial(mirt.collapse_patterns, responses),
                 repeats=repeats,
                 warmups=warmups,
             ),
@@ -2174,8 +2235,7 @@ def bench_bayesian(
             log_lik -= rng.pareto(1.8, size=log_lik.shape)
         relative_eff = np.linspace(0.2, 1.0, n_persons)
 
-        def run_psis():
-            return psis_loo(log_lik, relative_eff=relative_eff)
+        run_psis = partial(psis_loo, log_lik, relative_eff=relative_eff)
 
         times = _time(run_psis, repeats=repeats, warmups=warmups)
         results.append(BenchResult(name, times, _peak_traced_bytes(run_psis)))
@@ -2214,8 +2274,7 @@ def bench_pointwise(
             "discrimination": rng.uniform(0.6, 1.8, size=(32, n_items)),
         }
 
-        def run():
-            return compute_pointwise_log_lik(model, responses, chains, by="person")
+        run = partial(compute_pointwise_log_lik, model, responses, chains, by="person")
 
         results.append(
             BenchResult(
@@ -2259,7 +2318,7 @@ def bench_multigroup_fit(
     results = []
     for case in ("metric", "scalar", "fixed"):
 
-        def run():
+        def run(case=case):
             bank = MultigroupModel(mirt.TwoParameterLogistic(n_items), 3)
             return MultigroupEMEstimator(n_quadpts=21, max_iter=10).fit(
                 bank,
@@ -2310,13 +2369,12 @@ def bench_diagnostics(
         residuals = rng.normal(size=(n_persons, n_items))
         residuals[rng.random(residuals.shape) < missing_fraction] = np.nan
 
-        def run():
-            return _compute_ld_matrix(residuals)
+        run = partial(_compute_ld_matrix, residuals)
 
         times = _time(run, repeats=repeats, warmups=warmups)
         results.append(BenchResult(name, times, _peak_traced_bytes(run)))
 
-    for name, missing_fraction in (("ld_complete", 0.0), ("ld_missing", 0.15)):
+    def measure_local_dependence(name, missing_fraction):
         probabilities = rng.uniform(0.05, 0.95, size=(n_persons, n_items))
         responses = (rng.random(probabilities.shape) < probabilities).astype(np.int32)
         responses[rng.random(responses.shape) < missing_fraction] = -1
@@ -2336,6 +2394,9 @@ def bench_diagnostics(
 
         times = _time(run_ld, repeats=repeats, warmups=warmups)
         results.append(BenchResult(name, times, _peak_traced_bytes(run_ld)))
+
+    for name, missing_fraction in (("ld_complete", 0.0), ("ld_missing", 0.15)):
+        measure_local_dependence(name, missing_fraction)
     return results
 
 
@@ -2370,8 +2431,7 @@ def bench_misfit(
             data = responses.copy()
             data[rng.random(data.shape) < missing_fraction] = -1
 
-            def run():
-                return identify_misfitting_patterns(model, data, theta)
+            run = partial(identify_misfitting_patterns, model, data, theta)
 
             times = _time(run, repeats=repeats, warmups=warmups)
             results.append(
@@ -2401,9 +2461,9 @@ def bench_fit_statistics(
         responses = (rng.random(expected.shape) < expected).astype(np.int32)
         responses[rng.random(responses.shape) < missing_fraction] = -1
         for axis, dimension in ((0, "item"), (1, "person")):
-
-            def run_mean_squares():
-                return compute_fit_stats(responses, expected, variance, axis)
+            run_mean_squares = partial(
+                compute_fit_stats, responses, expected, variance, axis
+            )
 
             times = _time(run_mean_squares, repeats=repeats, warmups=warmups)
             results.append(
@@ -2415,10 +2475,8 @@ def bench_fit_statistics(
             )
 
     theta = rng.normal(size=(n_persons, 1))
-    for name, model, categories in (
-        ("2pl", TwoParameterLogistic(n_items), 2),
-        ("grm", GradedResponseModel(n_items, n_categories=5), 5),
-    ):
+
+    def measure_model(name, model, categories):
         responses = rng.integers(0, categories, size=(n_persons, n_items))
         responses[rng.random(responses.shape) < 0.15] = -1
         # Retain complete cases for the conditional score statistic even for
@@ -2450,6 +2508,12 @@ def bench_fit_statistics(
         results.append(
             BenchResult(f"itemfit_{name}", times, _peak_traced_bytes(run_itemfit))
         )
+
+    for name, model, categories in (
+        ("2pl", TwoParameterLogistic(n_items), 2),
+        ("grm", GradedResponseModel(n_items, n_categories=5), 5),
+    ):
+        measure_model(name, model, categories)
     return results
 
 
@@ -2474,9 +2538,7 @@ def bench_model_fit(
             responses = rng.integers(0, categories, size=(n_persons, n_items))
             responses[rng.random(responses.shape) < missing_fraction] = -1
             for integration, abilities in (("empirical", theta), ("quadrature", None)):
-
-                def run():
-                    return compute_fit_indices(model, responses, theta=abilities)
+                run = partial(compute_fit_indices, model, responses, theta=abilities)
 
                 times = _time(run, repeats=repeats, warmups=warmups)
                 results.append(

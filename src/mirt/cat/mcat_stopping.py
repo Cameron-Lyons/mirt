@@ -61,7 +61,8 @@ class MCATStoppingRule(ABC):
         pass
 
     def reset(self) -> None:
-        """Reset state before the rule is reused for another session."""
+        """Reset state before the rule is reused for another session (stateless by default)."""
+        return None
 
 
 class CovarianceTraceStop(MCATStoppingRule):

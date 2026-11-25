@@ -1233,10 +1233,11 @@ class GDINA(BaseCDM):
         initial = np.zeros(design.shape[1], dtype=np.float64)
         initial[0] = np.log(global_rate / (1.0 - global_rate))
         bounds = [(-23.0, 23.0)] + [(0.0, 23.0)] * group_patterns.shape[1]
-        if start is not None and start.shape == initial.shape:
-            if np.all(np.isfinite(start)):
-                lower, upper = np.array(bounds).T
-                initial = np.clip(start, lower, upper)
+        if (start is not None and start.shape == initial.shape) and (
+            np.all(np.isfinite(start))
+        ):
+            lower, upper = np.array(bounds).T
+            initial = np.clip(start, lower, upper)
 
         def objective(parameters: NDArray[np.float64]) -> float:
             linear = design @ parameters
@@ -1306,10 +1307,11 @@ class GDINA(BaseCDM):
         bounds = [(lower, float(np.log1p(-PROB_EPSILON)))] + [
             (lower, 0.0)
         ] * group_patterns.shape[1]
-        if start is not None and start.shape == initial.shape:
-            if np.all(np.isfinite(start)) and np.all(start > 0.0):
-                lower_bounds, upper_bounds = np.array(bounds).T
-                initial = np.clip(np.log(start), lower_bounds, upper_bounds)
+        if (start is not None and start.shape == initial.shape) and (
+            np.all(np.isfinite(start)) and np.all(start > 0.0)
+        ):
+            lower_bounds, upper_bounds = np.array(bounds).T
+            initial = np.clip(np.log(start), lower_bounds, upper_bounds)
         initial_objective = objective(initial)
         result = minimize(
             objective,

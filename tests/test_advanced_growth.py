@@ -567,7 +567,7 @@ class TestGrowthMixtureModel:
 
         entropy = model.entropy(observations, time_values)
 
-        assert 0 <= entropy
+        assert entropy >= 0
 
 
 def _dense_growth_mixture_reference(model, observations, time_values, prediction_times):

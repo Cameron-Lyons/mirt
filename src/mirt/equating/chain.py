@@ -979,7 +979,7 @@ def concurrent_link(
         curves: _ItemCurveSet,
     ) -> NDArray[np.float64]:
         """One side's square-root-weighted curves in the relation's layout."""
-        anchors = relation[2 + side]
+        anchors = relation[2] if side == 0 else relation[3]
         if method != "haebara":
             return root_weights * curves.expected[:, anchors].sum(axis=1)
         if curves.categories is None:

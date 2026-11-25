@@ -147,9 +147,7 @@ def _validate_models_and_categories(
                     )
                 categories.append(counts.pop())
 
-    for grade, (gd, mapping) in enumerate(
-        zip(grade_data, design.item_maps, strict=True)
-    ):
+    for gd, mapping in zip(grade_data, design.item_maps, strict=True):
         response = validate_responses(gd.responses)
         maximum = (
             np.ones(len(mapping), dtype=np.int_)

@@ -29,7 +29,7 @@ class TestDTF:
         )
 
         assert "DTF" in dtf_result
-        assert "DTF_SE" in dtf_result or "SE" in dtf_result or "se" in dtf_result.keys()
+        assert "DTF_SE" in dtf_result or "SE" in dtf_result or "se" in dtf_result
         assert "p_value" in dtf_result
 
     def test_compute_dtf_unsigned(self, two_group_responses):

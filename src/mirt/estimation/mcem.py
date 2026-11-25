@@ -555,7 +555,7 @@ class MCEMEstimator(BaseEstimator):
             if converged:
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
-                break
+                return iteration + 1, converged, theta_samples, weights
             if stalled >= _STALLED_ITERATIONS:
                 warnings.warn(
                     "MCEM stopped before convergence: log-likelihood changes "
@@ -564,25 +564,25 @@ class MCEMEstimator(BaseEstimator):
                     RuntimeWarning,
                     stacklevel=3,
                 )
-                break
+                return iteration + 1, converged, theta_samples, weights
 
             prev_ll = current_ll
             if free_parameters is not None:
                 previous = free_parameters.get(model)
 
             self._m_step_mc(model, responses, theta_samples, weights)
-            if iteration + 1 < self.max_iter:
-                # Release the previous draw before allocating its replacement.
-                del theta_samples, weights
-        else:
-            current_ll, weights = self._refresh_mc_state(
-                model, responses, theta_samples, weights
-            )
-            self._convergence_history.append(current_ll)
-            # Both estimates use the last draw, so they share its noise.
-            converged = self._check_convergence(prev_ll, current_ll)
+            if iteration + 1 == self.max_iter:
+                current_ll, weights = self._refresh_mc_state(
+                    model, responses, theta_samples, weights
+                )
+                self._convergence_history.append(current_ll)
+                # Both estimates use the last draw, so they share its noise.
+                converged = self._check_convergence(prev_ll, current_ll)
+                return iteration + 1, converged, theta_samples, weights
+            # Release the previous draw before allocating its replacement.
+            del theta_samples, weights
 
-        return iteration + 1, converged, theta_samples, weights
+        raise ValueError("max_iter must be positive")
 
     def _iterate_change(
         self,
@@ -1434,9 +1434,10 @@ class QMCEMEstimator(MCEMEstimator):
             (n_persons, self.n_samples, n_factors),
         )
 
-        if hasattr(model, "log_likelihood_batch"):
+        batch_likelihood = getattr(model, "log_likelihood_batch", None)
+        if callable(batch_likelihood):
             log_likes = self._validated_log_likelihoods(
-                model.log_likelihood_batch(responses, theta_base),
+                batch_likelihood(responses, theta_base),
                 (n_persons, self.n_samples),
             )
         else:
@@ -1459,17 +1460,14 @@ class QMCEMEstimator(MCEMEstimator):
         expected = (n_persons, self.n_samples, model.n_factors)
         if samples.shape != expected:
             raise ValueError(f"theta_samples must have shape {expected}")
-        if (
-            n_persons == 0
-            or samples.strides[0] != 0
-            or not hasattr(model, "log_likelihood_batch")
-        ):
+        batch_likelihood = getattr(model, "log_likelihood_batch", None)
+        if n_persons == 0 or samples.strides[0] != 0 or not callable(batch_likelihood):
             return super()._sample_log_likelihoods(model, responses, theta_samples)
         grid = np.asarray(samples[0], dtype=np.float64)
         if not np.all(np.isfinite(grid)):
             raise ValueError("theta_samples must contain only finite values")
         values = self._validated_log_likelihoods(
-            model.log_likelihood_batch(responses, grid), (n_persons, self.n_samples)
+            batch_likelihood(responses, grid), (n_persons, self.n_samples)
         )
         # The MC sampler owns its output and may update accepted cells in place.
         return np.array(values, dtype=np.float64, copy=True)
@@ -1543,7 +1541,7 @@ class QMCEMEstimator(MCEMEstimator):
                     objective = prepared
                 else:
 
-                    def objective(trial):
+                    def objective(trial, item_idx=item_idx, counts=counts):
                         self._set_item_params(model, item_idx, trial)
                         probabilities = np.asarray(
                             model.probability(theta, item_idx), dtype=np.float64
@@ -1579,7 +1577,7 @@ class QMCEMEstimator(MCEMEstimator):
                     objective = prepared
                 else:
 
-                    def objective(trial):
+                    def objective(trial, item_idx=item_idx, r_k=r_k, n_k=n_k):
                         self._set_item_params(model, item_idx, trial)
                         probabilities = np.asarray(
                             model.probability(theta, item_idx), dtype=np.float64
@@ -1723,6 +1721,7 @@ class StochasticEMEstimator(MCEMEstimator):
         iterates: list[NDArray[np.float64]] = []
         converged = False
         error = np.inf
+        last_draw = None
         for iteration in range(self.max_iter):
             theta_samples, weights, current_ll, _ = self._e_step_and_marginal_ll(
                 model, responses, prior_mean, cholesky, n_factors
@@ -1738,14 +1737,17 @@ class StochasticEMEstimator(MCEMEstimator):
                     errors = _batch_means_errors(np.asarray(iterates))
                     error = float(np.max(errors, initial=0.0))
                     converged = error < self.tol
-            if converged:
-                if self.verbose:
+            if converged or iteration + 1 == self.max_iter:
+                if converged and self.verbose:
                     print(f"Converged at iteration {iteration}")
+                last_draw = iteration + 1, theta_samples, weights
                 break
-            if iteration + 1 < self.max_iter:
-                # Release the previous draw before allocating its replacement.
-                del theta_samples, weights
+            # Release the previous draw before allocating its replacement.
+            del theta_samples, weights
 
+        if last_draw is None:
+            raise ValueError("max_iter must be positive")
+        n_iterations, theta_samples, weights = last_draw
         if not iterates:
             warnings.warn(
                 f"Stochastic EM stopped at max_iter={self.max_iter} within the "
@@ -1775,7 +1777,7 @@ class StochasticEMEstimator(MCEMEstimator):
                 RuntimeWarning,
                 stacklevel=3,
             )
-        return iteration + 1, converged, theta_samples, weights
+        return n_iterations, converged, theta_samples, weights
 
 
 _DEFAULT_MC_ITEM_METHODS = {

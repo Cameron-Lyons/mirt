@@ -419,7 +419,7 @@ def _five_pl_curve(
             logits = theta - difficulty[item_indices]
             logits *= discrimination[item_indices]
     exceptional = ~np.isfinite(logits)
-    positions = np.empty(0, dtype=np.intp)
+    negative_tail = None
     if np.any(exceptional):
         if item_indices is None:
             arguments = [
@@ -469,6 +469,7 @@ def _five_pl_curve(
                     + shape_exponent
                     + 1,
                 )
+            negative_tail = positions, a, c, d, e, log_power
     del exceptional
     if item_indices is not None:
         guessing = guessing[item_indices]
@@ -481,7 +482,8 @@ def _five_pl_curve(
         if information
         else _five_pl_probability(logits, guessing, upper, asymmetry)
     )
-    if positions.size:
+    if negative_tail is not None:
+        positions, a, c, d, e, log_power = negative_tail
         if information:
             result.flat[positions] = _five_pl_log_information(
                 np.full(positions.size, -np.inf), a, c, d, e, log_power=log_power

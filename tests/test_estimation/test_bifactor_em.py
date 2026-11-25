@@ -508,21 +508,25 @@ def test_em_warns_before_building_a_large_product_grid(monkeypatch) -> None:
     monkeypatch.setattr(em_module, "build_quadrature", stop)
     responses = np.zeros((4, 8), dtype=int)
 
-    with pytest.warns(RuntimeWarning, match=r"4,084,101 nodes.*mirt\.bfactor"):
-        with pytest.raises(Stop):
-            EMEstimator(n_quadpts=21).fit(BifactorModel(8, np.arange(8) % 4), responses)
-    with pytest.warns(RuntimeWarning, match=r"1,048,576 nodes.*reduce n_quadpts"):
-        with pytest.raises(Stop):
-            EMEstimator(n_quadpts=16).fit(MultidimensionalModel(8, 5), responses)
+    with (
+        pytest.warns(RuntimeWarning, match=r"4,084,101 nodes.*mirt\.bfactor"),
+        pytest.raises(Stop),
+    ):
+        EMEstimator(n_quadpts=21).fit(BifactorModel(8, np.arange(8) % 4), responses)
+    with (
+        pytest.warns(RuntimeWarning, match=r"1,048,576 nodes.*reduce n_quadpts"),
+        pytest.raises(Stop),
+    ):
+        EMEstimator(n_quadpts=16).fit(MultidimensionalModel(8, 5), responses)
     graded = GradedBifactorModel(8, np.arange(8) % 4, n_categories=3)
     with pytest.warns(RuntimeWarning, match=r"4,084,101 nodes.*mirt\.bfactor"):
         em_module._warn_large_grid(graded, 21, 4)
     # 21 ** 15 wraps to a negative value in 64-bit NumPy integer arithmetic.
-    with pytest.warns(RuntimeWarning, match=r"68,122,318,582,951,682,301 nodes"):
-        with pytest.raises(Stop):
-            EMEstimator(n_quadpts=np.int64(21)).fit(
-                MultidimensionalModel(8, 15), responses
-            )
+    with (
+        pytest.warns(RuntimeWarning, match=r"68,122,318,582,951,682,301 nodes"),
+        pytest.raises(Stop),
+    ):
+        EMEstimator(n_quadpts=np.int64(21)).fit(MultidimensionalModel(8, 15), responses)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         with pytest.raises(Stop):

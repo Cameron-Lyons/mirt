@@ -124,8 +124,8 @@ class TestLinkingBasic:
             compute_diagnostics=False,
         )
 
-        assert result.constants.A == pytest.approx(scale, abs=1e-6)
-        assert result.constants.B == pytest.approx(shift, abs=1e-6)
+        assert pytest.approx(scale, abs=1e-6) == result.constants.A
+        assert pytest.approx(shift, abs=1e-6) == result.constants.B
         assert result.constants.A > 0.0
         if method == "tcc":
             assert result.convergence_info["method"] == "tcc"
@@ -317,7 +317,7 @@ class TestLinkingRobust:
             robust=False,
         )
 
-        assert result_robust.constants.A != pytest.approx(result_normal.constants.A)
+        assert pytest.approx(result_normal.constants.A) != result_robust.constants.A
 
     def test_link_with_bootstrap_se(self, reference_model, scaled_model):
         """Test bootstrap standard error computation."""
@@ -628,8 +628,8 @@ class TestModelNativeCurves:
         A, B, criterion = _native_curve_oracle(
             old, new, method, [np.log(result.constants.A), result.constants.B]
         )
-        assert result.constants.A == pytest.approx(A, abs=1e-6)
-        assert result.constants.B == pytest.approx(B, abs=1e-6)
+        assert pytest.approx(A, abs=1e-6) == result.constants.A
+        assert pytest.approx(B, abs=1e-6) == result.constants.B
         assert result.convergence_info["fun"] == pytest.approx(
             criterion([np.log(A), B]), rel=1e-8, abs=1e-14
         )
@@ -716,7 +716,7 @@ class TestModelNativeCurves:
                     theta,
                     weights,
                 )
-                assert (result.constants.A, result.constants.B) == expected
+                assert expected == (result.constants.A, result.constants.B)
 
     def test_native_bootstrap_matches_least_squares_oracle(self):
         """Native anchor bootstraps resample the same model-native estimator."""
@@ -835,8 +835,8 @@ class TestLeastSquaresCurveLinking:
 
         A, B = _nelder_mead_curve_link(old, new, anchors, method)
         assert result.convergence_info["optimizer"] == "least_squares"
-        assert result.constants.A == pytest.approx(A, abs=1e-6)
-        assert result.constants.B == pytest.approx(B, abs=1e-6)
+        assert pytest.approx(A, abs=1e-6) == result.constants.A
+        assert pytest.approx(B, abs=1e-6) == result.constants.B
 
     @pytest.mark.parametrize("failure", ["raises", "status"])
     def test_falls_back_to_nelder_mead(self, reference_model, monkeypatch, failure):
@@ -862,8 +862,8 @@ class TestLeastSquaresCurveLinking:
         result = link(old, new, anchors, anchors, method="haebara")
 
         assert result.convergence_info["optimizer"] == "nelder_mead"
-        assert result.constants.A == pytest.approx(expected.constants.A, abs=1e-6)
-        assert result.constants.B == pytest.approx(expected.constants.B, abs=1e-6)
+        assert pytest.approx(expected.constants.A, abs=1e-6) == result.constants.A
+        assert pytest.approx(expected.constants.B, abs=1e-6) == result.constants.B
 
     @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
     def test_plateau_stop_falls_back_to_nelder_mead(self, method):
@@ -887,8 +887,8 @@ class TestLeastSquaresCurveLinking:
 
         A, B = _nelder_mead_curve_link(old, new, [0, 1], method)
         assert result.convergence_info["optimizer"] == "nelder_mead"
-        assert result.constants.A == pytest.approx(A, abs=1e-6)
-        assert result.constants.B == pytest.approx(B, abs=1e-6)
+        assert pytest.approx(A, abs=1e-6) == result.constants.A
+        assert pytest.approx(B, abs=1e-6) == result.constants.B
 
     @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
     def test_tied_reference_difficulties_start_from_mean_mean(self, method):
@@ -907,8 +907,8 @@ class TestLeastSquaresCurveLinking:
         result = link(old, new, anchors, anchors, method=method)
 
         A, B, _ = _native_curve_oracle(old, new, method, [0.0, 0.0])
-        assert result.constants.A == pytest.approx(A, abs=1e-6)
-        assert result.constants.B == pytest.approx(B, abs=1e-6)
+        assert pytest.approx(A, abs=1e-6) == result.constants.A
+        assert pytest.approx(B, abs=1e-6) == result.constants.B
 
     def test_exact_start_reports_no_optimizer(self, reference_model):
         new = TwoParameterLogistic(10)
@@ -1009,8 +1009,8 @@ class TestOverriddenResponseFunctions:
         A, B, criterion = _native_curve_oracle(
             old, new, method, [np.log(result.constants.A), result.constants.B]
         )
-        assert result.constants.A == pytest.approx(A, abs=1e-6)
-        assert result.constants.B == pytest.approx(B, abs=1e-6)
+        assert pytest.approx(A, abs=1e-6) == result.constants.A
+        assert pytest.approx(B, abs=1e-6) == result.constants.B
         theta = np.linspace(-4.0, 4.0, 61)
         weights = np.exp(-0.5 * theta**2)
         weights /= weights.sum()

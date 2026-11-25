@@ -289,7 +289,7 @@ def test_complete_fits_match_itemwise_m_step(kind, n_factors, fixed, monkeypatch
                 estimator = GVEMEstimator(max_iter=5, tol=1e-10, use_gpu=False)
                 if reference:
 
-                    def scalar_step(model, responses):
+                    def scalar_step(model, responses, estimator=estimator):
                         loadings, intercepts, _ = _reference_update(
                             estimator, model, responses
                         )
@@ -303,7 +303,7 @@ def test_complete_fits_match_itemwise_m_step(kind, n_factors, fixed, monkeypatch
                 )
                 if reference:
 
-                    def scalar_step(responses):
+                    def scalar_step(responses, estimator=estimator, model=model):
                         estimator._loadings, estimator._intercepts, estimator._gamma = (
                             _reference_update(estimator, model, responses)
                         )
